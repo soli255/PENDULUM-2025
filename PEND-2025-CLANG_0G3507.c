@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-08-31 1300             *****
+*****   2025-08-31 1900             *****
 ****************************************/
 
 #include "ti/driverlib/dl_gpio.h"
@@ -163,17 +163,15 @@ volatile    float       Roll_AngleDeg_AVG = 0.0f , Roll_AngleDeg_Tmp = 0.0f;
 volatile    float       Yaw_AngleDeg_AVG = 0.0f , Yaw_AngleDeg_Tmp = 0.0f;
 
 // ----- MOTOR/ROBOT -----
-// float   omega_1_rads;   // [rad/sec]    motor Angular Velocity
-// float   omega_2_rads;   // [rad/sec]     
-// float   omega_3_rads;   // [rad/sec]   
+float   omega_M0_rads;   // [rad/sec]    motor Angular Velocity
+float   omega_M1_rads;   // [rad/sec]     
 
-// float   theta_1_rad;    // [rad]        motor Angule
-// float   theta_2_rad;    // [rad]     
-// float   theta_3_rad;    // [rad] 
+float   theta_M0_rad;    // [rad]        motor Angule
+float   theta_M1_rad;    // [rad]     
 
-// float   robot_pos_m;     // [m]
-// float   robot_pos_m_1;
-// float   robot_speed_ms;  // [m/sec]
+float   robot_pos_m;     // [m]
+float   robot_pos_m_1;
+float   robot_speed_ms;  // [m/sec]
 float   robot_angle_rad; // [rad] 
 float   robot_rate_rads; // [rad/s]
 
@@ -181,6 +179,7 @@ float   robot_rate_rads; // [rad/s]
 void    MCU_Init( void );
 void    ADC_check( void );
 void    QUAD_check( void );
+void    OMEGA_check( void );
 void    MPU_check ( void );
 void    MPU_ExitSleep( void );
 void    MPU_GetAccTempGyro( void );
@@ -200,11 +199,6 @@ int main( void )
 {
     MCU_Init();
 
-    SET_PWM_DUTY( PHASE_A , 0U );       // MOTOR 0 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
-    SET_PWM_DUTY( PHASE_B , 0U );       // MOTOR 0 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
-    SET_PWM_DUTY( PHASE_C , 0U );       // MOTOR 1 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
-    SET_PWM_DUTY( PHASE_D , 0U );       // MOTOR 1 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
-
 // *****************************************  *****************************************  *****************************************
 // *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****
 // *****************************************  *****************************************  *****************************************
@@ -213,6 +207,7 @@ int main( void )
         MPU_check();
         ADC_check();
         QUAD_check();
+        OMEGA_check();
         DL_GPIO_togglePins( GPIO_PORT , GPIO_RC_PWM1_PIN );
     }
 
@@ -242,6 +237,12 @@ void TIMER_0_INST_IRQHandler()
 
         cHeartTick++;
         cHeartTick %= LED_TICK_COUNT;
+    }
+    // ----- MOTOR SPEED/OMEGA MEASUREMENT -----
+    if ( --cMotorOmega == 0 )
+    {
+        cMotorOmega = TIME_MOTOR_OMEGA_MS;
+        fMotorOmega = true;
     }
     // ----- MPU DELAY -----
     if ( cMPUdelay > 0 )
@@ -367,8 +368,13 @@ void I2C1_INST_IRQHandler ( void )
     }
 }
 
+// *****************************************  *****************************************  *****************************************
+// **********      FUNCTIONS      **********  **********      FUNCTIONS      **********  **********      FUNCTIONS      **********
+// *****************************************  *****************************************  *****************************************
 
-// ----- MCU INIT -----
+/**************************
+*****   MCU INIT      *****
+**************************/
 void MCU_Init( void )
 {
     SYSCFG_DL_init();
@@ -385,14 +391,10 @@ void MCU_Init( void )
     // ***** I2C 1 - enable interrupt *****
     NVIC_EnableIRQ( I2C1_INST_INT_IRQN);
     // ***** default motor value - motor stop *****
-    // DL_TimerA_setCaptureCompareValue(PWM_0_INST, 0, GPIO_PWM_0_C0_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_0_INST, 0, GPIO_PWM_0_C1_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_0_INST, 0, GPIO_PWM_0_C2_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_0_INST, 0, GPIO_PWM_0_C3_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_1_INST, 0, GPIO_PWM_1_C0_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_1_INST, 0, GPIO_PWM_1_C1_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_2_INST, 0, GPIO_PWM_2_C0_IDX);
-    // DL_TimerA_setCaptureCompareValue(PWM_2_INST, 0, GPIO_PWM_2_C1_IDX);
+    SET_PWM_DUTY( PHASE_A , 0U );       // MOTOR 0 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
+    SET_PWM_DUTY( PHASE_B , 0U );       // MOTOR 0 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
+    SET_PWM_DUTY( PHASE_C , 25U );       // MOTOR 1 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
+    SET_PWM_DUTY( PHASE_D , 0U );       // MOTOR 1 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
 }
 
 // ----- ANALOG MEASUREMENT -----
@@ -712,6 +714,30 @@ void MPU_GetAccTempGyro( void )
     robot_rate_rads = Gyro_X_RateDegs / RAD_TO_DEG;
 }
 
+// ----- OMEGA CALCULATION -----
+void OMEGA_check( void )
+{
+    if ( fMotorOmega )
+    {
+        fMotorOmega = false;
+
+        omega_M0_rads = -2.0f * PI_NUMBER * ( (float)( cQuadM0 - cQuadM0_1 ) ) * 1/TIME_MOTOR_OMEGA_S / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        theta_M0_rad  = -2.0f * PI_NUMBER * (float)( cQuadM0 ) / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        cQuadM0_1 = cQuadM0;
+        cQuadM0_1 = cQuadM0;
+        
+        omega_M1_rads = 2.0f * PI_NUMBER * ( (float)( cQuadM1 - cQuadM1_1 ) ) * 1/TIME_MOTOR_OMEGA_S / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        theta_M1_rad  = 2.0f * PI_NUMBER * (float)( cQuadM1 ) / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        cQuadM1_1 = cQuadM1;
+        cQuadM1_1 = cQuadM1;
+
+        // Robot speed and position calculation
+        robot_pos_m = 0.5f * ( theta_M0_rad + theta_M1_rad ) * WHEEL_RADIUS_M;
+        robot_speed_ms = ( robot_pos_m - robot_pos_m_1 ) * 1/TIME_MOTOR_OMEGA_S;
+        robot_pos_m_1 = robot_pos_m;
+    }
+}
+
 /*******************************
 *****   QUADRATURE FUNCT   *****
 ********************************/
@@ -720,7 +746,7 @@ void QUAD_check( void )
     // ----- MOTOR 0 quad channels -----
     fQuadA = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_A_PIN );
     fQuadB = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_B_PIN );
-
+    // ----- A-channel -----
     if ( fQuadA != fQuadA_1 )
     {
         fQuadA_1 = fQuadA;
@@ -741,11 +767,32 @@ void QUAD_check( void )
                 --cQuadM0;
         }
     }
+    // ----- B-channel -----
+    if ( fQuadB != fQuadB_1 )
+    {
+        fQuadB_1 = fQuadB;
+        // increment or decrement in depend of B channel EDGE and level on A channel
+        // rising edge
+        if ( fQuadB )
+        {
+            if ( fQuadA )
+                ++cQuadM0;
+            else
+                --cQuadM0;
+        }
+        else
+        {
+            if ( fQuadA )
+                --cQuadM0;
+            else
+                ++cQuadM0;
+        }	
+    }  
 
     // ----- MOTOR 1 quad channels -----
     fQuadC = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_C_PIN );
     fQuadD = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_D_PIN );
-
+    // ----- D-channel -----
     if ( fQuadC != fQuadC_1 )
     {
         fQuadC_1 = fQuadC;
@@ -766,5 +813,26 @@ void QUAD_check( void )
                 --cQuadM1;
         }
     }
+    // ----- D-channel -----
+    if ( fQuadD != fQuadD_1 )
+    {
+        fQuadD_1 = fQuadD;
+        // increment or decrement in depend of B channel EDGE and level on A channel
+        // rising edge
+        if ( fQuadD )
+        {
+            if ( fQuadC )
+                ++cQuadM1;
+            else
+                --cQuadM1;
+        }
+        else
+        {
+            if ( fQuadC )
+                --cQuadM1;
+            else
+                ++cQuadM1;
+        }	
+    } 
 }
    
