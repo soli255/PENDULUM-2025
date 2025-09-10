@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-08-31 1900             *****
+*****   2025-09-08 1930             *****
 ****************************************/
 
 #include "ti/driverlib/dl_gpio.h"
@@ -13,17 +13,20 @@
 #define     LED_HEART_ON_MS         150
 #define     LED_HEART_OFF_MS        150
 #define     LED_TICK_COUNT          12
-#define     LED_SEQUENCE            0b1010101
+#define     LED_SEQUENCE_1          0b1
+#define     LED_SEQUENCE_2          0b101
+#define     LED_SEQUENCE_3          0b10101
+#define     LED_SEQUENCE_4          0b1010101
 
-#define     TIME_SEND_DATA_MS       10          // 100Hz send data rate
+#define     TIME_SEND_DATA_MS       100         // 10Hz send data rate
 #define     TIME_MOTOR_OMEGA_MS     50          // rate to calculate impulses to determine motor speed
 #define     TIME_MOTOR_OMEGA_S      0.05f       // in seconds
 
-#define     TIME_MPU_DELAY_MS       125         // delay before MPU is initiated
+#define     TIME_MPU_DELAY_MS       250         // delay before MPU is initiated
 
 #define     TIME_MPU_READ_MS        2           // reading rate of MPU
 #define     TIME_MPU_READ_SEC       0.002f      // in seconds
-#define     TIME_PID_CONTROLLER_MS  TIME_MPU_READ_MS// MAIN PID loop control sample time
+#define     TIME_PID_CONTROLLER_MS  4           // MAIN PID loop control sample time
 
 #define     ANGLE_DEG_LIMIT_NEG     -15.0f       // negative ange limit - beyond PID controll os OFF    
 #define     ANGLE_DEG_LIMIT_POS      15.0f       // positive limit
@@ -38,7 +41,7 @@
 #define     ROBOT_STATE_CALIBRATE   2
 
 #define     VOLT_REF                3.6f        // ADC ref voltage
-#define     VOLT_VS_DEFAULT         7.5f        // supply default voltage
+#define     VOLT_VS_DEFAULT         12.0f        // supply default voltage
 
 #define     ADC_CHANNELS            5           // 5 channel used: VS1, Current M0, Current M1 , Temp M0, Temp M1     
 #define     MOV_AVG_ADC             8
@@ -66,6 +69,10 @@
 #define     PHASE_D                 3
 #define     PHASE_COUNT             4
 
+volatile    uint16_t    LED_Sequence    = LED_SEQUENCE_2;
+volatile    uint8_t     Robot_State     = ROBOT_STATE_BALANCING;
+volatile    uint8_t     Robot_State_1   = ROBOT_STATE_BALANCING;
+
 // ----- FLAGS -----
 volatile    bool        fHeartLED       = false;
 volatile    bool        fMPUread        = false;
@@ -86,6 +93,7 @@ volatile    uint32_t    cMPUdelay       = TIME_MPU_DELAY_MS;
 volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
 volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    cPIDcontroller  = TIME_PID_CONTROLLER_MS;
+volatile    uint32_t    auxCnt[ 10 ];
 
 // ----- MOTOR QUADRATURE ENCODERS -----
 volatile    int32_t     cQuadM0 = 0 , cQuadM0_1 = 0;
@@ -100,13 +108,26 @@ volatile    float       MotorTemp_C[ MOTOR_COUNT ];
 volatile    float       volt_AVG[ ADC_CHANNELS ];
 volatile    float       volt_Tmp[ ADC_CHANNELS ];
 
-// ----- COMPLEMENTARY FILTER -----
-volatile    float       Alpha = ALPHA_DEFAULT;
-
 // ----- PID -----
-volatile    float       T_sample            = TIME_PID_CONTROLLER_MS / 1000.0f;     // sample time [sec]
+volatile    float       T_sample                = TIME_PID_CONTROLLER_MS / 1000.0f;     // sample time [sec]
+volatile    float       PID_actVal              = 0.0f;
+volatile    float       PID_actVal_angle_volt   = 0.0f;
+volatile    float       PID_actVal_rate_volt    = 0.0f;
 
-volatile    uint16_t    auxCounters[14];
+// ----- USART0 -----
+// RX
+volatile    uint8_t     UART0_RXbuffer[ 8 ];
+volatile    uint8_t     UART0_MaxRXbytes = sizeof( UART0_RXbuffer );
+volatile    uint8_t     UART0_RXbytes = 0;
+// TX
+// count of numbers that will be sended over UART
+#define     NUM_COUNT 6
+// numbers in -99999 to +99999 range are max. 6 characters long plus separator (coma ',') and end-message character
+#define     BLOCK_SIZE 7
+// array with message (numbers in string format + separators and end-message character) - max. size
+volatile    uint8_t     UART0_message[ NUM_COUNT * BLOCK_SIZE ];
+volatile    uint8_t     UART0_MessageLength = 0;
+volatile    uint8_t     UART0_TXbytes = 0;
 
 // ----- I2C1 -----
 #define I2C_TX_MAX_PACKET_SIZE (16)
@@ -122,6 +143,9 @@ uint32_t gTxLen, gTxCount;
 uint8_t gRxPacket[ I2C_RX_MAX_PACKET_SIZE ];
 // Counters for TX length and bytes sent
 uint32_t gRxLen, gRxCount;
+// Anti Block System for IIC 
+volatile    uint16_t     I2C_Anti_Block = 0U;
+volatile    uint16_t     I2C_Flag_Block = 0U;
 // Indicates status of I2C
 enum I2cControllerStatus
 {
@@ -151,16 +175,21 @@ volatile	 int16_t	MPU_accX_offset  =  450 , MPU_accY_offset  = -350 , MPU_accZ_o
 volatile	 int16_t	MPU_gyroX_offset = -200 , MPU_gyroY_offset =    0 , MPU_gyroZ_offset =  75; // 2025-03-15
 // calculated data
 volatile    float       MPU_temp_C = 0.0f , MPU_accX_g = 0.0f , MPU_accY_g = 0.0f , MPU_accZ_g = 0.0f;
-volatile    float		Acc_X_AngleDeg = 0.0f , Acc_Y_AngleDeg = 0.0f , Acc_Z_AngleDeg = 0.0f;
+// volatile    float		Acc_X_AngleDeg = 0.0f , Acc_Y_AngleDeg = 0.0f , Acc_Z_AngleDeg = 0.0f;
 volatile	float		Gyro_X_RateDegs = 0.0f , Gyro_Y_RateDegs = 0.0f , Gyro_Z_RateDegs = 0.0f;
-volatile    float       Pitch_AngleDeg = 0.0f , Pitch_AngleDegN_1 = 0.0f;
-volatile    float       Roll_AngleDeg = 0.0f , Roll_AngleDegN_1 = 0.0f;
-volatile    float       Yaw_AngleDeg = 0.0f , Yaw_AngleDegN_1 = 0.0f;
+volatile    float       Pitch_AngleDeg = 0.0f;
+volatile    float       Roll_AngleDeg = 0.0f;
+volatile    float       Yaw_AngleDeg = 0.0f;
 // AVG filter
 #define     MOV_AVG_ANGLE_DEG 64
 volatile    float       Pitch_AngleDeg_AVG = 0.0f , Pitch_AngleDeg_Tmp = 0.0f;
-volatile    float       Roll_AngleDeg_AVG = 0.0f , Roll_AngleDeg_Tmp = 0.0f;
-volatile    float       Yaw_AngleDeg_AVG = 0.0f , Yaw_AngleDeg_Tmp = 0.0f;
+volatile    float       Roll_AngleDeg_AVG = 0.0f  , Roll_AngleDeg_Tmp  = 0.0f;
+volatile    float       Yaw_AngleDeg_AVG = 0.0f   , Yaw_AngleDeg_Tmp   = 0.0f;
+// ----- COMPLEMENTARY FILTER -----
+volatile    float       Alpha = ALPHA_DEFAULT;
+volatile    float       Pitch_AngleDeg_CoFil = 0.0f , Pitch_AngleDegN_1 = 0.0f;
+volatile    float       Roll_AngleDeg_CoFil  = 0.0f , Roll_AngleDegN_1  = 0.0f;
+volatile    float       Yaw_AngleDeg_CoFil   = 0.0f , Yaw_AngleDegN_1   = 0.0f;
 
 // ----- MOTOR/ROBOT -----
 float   omega_M0_rads;   // [rad/sec]    motor Angular Velocity
@@ -177,15 +206,17 @@ float   robot_rate_rads; // [rad/s]
 
 // ----- FUNCTIONS -----
 void    MCU_Init( void );
+void    PID_check( void );
 void    ADC_check( void );
+void    UART_check( void );
 void    QUAD_check( void );
 void    OMEGA_check( void );
 void    MPU_check ( void );
-void    MPU_ExitSleep( void );
-void    MPU_GetAccTempGyro( void );
-void    MPU_WhoAmI( void );
+uint16_t MPU_ExitSleep( void );
+uint16_t MPU_WhoAmI( void );
+uint16_t MPU_GetAccTempGyro( void );
 void    SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
-// int     Send_6_integers_over_UART( int D0 , int D1 , int D2 , int D3 , int D4 , int D5 );
+int     Send_6_integers_over_UART( int D0 , int D1 , int D2 , int D3 , int D4 , int D5 );
 // float   PID0_classic( float arg_measurement );
 // float   PID1_classic( float arg_measurement );
 // float   PID2_classic( float arg_measurement );
@@ -204,10 +235,12 @@ int main( void )
 // *****************************************  *****************************************  *****************************************
     while ( 1 )
     {
-        MPU_check();
-        ADC_check();
-        QUAD_check();
-        OMEGA_check();
+        MPU_check();    // read IMS
+        PID_check();    // Regulate
+        ADC_check();    // read Vs and Motor
+        UART_check();   // send diagnostic data
+        QUAD_check();   // calculate motor RPM
+        OMEGA_check();  // calculate speed
         DL_GPIO_togglePins( GPIO_PORT , GPIO_RC_PWM1_PIN );
     }
 
@@ -225,7 +258,7 @@ void TIMER_0_INST_IRQHandler()
     // ----- Heart beat -----
     if ( --cHeartLED == 0 )
     {
-        if ( LED_SEQUENCE & ( 1 << cHeartTick ) )
+        if ( LED_Sequence & ( 1 << cHeartTick ) )
         {
             DL_GPIO_setPins( GPIO_PORT , GPIO_GRN4_PIN );
             cHeartLED = LED_HEART_ON_MS;
@@ -237,6 +270,12 @@ void TIMER_0_INST_IRQHandler()
 
         cHeartTick++;
         cHeartTick %= LED_TICK_COUNT;
+    }
+    // ----- PID REGULATION -----
+    if ( --cPIDcontroller == 0 )
+    {
+        cPIDcontroller = TIME_PID_CONTROLLER_MS;
+        fPIDcontroller = true;
     }
     // ----- MOTOR SPEED/OMEGA MEASUREMENT -----
     if ( --cMotorOmega == 0 )
@@ -252,6 +291,12 @@ void TIMER_0_INST_IRQHandler()
     {
         cMPUread = TIME_MPU_READ_MS;
         fMPUread = true;
+    }
+    // ----- SEND DATA OVER UART -----
+    if ( --cSendData == 0 )
+    {
+        cSendData = TIME_SEND_DATA_MS;
+        fSendData = true;
     }
 }
 
@@ -300,6 +345,44 @@ void ADC12_1_INST_IRQHandler( void )
             fADC[ 0 ] = true;
             adc[ 0 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_VS1 );
             break; 
+        default:
+            break;
+    }
+}
+
+/****************************************
+*****   UART 3 TRANSMITTER          *****
+****************************************/
+
+void UART_0_INST_IRQHandler( void )
+{
+    switch ( DL_UART_Main_getPendingInterrupt( UART_0_INST ) )
+    {
+        case DL_UART_MAIN_IIDX_RX:
+            //Check to make sure there is no overflow
+            if( UART0_RXbytes < UART0_MaxRXbytes )
+            {
+                //receive byte
+                UART0_RXbuffer[ UART0_RXbytes++ ] = DL_UART_Main_receiveData( UART_0_INST );
+            }
+            else
+            {
+                // overflow - start again
+                UART0_RXbytes = 0;
+            }
+        break;
+
+        case DL_UART_MAIN_IIDX_TX:
+            //transmit byte
+            DL_UART_Main_transmitData ( UART_0_INST , UART0_message[ UART0_TXbytes++ ] );
+            // Disable transmit interrupt if no more bytes
+            if ( UART0_TXbytes == UART0_MessageLength )
+            {
+                DL_UART_Main_disableInterrupt( UART_0_INST , DL_UART_MAIN_INTERRUPT_TX );
+                UART0_TXbytes = 0;
+            }
+        break;
+
         default:
             break;
     }
@@ -385,16 +468,159 @@ void MCU_Init( void )
     NVIC_EnableIRQ( ADC12_1_INST_INT_IRQN );
     DL_ADC12_startConversion( ADC12_0_INST );
     DL_ADC12_startConversion( ADC12_1_INST );
-    // ***** UART 3 - enable interrupt *****
-    // NVIC_ClearPendingIRQ( UART_3_INST_INT_IRQN );
-    // NVIC_EnableIRQ( UART_3_INST_INT_IRQN );
+    // ***** UART 0 - enable interrupt *****
+    NVIC_ClearPendingIRQ( UART_0_INST_INT_IRQN );
+    NVIC_EnableIRQ( UART_0_INST_INT_IRQN );
     // ***** I2C 1 - enable interrupt *****
     NVIC_EnableIRQ( I2C1_INST_INT_IRQN);
     // ***** default motor value - motor stop *****
     SET_PWM_DUTY( PHASE_A , 0U );       // MOTOR 0 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
     SET_PWM_DUTY( PHASE_B , 0U );       // MOTOR 0 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
-    SET_PWM_DUTY( PHASE_C , 25U );       // MOTOR 1 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
+    SET_PWM_DUTY( PHASE_C , 0U );       // MOTOR 1 FORWARDING ( QUAD COUNTER INCREMENT ) - RED  LED ACTIVE
     SET_PWM_DUTY( PHASE_D , 0U );       // MOTOR 1 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
+}
+
+/*****************************
+*****   PID CONTROLLER   *****
+*****************************/
+void PID_check( void )
+{
+    uint16_t pwm_uint_value = 0;
+
+    if ( fPIDcontroller )
+    {
+        fPIDcontroller = false;
+
+        PID_actVal_angle_volt = Pitch_AngleDeg_CoFil    * 0.25f;     // P
+        PID_actVal_rate_volt  = Gyro_Y_RateDegs         * -10.0f;   // D
+
+        PID_actVal = PID_actVal_angle_volt + PID_actVal_rate_volt;
+
+        if ( PID_actVal > MOTOR_VOLT_LIMIT_POS )
+            PID_actVal = MOTOR_VOLT_LIMIT_POS;
+
+        if ( PID_actVal < MOTOR_VOLT_LIMIT_NEG )
+            PID_actVal = MOTOR_VOLT_LIMIT_NEG;
+
+        // if ( ( Pitch_AngleDeg_AVG < ANGLE_DEG_LIMIT_POS ) && ( Pitch_AngleDeg_AVG > ANGLE_DEG_LIMIT_NEG ) ) {
+        //     if ( PID_actVal > 0.25f ) {
+        //         pwm_uint_value = (uint16_t)( 100.0f * PID_actVal / 12.0f );
+        //         // run ROBOT FORWARD
+        //         SET_PWM_DUTY( PHASE_A , pwm_uint_value );
+        //         SET_PWM_DUTY( PHASE_B , 0U );
+        //         SET_PWM_DUTY( PHASE_C , 0U );
+        //         SET_PWM_DUTY( PHASE_D , pwm_uint_value );
+        //     } else if ( PID_actVal < -0.25f ) {
+        //         pwm_uint_value = (uint16_t)( -100.0f * PID_actVal / 12.0f );
+        //         // run ROBOT REVERSE
+        //         SET_PWM_DUTY( PHASE_A , 0U );
+        //         SET_PWM_DUTY( PHASE_B , pwm_uint_value );
+        //         SET_PWM_DUTY( PHASE_C , pwm_uint_value );
+        //         SET_PWM_DUTY( PHASE_D , 0U );
+        //     } else {
+        //         // STOP
+        //         SET_PWM_DUTY( PHASE_A , 0U );
+        //         SET_PWM_DUTY( PHASE_B , 0U );
+        //         SET_PWM_DUTY( PHASE_C , 0U );
+        //         SET_PWM_DUTY( PHASE_D , 0U );
+        //     } 
+        // } else {
+        //     // STOP
+        //     SET_PWM_DUTY( PHASE_A , 0U );
+        //     SET_PWM_DUTY( PHASE_B , 0U );
+        //     SET_PWM_DUTY( PHASE_C , 0U );
+        //     SET_PWM_DUTY( PHASE_D , 0U );
+        // }
+    }
+}
+
+/**************************************
+*****     SEND DATA OVER UART     *****
+**************************************/
+int Send_6_integers_over_UART( int D0 , int D1 , int D2 , int D3 , int D4 , int D5 )
+{
+    // to better process numbers are stored in fiel to use for-cycle
+    int     numbres[ NUM_COUNT ];
+    // ten thousands, thousands, hundreds, tens, ones - store variables for each decimal order
+    int     A = 0 , B = 0 , C = 0 , D = 0 , E = 0;
+    // number counter
+    int     i = 0;
+    // char in string counter
+    int     j = 0;
+    // put numbers into field to better proccess later
+    numbres[ 0 ] = D0;
+    numbres[ 1 ] = D1;
+    numbres[ 2 ] = D2;
+    numbres[ 3 ] = D3;
+    numbres[ 4 ] = D4;
+    numbres[ 5 ] = D5;
+    // MAIN FOR-CYCLE for conversion integers into strings
+    for ( i = 0 ; i < NUM_COUNT ; i++ )
+    {
+        // limiting -99 999 to +99 999
+        if ( numbres[ i ] > 99999 )
+            numbres[ i ] = 99999;
+        if ( numbres[ i ] < -99999 )
+            numbres[ i ] = -99999;
+           
+        // negative sign assigment
+        if ( numbres[ i ] < 0  )
+        {
+            // negative number will be inverted to positive
+            numbres[ i ] = -1 * numbres[ i ];
+            // write '-' symbol to signalize negative number
+            UART0_message[ j++ ] = '-';
+        }
+       
+        // ten thousands, thousands, hundreds, tens, ones variables are cleared for cycle run
+        A = 0;
+        B = 0;
+        C = 0;
+        D = 0;
+        E = 0;
+       
+        // calculate a cipher for each decimal order
+        // ten thousands
+        if ( numbres[ i ] >= 10000 )
+            A = numbres[ i ] / 10000;
+        // thousands
+        if ( numbres[ i ] >= 1000 )    
+            B = ( numbres[ i ] - A * 10000 ) / 1000;
+        // hundreds
+        if ( numbres[ i ] >= 100 )    
+            C = ( numbres[ i ] - A * 10000 - B * 1000 ) / 100;
+        // tens
+        if ( numbres[ i ] >= 10 )        
+            D = ( numbres[ i ] - A * 10000 - B * 1000 - C * 100 ) / 10;
+        // ones
+        E = ( numbres[ i ] - A * 10000 - B * 1000 - C * 100 - D * 10 ) % 10;
+       
+        // string creation, leading zeros are inhibited, base is '0'
+        if ( A > 0 )
+            UART0_message[ j++ ] = '0' + A;
+        if ( ( A > 0 ) || ( B > 0 ) )
+            UART0_message[ j++ ] = '0' + B;
+        if ( ( A > 0 ) || ( B > 0 ) || ( C > 0 ) )
+            UART0_message[ j++ ] = '0' + C;
+        if ( ( A > 0 ) || ( B > 0 ) || ( C > 0 ) || ( D > 0 ) )
+            UART0_message[ j++ ] = '0' + D;
+        // ones will be always writte becase of 0
+        UART0_message[ j++ ] = '0' + E;
+
+        // comma separated data
+        if ( i < NUM_COUNT - 1 )
+            UART0_message[ j++ ] = ',';
+        else
+            // last character as requested by Processing Grapher
+            // https://wired.chillibasket.com/processing-grapher/
+            UART0_message[ j++ ] = '\n';
+    }
+   
+    //printf(UART_message);
+    UART0_MessageLength = j;
+    DL_UART_Main_enableInterrupt( UART_0_INST, DL_UART_MAIN_INTERRUPT_TX );
+   
+    return j;
 }
 
 // ----- ANALOG MEASUREMENT -----
@@ -419,6 +645,75 @@ void ADC_check( void )
                 MotorCurr_mA[ 0 ] = 1000.0f * volt_AVG[ 1 ] / ( 0.033f * 20.0f );    // Motor_current[A] = V_sns[V] / R_sns[R] * INA_GAIN[-] -> Motor_cuureent = V_sns / 0.033R * 20
             if ( i == 2 )
                 MotorCurr_mA[ 1 ] = 1000.0f * volt_AVG[ 2 ] / ( 0.033f * 20.0f );
+        }
+    }
+}
+
+void UART_check( void )
+{
+    // ----- SEND DATA OVER UART -----
+    if ( fSendData )
+    {
+        fSendData = false;
+
+        switch ( Robot_State )
+        {
+            // ----- OBSERVATION ------  
+            case ROBOT_STATE_INIT:                  
+                Send_6_integers_over_UART
+                (
+                    /*BLUE*/    Pitch_AngleDeg_CoFil  * 10.0f ,
+                    /*VIOL*/    Roll_AngleDeg_CoFil  * 10.0f ,
+                    /*REDD*/    Yaw_AngleDeg_CoFil  * 10.0f ,
+                    /*YELL*/    Gyro_X_RateDegs * 1000.0f ,
+                    /*GREE*/    Gyro_Y_RateDegs * 1000.0f ,
+                    /*ORAN*/    Gyro_Z_RateDegs * 1000.0f 
+                );
+                break;
+            // ----- REGULATION ------    
+            case ROBOT_STATE_BALANCING:                    
+                Send_6_integers_over_UART
+                (
+                    /*BLUE*/    PID_actVal              * 10.0f ,
+                    /*VIOL*/    PID_actVal_angle_volt   * 10.0f ,
+                    /*REDD*/    PID_actVal_rate_volt    * 10.0f ,
+                    /*YELL*/    0.0f ,
+                    /*GREE*/    0.0f ,
+                    /*ORAN*/    0.0f 
+                );
+                break;
+            // ----- CALIBRATION ------
+            case ROBOT_STATE_CALIBRATE:
+                Send_6_integers_over_UART
+                (
+                    /*BLUE*/    MPU_accX ,
+                    /*VIOL*/    MPU_accY ,
+                    /*REDD*/    MPU_accZ ,
+                    /*YELL*/    MPU_gyroX ,
+                    /*GREE*/    MPU_gyroY ,
+                    /*ORAN*/    MPU_gyroZ 
+                );                    
+                break;    
+        } 
+    }
+
+    if ( Robot_State != Robot_State_1 )
+    {
+        switch ( Robot_State )
+        {
+            case ROBOT_STATE_INIT:
+                LED_Sequence = LED_SEQUENCE_1;
+                Robot_State_1 = Robot_State;
+                break;
+            case ROBOT_STATE_BALANCING:
+                LED_Sequence = LED_SEQUENCE_2;
+                Robot_State_1 = Robot_State;
+                break;
+
+            case ROBOT_STATE_CALIBRATE:
+                LED_Sequence = LED_SEQUENCE_3;
+                Robot_State_1 = Robot_State;
+                break;    
         }
     }
 }
@@ -476,50 +771,74 @@ void MPU_check ( void )
                 MPU_switch = 1;
                 break;
             case 1:
-                MPU_ExitSleep();
-                MPU_switch = 2;
+                if ( MPU_ExitSleep() == 0 )
+                    MPU_switch = 2;
                 break;
             case 2:
-                MPU_WhoAmI(); // takes ~105us @400kHz
-                if ( MPU_WhoAmI_data == 104 )
-                    MPU_switch = 3;
+                if ( MPU_WhoAmI() == 0 ) { // takes ~105us @400kHz
+                    if ( MPU_WhoAmI_data == 104 )
+                        MPU_switch = 3;
+                }
                 break;
             case 3:
                 DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
-                MPU_GetAccTempGyro(); // takes ~410us @400kHz
+                
+                if ( MPU_GetAccTempGyro() > 0 ) { // takes ~410us @400kHz
+                    MPU_switch = 1;
+                    auxCnt[0]++;
+                }
+
                 DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
                 break;
         }
     }
 }
 
-void MPU_ExitSleep( void )
+uint16_t MPU_ExitSleep( void )
 {
     gI2cControllerStatus = I2C_STATUS_IDLE;
     gTxLen = 2;
     gTxPacket[ 0 ] = 0x6B;  // PWM_MGMT1 register
     gTxPacket[ 1 ] = 0x00;  // Exit Sleep    
 
+    I2C_Flag_Block = 0;
+
     // Fill the FIFO. The FIFO is 8-bytes deep, and this function will return number of bytes written to FIFO
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
-    //
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
-    
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+    // ANTIBLOCK 
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
+
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
-    //
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;   
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;   
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
+
+    return I2C_Flag_Block;
 }
 
-void MPU_WhoAmI( void )
+uint16_t MPU_WhoAmI( void )
 {
     gI2cControllerStatus = I2C_STATUS_IDLE;
     gTxLen = 1;
     gTxPacket[ 0 ] = 0x75;  // WHO_AM_I register 
+
+    I2C_Flag_Block = 0;
 
     // Fill the FIFO. The FIFO is 8-bytes deep, and this function will return number of bytes written to FIFO
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
@@ -535,25 +854,51 @@ void MPU_WhoAmI( void )
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
  
-    //
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
   
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
-    //
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ; 
+    
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ; 
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
   
     /* Wait until the Controller sends all bytes */
     // while ( ( gI2cControllerStatus != I2C_STATUS_TX_COMPLETE ) && ( gI2cControllerStatus != I2C_STATUS_ERROR ) )
     //     ;
+    // ORIGINAL
+    // while ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
 
-    while ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS )
-        ;
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
+    
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
 
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
 
     //----- REPEAT START -----
 
@@ -568,19 +913,29 @@ void MPU_WhoAmI( void )
     // z nejakeho duvodu se data prijmou ale sekne se to tady
     // while ( gI2cControllerStatus != I2C_STATUS_RX_COMPLETE )
     //     ;
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ; 
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
 
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ; 
+    if ( I2C_Anti_Block == 0 )
+        I2C_Flag_Block++;
     
     MPU_WhoAmI_data = gRxPacket[ 0 ];	// read one byte
+
+    return I2C_Flag_Block;
 }
 
-void MPU_GetAccTempGyro( void )
+uint16_t MPU_GetAccTempGyro( void )
 {
 // ACCEL_XOUT_H
     gI2cControllerStatus = I2C_STATUS_IDLE;
     gTxLen = 1;
     gTxPacket[ 0 ] = 0x3B;  // ACCEL_XOUT_H
+
+    I2C_Flag_Block = 0;
 
     // Fill the FIFO. The FIFO is 8-bytes deep, and this function will return number of bytes written to FIFO
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
@@ -597,25 +952,60 @@ void MPU_GetAccTempGyro( void )
     
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
 
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
+    if ( I2C_Anti_Block == 0 ) {
+        I2C_Flag_Block++;
+        auxCnt[1]++;
+    }
 
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
-    //
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ; 
+    
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ; 
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 ) {
+        I2C_Flag_Block++;
+        auxCnt[2]++;
+    }
 
     /* Wait until the Controller sends all bytes */
     // while ( ( gI2cControllerStatus != I2C_STATUS_TX_COMPLETE ) && ( gI2cControllerStatus != I2C_STATUS_ERROR ) )
     //     ;
 
-    while ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS )
-        ;
+    // ORIGINAL
+    // while ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
 
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
+    if ( I2C_Anti_Block == 0 ) {
+        I2C_Flag_Block++;
+        auxCnt[3]++;
+    }
+
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 ) {
+        I2C_Flag_Block++;
+        auxCnt[4]++;
+    }
 
     //----- REPEAT START -----
 
@@ -631,8 +1021,18 @@ void MPU_GetAccTempGyro( void )
     // while ( gI2cControllerStatus != I2C_STATUS_RX_COMPLETE )
     //     ;
     
-    while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
-        ;
+    // ORIGINAL
+    // while ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) )
+    //     ;
+
+    // ANTIBLOCK
+    for ( I2C_Anti_Block = 15000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+
+    if ( I2C_Anti_Block == 0 ) {
+        I2C_Flag_Block++;
+        auxCnt[5]++;
+    }
 
     MPU_accX_raw = (int16_t)gRxPacket[ 0 ] << 8;	// read High byte
     MPU_accX_raw += (int16_t)gRxPacket[ 1 ];
@@ -655,9 +1055,13 @@ void MPU_GetAccTempGyro( void )
 
 // TRIGINOMETRY USED TO DETERMINE ANGLES - theta, psi, phi
 // https://www.analog.com/en/resources/app-notes/an-1057.html
-    Acc_X_AngleDeg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
-    Acc_Y_AngleDeg = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
-    Acc_Z_AngleDeg = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
+    // Acc_X_AngleDeg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
+    // Acc_Y_AngleDeg = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
+    // Acc_Z_AngleDeg = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
+    Pitch_AngleDeg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
+    Roll_AngleDeg  = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
+    Yaw_AngleDeg   = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
+    
     MPU_temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
 
     MPU_gyroX_raw = (uint16_t)gRxPacket[ 8 ] << 8;	// read High byte
@@ -684,14 +1088,14 @@ void MPU_GetAccTempGyro( void )
     Gyro_Y_RateDegs = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / 131.0f );
     Gyro_Z_RateDegs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );   // 3 lines 125us	
 	
-	Roll_AngleDeg  = ( 1 - Alpha ) * ( Roll_AngleDegN_1  + Gyro_X_RateDegs ) + Alpha * Acc_X_AngleDeg;
-    Pitch_AngleDeg = ( 1 - Alpha ) * ( Pitch_AngleDegN_1 + Gyro_Y_RateDegs ) + Alpha * Acc_Y_AngleDeg;
-    Yaw_AngleDeg   = ( 1 - Alpha ) * ( Yaw_AngleDegN_1   + Gyro_Z_RateDegs ) + Alpha * Acc_Z_AngleDeg;  // 3 lines 120us
+    Pitch_AngleDeg_CoFil = ( 1 - Alpha ) * ( Pitch_AngleDegN_1 + Gyro_Y_RateDegs ) + Alpha * Pitch_AngleDeg;
+	Roll_AngleDeg_CoFil  = ( 1 - Alpha ) * ( Roll_AngleDegN_1  + Gyro_X_RateDegs ) + Alpha * Roll_AngleDeg;
+    Yaw_AngleDeg_CoFil   = ( 1 - Alpha ) * ( Yaw_AngleDegN_1   + Gyro_Z_RateDegs ) + Alpha * Yaw_AngleDeg;  // 3 lines 120us
 
     // re-shift
-    Pitch_AngleDegN_1 = Pitch_AngleDeg;
-    Roll_AngleDegN_1 = Roll_AngleDeg;
-    Yaw_AngleDegN_1 = Yaw_AngleDeg;
+    Pitch_AngleDegN_1 = Pitch_AngleDeg_CoFil;
+    Roll_AngleDegN_1  = Roll_AngleDeg_CoFil;
+    Yaw_AngleDegN_1   = Yaw_AngleDeg_CoFil;
 
 // ***********************************
 // ********** KALMAN FILTER **********
@@ -712,6 +1116,9 @@ void MPU_GetAccTempGyro( void )
 
     robot_angle_rad = Pitch_AngleDeg_AVG / RAD_TO_DEG;
     robot_rate_rads = Gyro_X_RateDegs / RAD_TO_DEG;
+
+    return I2C_Flag_Block;
+
 }
 
 // ----- OMEGA CALCULATION -----
