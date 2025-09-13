@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-09-08 1930             *****
+*****   2025-09-13 1100             *****
 ****************************************/
 
 #include "ti/driverlib/dl_gpio.h"
@@ -18,7 +18,7 @@
 #define     LED_SEQUENCE_3          0b10101
 #define     LED_SEQUENCE_4          0b1010101
 
-#define     TIME_SEND_DATA_MS       100         // 10Hz send data rate
+#define     TIME_SEND_DATA_MS       10          // 100Hz send data rate
 #define     TIME_MOTOR_OMEGA_MS     50          // rate to calculate impulses to determine motor speed
 #define     TIME_MOTOR_OMEGA_S      0.05f       // in seconds
 
@@ -28,17 +28,17 @@
 #define     TIME_MPU_READ_SEC       0.002f      // in seconds
 #define     TIME_PID_CONTROLLER_MS  4           // MAIN PID loop control sample time
 
-#define     ANGLE_DEG_LIMIT_NEG     -15.0f       // negative ange limit - beyond PID controll os OFF    
-#define     ANGLE_DEG_LIMIT_POS      15.0f       // positive limit
+#define     ANGLE_DEG_LIMIT_NEG     -25.0f       // negative ange limit - beyond PID controll os OFF    
+#define     ANGLE_DEG_LIMIT_POS      25.0f       // positive limit
 
-#define     MOTOR_VOLT_LIMIT_NEG    -6.5f       // Action value limit - motor maximum voltage
-#define     MOTOR_VOLT_LIMIT_POS     6.5f
+#define     MOTOR_VOLT_LIMIT_NEG    -8.5f       // Action value limit - motor maximum voltage
+#define     MOTOR_VOLT_LIMIT_POS     8.5f
 
 #define     MOTOR_COUNT             2           // M0 and M1
 
-#define     ROBOT_STATE_INIT        0
+#define     ROBOT_STATE_INIT        0           // MPU not initiated or found
 #define     ROBOT_STATE_BALANCING   1
-#define     ROBOT_STATE_CALIBRATE   2
+#define     ROBOT_STATE_CALIBRATE   2           //
 
 #define     VOLT_REF                3.6f        // ADC ref voltage
 #define     VOLT_VS_DEFAULT         12.0f        // supply default voltage
@@ -46,7 +46,11 @@
 #define     ADC_CHANNELS            5           // 5 channel used: VS1, Current M0, Current M1 , Temp M0, Temp M1     
 #define     MOV_AVG_ADC             8
 
-#define     ALPHA_DEFAULT            0.02f      // Complementary filter coefficient
+#define     ALPHA_DEFAULT           0.02f      // Complementary filter coefficient
+
+#define     P_GAIN_def              0.35f
+#define     D_GAIN_def              -15.0f
+#define     P_GAIN_LH_RH_def        1.0f 
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V with 64 CPR Encoder )
 #define     GEAR_RATIO              50.0f
@@ -60,7 +64,7 @@
 #define     RAD_TO_DEG              57.2958f
 
 #define     PWM_MAX_DUTY            90  // [ % ]
-#define     PWM_MIN_DUTY            5   // [ % ]
+#define     PWM_MIN_DUTY            2   // [ % ]
 
 // TIMER CHANNELS ASSIGNED TO OUTPUTS
 #define     PHASE_A                 1
@@ -69,7 +73,7 @@
 #define     PHASE_D                 3
 #define     PHASE_COUNT             4
 
-volatile    uint16_t    LED_Sequence    = LED_SEQUENCE_2;
+volatile    uint16_t    LED_Sequence_Actual    = LED_SEQUENCE_1;
 volatile    uint8_t     Robot_State     = ROBOT_STATE_BALANCING;
 volatile    uint8_t     Robot_State_1   = ROBOT_STATE_BALANCING;
 
@@ -84,6 +88,7 @@ volatile    bool        fQuadC          = false , fQuadC_1 = false;
 volatile    bool        fQuadD          = false , fQuadD_1 = false;
 volatile    bool        fMotorOmega     = false;
 volatile    bool        fPIDcontroller  = false;
+volatile    bool        fMotorEnable    = false;
 
 // ----- COUNTERS -----
 volatile    uint32_t    cHeartLED       = LED_HEART_ON_MS;
@@ -93,14 +98,14 @@ volatile    uint32_t    cMPUdelay       = TIME_MPU_DELAY_MS;
 volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
 volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    cPIDcontroller  = TIME_PID_CONTROLLER_MS;
-volatile    uint32_t    auxCnt[ 10 ];
+volatile    uint32_t    errorCnt[ 10 ];
 
 // ----- MOTOR QUADRATURE ENCODERS -----
 volatile    int32_t     cQuadM0 = 0 , cQuadM0_1 = 0;
 volatile    int32_t     cQuadM1 = 0 , cQuadM1_1 = 0;
 
 // ----- ANALOG -----
-volatile    uint32_t    adc[ ADC_CHANNELS ];    // [ LSB ]
+volatile    uint32_t    ADC_LSB[ ADC_CHANNELS ];    // [ LSB ]
 volatile    float       volt[ ADC_CHANNELS ];   // [ V ]
 volatile    float       MotorCurr_mA[ MOTOR_COUNT ];
 volatile    float       MotorTemp_C[ MOTOR_COUNT ];
@@ -110,9 +115,13 @@ volatile    float       volt_Tmp[ ADC_CHANNELS ];
 
 // ----- PID -----
 volatile    float       T_sample                = TIME_PID_CONTROLLER_MS / 1000.0f;     // sample time [sec]
+volatile    float       P_gain                  = P_GAIN_def;
+volatile    float       D_gain                  = D_GAIN_def;
+volatile    float       P_gain_LH_RH            = P_GAIN_LH_RH_def;
 volatile    float       PID_actVal              = 0.0f;
 volatile    float       PID_actVal_angle_volt   = 0.0f;
 volatile    float       PID_actVal_rate_volt    = 0.0f;
+volatile    float       PID_actVal_LH_RH_comp   = 0.0f;
 
 // ----- USART0 -----
 // RX
@@ -163,7 +172,10 @@ enum I2cControllerStatus
 //MPU physical AD0 = 0
 #define     MPU_ADDRESS ( 0b1101000 )  // MPU slave address in 7bit format
 volatile	uint8_t		MPU_WhoAmI_data = 0;
-volatile	uint8_t		MPU_switch = 0;
+volatile	uint8_t		MPU_switch = 1;
+volatile    uint16_t    MPU_WhoAmI_Return = 0;
+volatile    uint16_t    MPU_ExitSleep_Return = 0;
+volatile    uint16_t    MPU_GetAccTempGyro_Return = 0;
 // raw data registers
 volatile	int16_t	    MPU_temp = 0;
 volatile	int16_t	    MPU_accX = 0, MPU_accY = 0, MPU_accZ = 0;
@@ -216,6 +228,8 @@ uint16_t MPU_ExitSleep( void );
 uint16_t MPU_WhoAmI( void );
 uint16_t MPU_GetAccTempGyro( void );
 void    SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
+void    Motor_M0_volt( float argVoltM0 );
+void    Motor_M1_volt( float argVoltM1 );
 int     Send_6_integers_over_UART( int D0 , int D1 , int D2 , int D3 , int D4 , int D5 );
 // float   PID0_classic( float arg_measurement );
 // float   PID1_classic( float arg_measurement );
@@ -226,22 +240,25 @@ int     Send_6_integers_over_UART( int D0 , int D1 , int D2 , int D3 , int D4 , 
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
 // *****************************************  *****************************************  *****************************************
 
-int main( void )
-{
+int main( void ) {
     MCU_Init();
 
 // *****************************************  *****************************************  *****************************************
 // *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****
 // *****************************************  *****************************************  *****************************************
-    while ( 1 )
-    {
+    while ( 1 ) {
+
         MPU_check();    // read IMS
+        
         PID_check();    // Regulate
+        
         ADC_check();    // read Vs and Motor
+        
         UART_check();   // send diagnostic data
+        
         QUAD_check();   // calculate motor RPM
+        
         OMEGA_check();  // calculate speed
-        DL_GPIO_togglePins( GPIO_PORT , GPIO_RC_PWM1_PIN );
     }
 
 }
@@ -258,7 +275,7 @@ void TIMER_0_INST_IRQHandler()
     // ----- Heart beat -----
     if ( --cHeartLED == 0 )
     {
-        if ( LED_Sequence & ( 1 << cHeartTick ) )
+        if ( LED_Sequence_Actual & ( 1 << cHeartTick ) )
         {
             DL_GPIO_setPins( GPIO_PORT , GPIO_GRN4_PIN );
             cHeartLED = LED_HEART_ON_MS;
@@ -315,11 +332,11 @@ void ADC12_0_INST_IRQHandler( void )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
             fADC[ 4 ] = true;
-            adc[ 4 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_TEMP_M1 );
+            ADC_LSB[ 4 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_TEMP_M1 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
             fADC[ 2 ] = true;
-            adc[ 2 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_CURR_M1 );
+            ADC_LSB[ 2 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_CURR_M1 );
             break;    
         default:
             break;
@@ -335,15 +352,15 @@ void ADC12_1_INST_IRQHandler( void )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
             fADC[ 3 ] = true;
-            adc[ 3 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_TEMP_M0 );
+            ADC_LSB[ 3 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_TEMP_M0 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
             fADC[ 1 ] = true;
-            adc[ 1 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_CURR_M0 );
+            ADC_LSB[ 1 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_CURR_M0 );
             break;    
         case DL_ADC12_IIDX_MEM2_RESULT_LOADED:
             fADC[ 0 ] = true;
-            adc[ 0 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_VS1 );
+            ADC_LSB[ 0 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_VS1 );
             break; 
         default:
             break;
@@ -485,14 +502,15 @@ void MCU_Init( void )
 *****************************/
 void PID_check( void )
 {
-    uint16_t pwm_uint_value = 0;
+    // uint16_t pwm_uint_value = 0;
 
     if ( fPIDcontroller )
     {
         fPIDcontroller = false;
 
-        PID_actVal_angle_volt = Pitch_AngleDeg_CoFil    * 0.25f;     // P
-        PID_actVal_rate_volt  = Gyro_Y_RateDegs         * -10.0f;   // D
+        PID_actVal_angle_volt = Pitch_AngleDeg_CoFil    * P_gain;     // P
+        PID_actVal_rate_volt  = Gyro_Y_RateDegs         * D_gain;   // D
+        PID_actVal_LH_RH_comp = ( theta_M0_rad - theta_M1_rad ) * P_gain_LH_RH; 
 
         PID_actVal = PID_actVal_angle_volt + PID_actVal_rate_volt;
 
@@ -501,6 +519,22 @@ void PID_check( void )
 
         if ( PID_actVal < MOTOR_VOLT_LIMIT_NEG )
             PID_actVal = MOTOR_VOLT_LIMIT_NEG;
+
+        if (
+            ( Pitch_AngleDeg_AVG < ANGLE_DEG_LIMIT_POS ) &&
+            ( Pitch_AngleDeg_AVG > ANGLE_DEG_LIMIT_NEG ) && 
+            ( fMotorEnable ) ) {
+                // Robot_MOVE( PID_actVal - PID_actVal_LH_RH_comp , PID_actVal + PID_actVal_LH_RH_comp );
+                Motor_M0_volt( PID_actVal + PID_actVal_LH_RH_comp );
+                Motor_M1_volt( PID_actVal - PID_actVal_LH_RH_comp );
+            // if ( ( PID_actVal > 0.0f ) && ( PID_actVal > 0.25f ) ) {
+            //     Robot_MOVE( PID_actVal );
+            // } else if ( ( PID_actVal < 0.0f ) && ( PID_actVal < -0.25f ) ) {
+            //     Robot_MOVE( PID_actVal );
+            } else {
+                Motor_M0_volt( 0.0f );
+                Motor_M1_volt( 0.0f );
+            }
 
         // if ( ( Pitch_AngleDeg_AVG < ANGLE_DEG_LIMIT_POS ) && ( Pitch_AngleDeg_AVG > ANGLE_DEG_LIMIT_NEG ) ) {
         //     if ( PID_actVal > 0.25f ) {
@@ -532,6 +566,64 @@ void PID_check( void )
         //     SET_PWM_DUTY( PHASE_D , 0U );
         // }
     }
+}
+
+/*****************************
+*****   MOTOR VOLTAGE   *****
+*****************************/
+
+void Motor_M0_volt( float argVoltM0 )
+{
+    uint16_t pwm_uint_value_M0 = 0;
+
+    if ( argVoltM0 > 0.15f ) {
+        pwm_uint_value_M0 = (uint16_t)( 100.0f * argVoltM0 / 12.0f );
+        // run ROBOT FORWARD
+        SET_PWM_DUTY( PHASE_A , pwm_uint_value_M0 );
+        SET_PWM_DUTY( PHASE_B , 0U );
+        // SET_PWM_DUTY( PHASE_C , 0U );
+        // SET_PWM_DUTY( PHASE_D , pwm_uint_value_M1 );
+    } else if ( argVoltM0 < -0.15f ) {
+        pwm_uint_value_M0 = (uint16_t)( -100.0f * argVoltM0 / 12.0f );
+        // run ROBOT REVERSE
+        SET_PWM_DUTY( PHASE_A , 0U );
+        SET_PWM_DUTY( PHASE_B , pwm_uint_value_M0 );
+        // SET_PWM_DUTY( PHASE_C , pwm_uint_value_M1 );
+        // SET_PWM_DUTY( PHASE_D , 0U );
+    } else {
+        // STOP
+        SET_PWM_DUTY( PHASE_A , 0U );
+        SET_PWM_DUTY( PHASE_B , 0U );
+        // SET_PWM_DUTY( PHASE_C , 0U );
+        // SET_PWM_DUTY( PHASE_D , 0U );
+    } 
+}
+
+void Motor_M1_volt( float argVoltM1 )
+{
+    uint16_t pwm_uint_value_M1 = 0;
+
+    if ( argVoltM1 > 0.15f ) {
+        pwm_uint_value_M1 = (uint16_t)( 100.0f * argVoltM1 / 12.0f );
+        // run ROBOT FORWARD
+        // SET_PWM_DUTY( PHASE_A , pwm_uint_value_M0 );
+        // SET_PWM_DUTY( PHASE_B , 0U );
+        SET_PWM_DUTY( PHASE_C , 0U );
+        SET_PWM_DUTY( PHASE_D , pwm_uint_value_M1 );
+    } else if ( argVoltM1 < -0.15f ) {
+        pwm_uint_value_M1 = (uint16_t)( -100.0f * argVoltM1 / 12.0f );
+        // run ROBOT REVERSE
+        // SET_PWM_DUTY( PHASE_A , 0U );
+        // SET_PWM_DUTY( PHASE_B , pwm_uint_value_M0 );
+        SET_PWM_DUTY( PHASE_C , pwm_uint_value_M1 );
+        SET_PWM_DUTY( PHASE_D , 0U );
+    } else {
+        // STOP
+        // SET_PWM_DUTY( PHASE_A , 0U );
+        // SET_PWM_DUTY( PHASE_B , 0U );
+        SET_PWM_DUTY( PHASE_C , 0U );
+        SET_PWM_DUTY( PHASE_D , 0U );
+    } 
 }
 
 /**************************************
@@ -634,9 +726,9 @@ void ADC_check( void )
             fADC[ i ] = false;
 
             if ( i == 0 )
-                volt[ i ] = (float)adc[ i ] * VOLT_REF * 11.0f / 4096.0f;   // 11 => divider ( 4k7 + 47k ) / 4k7
+                volt[ i ] = (float)ADC_LSB[ i ] * VOLT_REF * 11.0f / 4096.0f;   // 11 => divider ( 4k7 + 47k ) / 4k7
             else
-                volt[ i ] = (float)adc[ i ] * VOLT_REF / 4096.0f;
+                volt[ i ] = (float)ADC_LSB[ i ] * VOLT_REF / 4096.0f;
             
             volt_Tmp[ i ] = volt_Tmp[ i ] - ( volt_Tmp[ i ] / MOV_AVG_ADC ) + volt[ i ];
             volt_AVG[ i ] = volt_Tmp[ i ] / MOV_AVG_ADC;
@@ -655,7 +747,7 @@ void UART_check( void )
     if ( fSendData )
     {
         fSendData = false;
-
+    DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
         switch ( Robot_State )
         {
             // ----- OBSERVATION ------  
@@ -674,10 +766,10 @@ void UART_check( void )
             case ROBOT_STATE_BALANCING:                    
                 Send_6_integers_over_UART
                 (
-                    /*BLUE*/    PID_actVal              * 10.0f ,
-                    /*VIOL*/    PID_actVal_angle_volt   * 10.0f ,
-                    /*REDD*/    PID_actVal_rate_volt    * 10.0f ,
-                    /*YELL*/    0.0f ,
+                    /*BLUE*/    Pitch_AngleDeg_CoFil    * 10.0f ,
+                    /*VIOL*/    PID_actVal              * 10.0f ,
+                    /*REDD*/    PID_actVal_angle_volt   * 10.0f ,
+                    /*YELL*/    PID_actVal_rate_volt    * 10.0f ,
                     /*GREE*/    0.0f ,
                     /*ORAN*/    0.0f 
                 );
@@ -695,27 +787,28 @@ void UART_check( void )
                 );                    
                 break;    
         } 
+    DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
     }
 
-    if ( Robot_State != Robot_State_1 )
-    {
-        switch ( Robot_State )
-        {
-            case ROBOT_STATE_INIT:
-                LED_Sequence = LED_SEQUENCE_1;
-                Robot_State_1 = Robot_State;
-                break;
-            case ROBOT_STATE_BALANCING:
-                LED_Sequence = LED_SEQUENCE_2;
-                Robot_State_1 = Robot_State;
-                break;
+    // if ( Robot_State != Robot_State_1 )
+    // {
+    //     switch ( Robot_State )
+    //     {
+    //         case ROBOT_STATE_INIT:
+    //             LED_Sequence_Actual = LED_SEQUENCE_1;
+    //             Robot_State_1 = Robot_State;
+    //             break;
+    //         case ROBOT_STATE_BALANCING:
+    //             LED_Sequence_Actual = LED_SEQUENCE_2;
+    //             Robot_State_1 = Robot_State;
+    //             break;
 
-            case ROBOT_STATE_CALIBRATE:
-                LED_Sequence = LED_SEQUENCE_3;
-                Robot_State_1 = Robot_State;
-                break;    
-        }
-    }
+    //         case ROBOT_STATE_CALIBRATE:
+    //             LED_Sequence_Actual = LED_SEQUENCE_3;
+    //             Robot_State_1 = Robot_State;
+    //             break;    
+    //     }
+    // }
 }
 
 // ----- MOTOR PWM -----
@@ -767,28 +860,52 @@ void MPU_check ( void )
 
         switch ( MPU_switch )
         {
-            default:
-                MPU_switch = 1;
-                break;
             case 1:
-                if ( MPU_ExitSleep() == 0 )
+                MPU_ExitSleep_Return = MPU_ExitSleep();
+                if (  MPU_ExitSleep_Return == 0 ) {
                     MPU_switch = 2;
+                    LED_Sequence_Actual = LED_SEQUENCE_2;
+                } else {
+                    errorCnt[6]++;
+                    MPU_switch = 1;
+                    fMotorEnable = false;
+                    LED_Sequence_Actual = LED_SEQUENCE_1;
+                }
                 break;
             case 2:
-                if ( MPU_WhoAmI() == 0 ) { // takes ~105us @400kHz
-                    if ( MPU_WhoAmI_data == 104 )
+                MPU_WhoAmI_data = 0x00;
+                MPU_WhoAmI_Return = MPU_WhoAmI();   // takes ~105us @400kHz
+                if ( MPU_WhoAmI_Return == 0 ) {
+                    if ( MPU_WhoAmI_data == 104 ) {
                         MPU_switch = 3;
+                        fMotorEnable = true;
+                        LED_Sequence_Actual = LED_SEQUENCE_3;
+                    } else {
+                        MPU_switch = 1;
+                        fMotorEnable = false;
+                        LED_Sequence_Actual = LED_SEQUENCE_1;
+                    }
+                } else {
+                    MPU_switch = 1;
+                    fMotorEnable = false;
+                    LED_Sequence_Actual = LED_SEQUENCE_1;
                 }
                 break;
-            case 3:
-                DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
-                
-                if ( MPU_GetAccTempGyro() > 0 ) { // takes ~410us @400kHz
+            case 3:      
+        DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
+                MPU_GetAccTempGyro_Return = MPU_GetAccTempGyro();   // takes ~410us @400kHz
+        DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
+                if ( MPU_GetAccTempGyro_Return != 0 ) { 
                     MPU_switch = 1;
-                    auxCnt[0]++;
+                    fMotorEnable = false;
+                    LED_Sequence_Actual = LED_SEQUENCE_1;
+                    errorCnt[0]++;
                 }
 
-                DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
+                break;
+            default:
+                MPU_switch = 1;
+                LED_Sequence_Actual = LED_SEQUENCE_1;
                 break;
         }
     }
@@ -805,6 +922,15 @@ uint16_t MPU_ExitSleep( void )
 
     // Fill the FIFO. The FIFO is 8-bytes deep, and this function will return number of bytes written to FIFO
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
+
+    // Enable TXFIFO trigger interrupt if there are more bytes to send
+    if ( gTxCount < gTxLen )
+    {
+        DL_I2C_enableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
+    } else {
+        DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
+    }
+
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
     // ORIGINAL
@@ -961,7 +1087,7 @@ uint16_t MPU_GetAccTempGyro( void )
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        auxCnt[1]++;
+        errorCnt[1]++;
     }
 
     // Send data to Slave - Write (0)
@@ -976,7 +1102,7 @@ uint16_t MPU_GetAccTempGyro( void )
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        auxCnt[2]++;
+        errorCnt[2]++;
     }
 
     /* Wait until the Controller sends all bytes */
@@ -992,7 +1118,7 @@ uint16_t MPU_GetAccTempGyro( void )
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        auxCnt[3]++;
+        errorCnt[3]++;
     }
 
     // ORIGINAL
@@ -1004,7 +1130,7 @@ uint16_t MPU_GetAccTempGyro( void )
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        auxCnt[4]++;
+        errorCnt[4]++;
     }
 
     //----- REPEAT START -----
@@ -1031,7 +1157,7 @@ uint16_t MPU_GetAccTempGyro( void )
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        auxCnt[5]++;
+        errorCnt[5]++;
     }
 
     MPU_accX_raw = (int16_t)gRxPacket[ 0 ] << 8;	// read High byte
@@ -1131,16 +1257,16 @@ void OMEGA_check( void )
         omega_M0_rads = -2.0f * PI_NUMBER * ( (float)( cQuadM0 - cQuadM0_1 ) ) * 1/TIME_MOTOR_OMEGA_S / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
         theta_M0_rad  = -2.0f * PI_NUMBER * (float)( cQuadM0 ) / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
         cQuadM0_1 = cQuadM0;
-        cQuadM0_1 = cQuadM0;
+        // cQuadM0_1 = cQuadM0;
         
         omega_M1_rads = 2.0f * PI_NUMBER * ( (float)( cQuadM1 - cQuadM1_1 ) ) * 1/TIME_MOTOR_OMEGA_S / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
         theta_M1_rad  = 2.0f * PI_NUMBER * (float)( cQuadM1 ) / GEAR_RATIO / IMPULSES_PER_REVOLUTION;
         cQuadM1_1 = cQuadM1;
-        cQuadM1_1 = cQuadM1;
+        // cQuadM1_1 = cQuadM1;
 
         // Robot speed and position calculation
         robot_pos_m = 0.5f * ( theta_M0_rad + theta_M1_rad ) * WHEEL_RADIUS_M;
-        robot_speed_ms = ( robot_pos_m - robot_pos_m_1 ) * 1/TIME_MOTOR_OMEGA_S;
+        robot_speed_ms = ( robot_pos_m - robot_pos_m_1 ) * 1.0f/TIME_MOTOR_OMEGA_S;
         robot_pos_m_1 = robot_pos_m;
     }
 }
@@ -1242,4 +1368,3 @@ void QUAD_check( void )
         }	
     } 
 }
-   
