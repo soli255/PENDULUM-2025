@@ -2,7 +2,7 @@
 
 Welcome to **PENDULUM ROBOT** — an Inverted Pendulum two wheeled robot as next version to 2024 model. This repository contains the source code and resources for it. Whether you're a developer, contributor, or just curious, this README will help you get started.
 
-![Project Screenshot](./IMG Pend-2025-1.png) 
+![Project Screenshot](./IMG Pend-2025-1.png)
 
 ## 📦 Features
 
@@ -21,3 +21,4 @@ Welcome to **PENDULUM ROBOT** — an Inverted Pendulum two wheeled robot as next
 
 ## 🔧 Body Diagram
 
+<img width="966" height="751" alt="IMG Pend-2025-1" src="https://github.com/user-attachments/assets/ad414592-140b-4226-a7e2-e6423210042f" />
