@@ -179,23 +179,15 @@ TIMER1.interrupts         = ["ZERO"];
 TIMER1.interruptPriority  = "2";
 TIMER1.peripheral.$assign = "TIMG0";
 
-UART1.enabledInterrupts                = ["RX","TX"];
-UART1.interruptPriority                = "1";
-UART1.targetBaudRate                   = 250000;
-UART1.uartClkDiv                       = "8";
-UART1.$name                            = "UART_0";
-UART1.peripheral.$assign               = "UART0";
-UART1.peripheral.rxPin.$assign         = "PB1";
-UART1.peripheral.txPin.$assign         = "PB0";
-UART1.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric15";
-UART1.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
-UART1.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART1.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART1.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART1.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric16";
-UART1.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART1.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART1.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART1.$name                    = "UART_0";
+UART1.enabledInterrupts        = ["RX","TX"];
+UART1.interruptPriority        = "1";
+UART1.targetBaudRate           = 460800;
+UART1.peripheral.$assign       = "UART0";
+UART1.peripheral.rxPin.$assign = "PB1";
+UART1.peripheral.txPin.$assign = "PB0";
+UART1.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric15";
+UART1.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric16";
 
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
