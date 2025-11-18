@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-11-08 2359             *****
+*****   2025-11-18 1030             *****
 ****************************************/
 
 #include <stdbool.h>
@@ -30,10 +30,10 @@
 #define     TIME_MPU_READ_SEC       0.002f      // in seconds
 #define     TIME_PID_CONTROLLER_MS  4           // MAIN PID loop control sample time
 
-#define     ANGLE_DEG_LIMIT_NEG     -25.0f      // negative angle limit - beyond PID controll os OFF    
-#define     ANGLE_DEG_LIMIT_POS     25.0f      // positive limit
-#define     ANGLE_DEG_HYST          9.9f       // hysteresis
-#define     ANGLE_DEG_DEFAULT       0.01f      // default upright angle for ballancing
+#define     ANGLE_DEG_LIMIT_NEG     -45.0f      // negative angle limit - beyond PID controll os OFF    
+#define     ANGLE_DEG_LIMIT_POS     45.0f       // positive limit
+#define     ANGLE_DEG_HYST          9.9f        // hysteresis
+#define     ANGLE_DEG_DEFAULT       0.01f       // default upright angle for ballancing
 
 #define     VOLT_MOTOR_LIMIT_NEG    -8.5f       // Action value limit - motor maximum voltage
 #define     VOLT_MOTOR_LIMIT_POS    8.5f
@@ -53,15 +53,15 @@
 
 #define     ALPHA_DEFAULT           0.02f      // Complementary filter coefficient
 
-#define     P_GAIN_def              0.03f
+#define     P_GAIN_def              0.10f
 #define     I_GAIN_def              0.00f
 #define     D_GAIN_def              0.02f
+#define     C_GAIN_LH_RH_def        1.0f 
+#define     N_FILTER_def            2.0f        // smaller N means stronger filtering.
+#define     GYRO_DAMP_def           15.0f       // Use angular velocity (from gyroscope) as a damping term
 // #define     P_GAIN_def              0.35f
 // #define     I_GAIN_def              0.01f
 // #define     D_GAIN_def              -15.0f
-#define     N_FILTER_def            5.0f        // smaller N means stronger filtering.
-#define     C_GAIN_LH_RH_def        1.0f 
-#define     GYRO_DAMP_def           5.0f      // Use angular velocity (from gyroscope) as a damping term
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
 #define     GEAR_RATIO              50.0f
@@ -163,19 +163,19 @@ volatile    int16_t     N_Gain_received = 0;
 volatile    int16_t     G_Gain_received = 0;
 // TX
 #define     SIGNAL_CNT  (24U)                                           // count of Signals that will be sended over UART
-#define     BLOCK_SIZE  (7U)                                            // Signals -99999 to +99999 range (6 characters max) + coma separator
+#define     SIGNAL_RNG  (7U)                                            // Signals -99999 to +99999 range (6 characters max) + coma separator
 volatile    int32_t     UART0_signals[ SIGNAL_CNT ];                    // Signals are stored in fiel to use for-cycle - now global
-volatile    uint8_t     UART0_message[ SIGNAL_CNT * BLOCK_SIZE + 1 ];   // array with message (Signals + separators + terminator) - max. size
+volatile    uint8_t     UART0_message[ SIGNAL_CNT * SIGNAL_RNG + 1 ];   // array with message (Signals + separators + terminator) - max. size
 volatile    uint8_t     UART0_MessageLength = 0;
 volatile    uint8_t     UART0_TXbytes = 0;
 
 // ----- I2C1 -----
-#define I2C_TX_MAX_PACKET_SIZE (16U)
-#define I2C_RX_MAX_PACKET_SIZE (16U)
-    uint8_t     gTxPacket[ I2C_TX_MAX_PACKET_SIZE ] = { 0x00 , 0x01 , 0x02 , 0x03 , 0x04 , 0x05 , 0x06 , 0x07 , 0x08 , 0x09 , 0x0A , 0x0B , 0x0C , 0x0D , 0x0E , 0x0F };
-    uint8_t     gRxPacket[ I2C_RX_MAX_PACKET_SIZE ] = { 0x00 , 0x01 , 0x02 , 0x03 , 0x04 , 0x05 , 0x06 , 0x07 , 0x08 , 0x09 , 0x0A , 0x0B , 0x0C , 0x0D , 0x0E , 0x0F };
-    uint32_t    gTxLen = 0U, gTxCount = 0U;     // Counters for TX length and bytes sent
-    uint32_t    gRxLen = 0U, gRxCount = 0U;     // Counters for RX length and bytes sent
+#define     I2C_TX_MAX_PACKET_SIZE (16U)
+#define     I2C_RX_MAX_PACKET_SIZE (16U)
+uint8_t     gTxPacket[ I2C_TX_MAX_PACKET_SIZE ] = { 0x00 , 0x01 , 0x02 , 0x03 , 0x04 , 0x05 , 0x06 , 0x07 , 0x08 , 0x09 , 0x0A , 0x0B , 0x0C , 0x0D , 0x0E , 0x0F };
+uint8_t     gRxPacket[ I2C_RX_MAX_PACKET_SIZE ] = { 0x00 , 0x01 , 0x02 , 0x03 , 0x04 , 0x05 , 0x06 , 0x07 , 0x08 , 0x09 , 0x0A , 0x0B , 0x0C , 0x0D , 0x0E , 0x0F };
+uint32_t    gTxLen = 0U, gTxCount = 0U;                 // Counters for TX length and bytes sent
+uint32_t    gRxLen = 0U, gRxCount = 0U;                 // Counters for RX length and bytes sent
 volatile    uint16_t    I2C_Anti_Block = 0U;            // Anti Block System for IIC 
 volatile    uint16_t    I2C_Flag_Block = 0U;            // Anti Block System for IIC 
 // Indicates status of I2C
@@ -394,7 +394,7 @@ void UART_0_INST_IRQHandler( void )
         case DL_UART_MAIN_IIDX_RX:
             UART0_RXbytes &= UART0_RX_BUFFER_SIZE - 1U;  // mask to prevent overflow
             UART0_RXbuffer[ UART0_RXbytes ] = DL_UART_Main_receiveData( UART_0_INST );
-            //Check terminator
+            // Check terminator
             if( UART0_RXbuffer[ UART0_RXbytes ] == '\n' )
                 UART0_terminator_detected = true;
             UART0_RXbytes++;
@@ -746,7 +746,9 @@ void UART_check( void )
     if ( UART0_terminator_detected ) {
         UART0_terminator_detected = false;
 
-        checkForGainCommand();       
+        checkForGainCommand();   
+
+        clearUART0_RXbuffer_Zero();   
     }
     // ----- SEND DATA OVER UART -----
     if ( fSendData )
@@ -810,73 +812,68 @@ bool checkForGainCommand(void)
         UART0_RXbuffer[5] == '=')
     {
         // Look for '\n' terminator
-        for (int i = 6; i < UART0_RX_BUFFER_SIZE; ++i)
+        for (uint8_t i = 6; i < UART0_RX_BUFFER_SIZE; ++i)
         {
             if (UART0_RXbuffer[i] == '\n')
             {
                 // Extract value substring
                 char valueStr[8] = {0};
-                int len = i - 6;
+                uint8_t len = i - 6;
                 if (len > 0 && len < sizeof(valueStr))
                 {
-                    for (int j = 0; j < len; ++j)
+                    for (uint8_t j = 0; j < len; ++j)
                     {
                         valueStr[j] = UART0_RXbuffer[6 + j];
                     }
 
-                    int value = atoi(valueStr);
+                    int16_t value = atoi(valueStr);
 
                     // Assign to correct variable
                     switch (gainType)
                     {
                         case 'P': 
                             P_Gain_received = value;
-                            if ( P_Gain_received >= 0 ) {
+                            if ( 100 >= P_Gain_received && P_Gain_received >= 0 ) { // P shall be small and positive
                                 P_gain = (float)P_Gain_received / 100.0f;
                             }
                             break;
                         case 'I': 
                             I_Gain_received = value;
-                            if ( I_Gain_received >= 0 ) {
-                                I_gain = (float)I_Gain_received / 100.0f;
+                            if ( 100 >= I_Gain_received && I_Gain_received >= 0 ) { // I shall be small and positive
+                                I_gain = (float)I_Gain_received / 10000.0f;
                             }
                             break;
                         case 'D':
                             D_Gain_received = value;
-                            if ( D_Gain_received >= 0  ) {
+                            if ( 100 >= D_Gain_received && D_Gain_received >= -100  ) { // D shall be small
                                 D_gain = (float)D_Gain_received / 100.0f;
                             }
                             break;
                         case 'C':
                             C_Gain_received = value;
-                            if ( C_Gain_received >= 0 ) {
+                            if ( 10000 >= C_Gain_received && C_Gain_received >= 0 ) {   // C could be large and positive
                                 C_gain_LH_RH = (float)C_Gain_received / 100.0f;
                             }
                             break;
                         case 'N':
                             N_Gain_received = value;
-                            if ( N_Gain_received >= 0 ) {
+                            if ( 2000 >= N_Gain_received && N_Gain_received >= 0 ) {    // N could be large and positive
                                 N_coef = (float)N_Gain_received / 100.0f;
                             }
                             break;
                         case 'G':
                             G_Gain_received = value;
-                            if ( G_Gain_received >= 0 ) {
+                            if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
                                 G_damp = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         default: return false;
                     }
-
-                    clearUART0_RXbuffer_Zero();
                     return true;
                 }
             }
         }
-    } else {
-        clearUART0_RXbuffer_Zero(); // false command received
     }
-
     return false;
 }
 
