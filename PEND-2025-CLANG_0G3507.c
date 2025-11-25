@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-11-22 2200             *****
+*****   2025-11-25 1930             *****
 ****************************************/
 #include <stdbool.h>
 #include <string.h>
@@ -16,10 +16,10 @@
 #define     LED_HEART_ON_MS         (150U)
 #define     LED_HEART_OFF_MS        (150U)
 #define     LED_TICK_COUNT          (12U)
-#define     LED_SEQUENCE_1          (0b1)
-#define     LED_SEQUENCE_2          (0b101)
-#define     LED_SEQUENCE_3          (0b10101)
-#define     LED_SEQUENCE_4          (0b1010101)
+#define     LED_SEQUENCE_1          (0b1)       // one blinnk
+#define     LED_SEQUENCE_2          (0b101)     // two blink
+#define     LED_SEQUENCE_3          (0b10101)   // three blink
+#define     LED_SEQUENCE_4          (0b1010101) // four blink
 
 #define     TIME_SEND_DATA_MS       (100U)      // 10Hz send data rate
 #define     TIME_MOTOR_OMEGA_MS     (50U)       // rate to calculate impulses to determine motor speed
@@ -112,9 +112,10 @@ volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
 volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    cPIDcontroller  = TIME_PID_CONTROLLER_MS;
 
-volatile    uint32_t    errorCnt[ 10 ];
-volatile    uint16_t    dt_us[3] = { 0U , 0U , 0U };   // delta time in us
-volatile    uint16_t    t0_us[3] = { 0U , 0U , 0U };   // save timer value
+volatile    uint32_t    er_ct[ 24 ];
+volatile    uint16_t    dt_us[ 3 ]      = { 0U , 0U , 0U };   // delta time in us
+volatile    uint16_t    t0_us[ 3 ]      = { 0U , 0U , 0U };   // save timer value
+volatile    uint32_t    ab_ct[ 24 ]; 
 
 // ----- MOTOR QUADRATURE ENCODERS -----
 volatile    int32_t     cQuadM0 = 0 , cQuadM0_1 = 0;
@@ -127,7 +128,7 @@ volatile    uint32_t    ADC_LSB[  ADC_CHANNELS ];       // [ LSB ]
 volatile    float       ADC_volt[ ADC_CHANNELS ];       // [ V ]
 volatile    float       Batt_volt       = VOLT_BATTERY_DEF;
 volatile    float       Batt_volt_ema   = VOLT_BATTERY_DEF;
-volatile    float       Beta_ema_volt  = BETA_EMA_BAT_VOLT;
+volatile    float       Beta_ema_volt   = BETA_EMA_BAT_VOLT;
 volatile    float       Zeta_ema_curr   = ZETA_EMA_MOT_CURR;
 volatile    float       Motor0_curr_mA      = 0.0f , Motor1_curr_mA     = 0.0f;
 volatile    float       Motor0_curr_mA_med  = 0.0f , Motor1_curr_mA_med = 0.0f;
@@ -213,11 +214,12 @@ enum I2cControllerStatus
 // ----- MPU-6050 -----
 //MPU physical AD0 = 0
 #define     MPU_ADDRESS ( 0b1101000 )  // MPU slave address in 7bit format
-volatile	uint8_t		MPU_WhoAmI_data = 0;
-volatile	uint8_t		MPU_switch = 1;
-volatile    uint16_t    MPU_WhoAmI_Return = 0;
-volatile    uint16_t    MPU_ExitSleep_Return = 0;
-volatile    uint16_t    MPU_GetAccTempGyro_Return = 0;
+volatile	uint8_t		MPU_WhoAmI_data = 0U;
+volatile	uint8_t		MPU_switch = 0U;
+volatile    uint32_t    MPU_switch_transition_cnt = 0U;
+volatile    uint16_t    MPU_WhoAmI_Return = 0U;
+volatile    uint16_t    MPU_ExitSleep_Return = 0U;
+volatile    uint16_t    MPU_GetAccTempGyro_Return = 0U;
 // raw data registers
 volatile	int16_t	    MPU_temp = 0;
 volatile	int16_t	    MPU_accX = 0, MPU_accY = 0, MPU_accZ = 0;
@@ -266,13 +268,14 @@ void    SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
 void    Motor_M0_volt( float argVoltM0 );
 void    Motor_M1_volt( float argVoltM1 );
 bool    checkForGainCommand( void );
+bool    checkForCommand2( void );
 void    clearUART0_RXbuffer_Zero(void);
 uint16_t MPU_ExitSleep( void );
 uint16_t MPU_WhoAmI( void );
 uint16_t MPU_GetAccTempGyro( void );
 uint16_t Send_integers_over_UART( uint8_t argCount );
 static inline float atan2_fast(float y, float x, int precision_level);
-static inline float atan2_fast_cordic(float y, float x, int precision_level);
+// static inline float atan2_fast_cordic(float y, float x, int precision_level);
 int32_t median3(int32_t a, int32_t b, int32_t c);
 float find_max(const volatile float *arr, int size);
 
@@ -944,6 +947,139 @@ bool checkForGainCommand( void )
     return false;
 }
 
+bool checkForCommand2( void )
+{
+    char typeChar = UART0_RXbuffer[0];
+
+    // -------- Branch 1: xGAIN= --------
+    if (UART0_RXbuffer[1]=='G' && UART0_RXbuffer[2]=='A' &&
+        UART0_RXbuffer[3]=='I' && UART0_RXbuffer[4]=='N' &&
+        UART0_RXbuffer[5]=='=')
+    {
+        // find terminator
+        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
+        {
+            if (UART0_RXbuffer[i]=='\n')
+            {
+                char valueStr[8] = {0};
+                uint8_t len = i-6;
+                if (len>0 && len<sizeof(valueStr))
+                {
+                    for (uint8_t j=0; j<len; j++)
+                        valueStr[j] = UART0_RXbuffer[6+j];
+
+                    int16_t value = atoi(valueStr);
+
+                    switch(typeChar)
+                    {
+                        case 'P': P_Gain_received=value;
+                                  if(value>=0 && value<=100)
+                                      P_gain=(float)value/100.0f;
+                                  break;
+                        case 'I': I_Gain_received=value;
+                                  if(value>=0 && value<=100)
+                                      I_gain=(float)value/10000.0f;
+                                  break;
+                        case 'D': D_Gain_received=value;
+                                  if(value>=-100 && value<=100)
+                                      D_gain=(float)value/100.0f;
+                                  break;
+                        case 'C': C_Gain_received=value;
+                                  if(value>=0 && value<=10000)
+                                      C_gain_LH_RH=(float)value/100.0f;
+                                  break;
+                        case 'N': N_Gain_received=value;
+                                  if(value>=0 && value<=2000)
+                                      N_coef=(float)value/100.0f;
+                                  break;
+                        case 'G': G_Gain_received=value;
+                                  if(value>=0 && value<=2000)
+                                      G_damp=(float)value/100.0f;
+                                  break;
+                        case 'A': A_Filt_received=value;
+                                  if(value>=0 && value<=100)
+                                      Alpha_cf_MPU=(float)value/100.0f;
+                                  break;
+                        case 'Z': Z_Filt_received=value;
+                                  if(value>=0 && value<=100)
+                                      Zeta_ema_curr=(float)value/100.0f;
+                                  break;
+                        default: return false;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // -------- Branch 2: yPARA= --------
+    if (UART0_RXbuffer[1]=='P' && UART0_RXbuffer[2]=='A' &&
+        UART0_RXbuffer[3]=='R' && UART0_RXbuffer[4]=='A' &&
+        UART0_RXbuffer[5]=='=')
+    {
+        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
+        {
+            if (UART0_RXbuffer[i]=='\n')
+            {
+                char valueStr[8]={0};
+                uint8_t len=i-6;
+                if(len>0 && len<sizeof(valueStr))
+                {
+                    for(uint8_t j=0;j<len;j++)
+                        valueStr[j]=UART0_RXbuffer[6+j];
+                    int16_t value=atoi(valueStr);
+
+                    // Example: assign to parameter variable
+                    switch(typeChar)
+                    {
+                        // case 'K': Kpara_received=value;
+                        //           Kpara_flag=(value!=0);
+                        //           break;
+                        // add other PARA parameters here
+                        default: return false;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    // -------- Branch 3: zOFFS= --------
+    if (UART0_RXbuffer[1]=='O' && UART0_RXbuffer[2]=='F' &&
+        UART0_RXbuffer[3]=='F' && UART0_RXbuffer[4]=='S' &&
+        UART0_RXbuffer[5]=='=')
+    {
+        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
+        {
+            if (UART0_RXbuffer[i]=='\n')
+            {
+                char valueStr[8]={0};
+                uint8_t len=i-6;
+                if(len>0 && len<sizeof(valueStr))
+                {
+                    for(uint8_t j=0;j<len;j++)
+                        valueStr[j]=UART0_RXbuffer[6+j];
+                    int16_t value=atoi(valueStr);
+
+                    // Example: assign to offset variable
+                    switch(typeChar)
+                    {
+                        // case 'X': X_offset=value; break;
+                        // case 'Y': Y_offset=value; break;
+                        // case 'Z': Z_offset=value; break;
+                        // add other OFFS parameters here
+                        default: return false;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+
 void clearUART0_RXbuffer_Zero( void )
 {
     for ( int i = 0; i < UART0_RX_BUFFER_SIZE; ++i )
@@ -1002,52 +1138,57 @@ void MPU_check ( void )
 
         switch ( MPU_switch )
         {
-            case 1:
+            case 0:
                 MPU_ExitSleep_Return = MPU_ExitSleep();
                 if (  MPU_ExitSleep_Return == 0 ) {
-                    MPU_switch = 2;
-                    LED_Sequence_Actual = LED_SEQUENCE_2;
-                } else {
-                    errorCnt[6]++;
                     MPU_switch = 1;
+                    LED_Sequence_Actual = LED_SEQUENCE_2;
+                    MPU_switch_transition_cnt++;
+                } else {
+                    MPU_switch = 0;
                     fMotorEnable = false;
                     LED_Sequence_Actual = LED_SEQUENCE_1;
+                    er_ct[0]++;
                 }
                 break;
-            case 2:
+            case 1:
                 MPU_WhoAmI_data = 0x00;
                 MPU_WhoAmI_Return = MPU_WhoAmI();   // takes ~105us @400kHz
                 if ( MPU_WhoAmI_Return == 0 ) {
                     if ( MPU_WhoAmI_data == 104 ) {
-                        MPU_switch = 3;
+                        MPU_switch = 2;
                         fMotorEnable = true;
                         LED_Sequence_Actual = LED_SEQUENCE_3;
+                        MPU_switch_transition_cnt++;
                     } else {
-                        MPU_switch = 1;
+                        MPU_switch = 0;
                         fMotorEnable = false;
                         LED_Sequence_Actual = LED_SEQUENCE_1;
+                        er_ct[1]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
                     }
                 } else {
-                    MPU_switch = 1;
+                    MPU_switch = 0;
                     fMotorEnable = false;
                     LED_Sequence_Actual = LED_SEQUENCE_1;
+                    er_ct[2]++;
                 }
                 break;
-            case 3:      
+            case 2:      
         DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
                 MPU_GetAccTempGyro_Return = MPU_GetAccTempGyro();   // takes ~410us @400kHz
         DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
                 if ( MPU_GetAccTempGyro_Return != 0 ) { 
-                    MPU_switch = 1;
+                    MPU_switch = 0;
                     fMotorEnable = false;
                     LED_Sequence_Actual = LED_SEQUENCE_1;
-                    errorCnt[0]++;
+                    er_ct[3]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
                 }
 
                 break;
             default:
-                MPU_switch = 1;
+                MPU_switch = 0;
                 LED_Sequence_Actual = LED_SEQUENCE_1;
+                er_ct[4]++;
                 break;
         }
     }
@@ -1076,22 +1217,25 @@ uint16_t MPU_ExitSleep( void )
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
 
-    // ANTIBLOCK 
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 5 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-
+        er_ct[5]++;
+    }
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
  
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 6 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
+        er_ct[6]++;
+    }
 
     return I2C_Flag_Block;
 }
@@ -1118,36 +1262,44 @@ uint16_t MPU_WhoAmI( void )
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
  
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 7 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
+        er_ct[7]++;
+    }
   
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
     
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 8 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-  
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+        er_ct[8]++;
+    }
+
+    // ANTIBLOCK - count down to 994
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 9 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
+        er_ct[9]++;
+    }
     
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - countdown to 768
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 10 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
+        er_ct[10]++;
+    }
 
     //----- REPEAT START -----
 
@@ -1158,12 +1310,14 @@ uint16_t MPU_WhoAmI( void )
     // Send data to Slave - Request to read (1)
     DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
 
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
-    if ( I2C_Anti_Block == 0 )
+    ab_ct[ 11 ] = I2C_Anti_Block;
+    if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
+        er_ct[11]++;
+    }
     
     MPU_WhoAmI_data = gRxPacket[ 0 ];	// read one byte
 
@@ -1193,61 +1347,63 @@ uint16_t MPU_GetAccTempGyro( void )
     // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
 
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
+    ab_ct[ 13 ] = I2C_Anti_Block;
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        errorCnt[1]++;
+        er_ct[13]++;
     }
 
     // Send data to Slave - Write (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
     
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - stays at 1000
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
+    ab_ct[ 14 ] = I2C_Anti_Block;
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        errorCnt[2]++;
+        er_ct[14]++;
     }
 
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - count down to 994
+    for ( I2C_Anti_Block = 8000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
+    ab_ct[ 15 ] = I2C_Anti_Block;
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        errorCnt[3]++;
+        er_ct[15]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
     }
 
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 255 ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - count down to 768
+    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-
+    ab_ct[ 16 ] = I2C_Anti_Block;
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        errorCnt[4]++;
+        er_ct[16]++;
     }
 
     //----- REPEAT START -----
-
     // Send a read request to Target
     gRxLen               = 14;
     gRxCount             = 0;
     gI2cControllerStatus = I2C_STATUS_RX_STARTED;
-    // Send data to Slave - Request to read (1)
+    // Send data to Slave - Request to read (14 bytes - 2*(ACCx+ACCy+ACCz+GYROx+GYROy+GYROz+TEMP))
     DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
 
-    // ANTIBLOCK
-    for ( I2C_Anti_Block = 15000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+t0_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
+    // ANTIBLOCK - count down to 8549 -> this takes 366us
+    for ( I2C_Anti_Block = 10000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
+    ab_ct[ 17 ] = I2C_Anti_Block;
+dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
-        errorCnt[5]++;
+        er_ct[17]++;
     }
 
     MPU_accX_raw = (int16_t)gRxPacket[ 0 ] << 8;	// read High byte
@@ -1271,30 +1427,27 @@ uint16_t MPU_GetAccTempGyro( void )
 
 // TRIGINOMETRY USED TO DETERMINE ANGLES - theta, psi, phi
 // https://www.analog.com/en/resources/app-notes/an-1057.html
-t0_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
+t0_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
     Angle_Pitch_Deg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
     Angle_Roll_Deg  = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
     Angle_Yaw_Deg   = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
-dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
+dt_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[1];
 
-t0_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
+t0_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
     Angle_Pitch_Deg_rp_fast = RAD_TO_DEG * atan2_fast( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) , gprecision_level );
     Angle_Roll_Deg_rp_fast  = RAD_TO_DEG * atan2_fast( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) , gprecision_level );
     Angle_Yaw_Deg_rp_fast   = RAD_TO_DEG * atan2_fast( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g , gprecision_level );
-dt_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[1];
-
-
-t0_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
-Angle_Pitch_Deg_delta = Angle_Pitch_Deg - Angle_Pitch_Deg_rp_fast;
-Angle_Pitch_Deg_delta_filtered = (0.1f) * Angle_Pitch_Deg_delta + (1.0f - 0.1f) * Angle_Pitch_Deg_delta_filtered; // Apply exponential filter
-if ( Angle_Pitch_Deg_delta_filtered <= 0.0f ) {
-    if ( Angle_Pitch_Deg_max_hold_neg > Angle_Pitch_Deg_delta_filtered )
-        Angle_Pitch_Deg_max_hold_neg = Angle_Pitch_Deg_delta_filtered;
-} else {
-    if (  Angle_Pitch_Deg_max_hold_pos < Angle_Pitch_Deg_delta_filtered )
-        Angle_Pitch_Deg_max_hold_pos = Angle_Pitch_Deg_delta_filtered;
-}
 dt_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[2];
+
+// Angle_Pitch_Deg_delta = Angle_Pitch_Deg - Angle_Pitch_Deg_rp_fast;
+// Angle_Pitch_Deg_delta_filtered = (0.1f) * Angle_Pitch_Deg_delta + (1.0f - 0.1f) * Angle_Pitch_Deg_delta_filtered; // Apply exponential filter
+// if ( Angle_Pitch_Deg_delta_filtered <= 0.0f ) {
+//     if ( Angle_Pitch_Deg_max_hold_neg > Angle_Pitch_Deg_delta_filtered )
+//         Angle_Pitch_Deg_max_hold_neg = Angle_Pitch_Deg_delta_filtered;
+// } else {
+//     if (  Angle_Pitch_Deg_max_hold_pos < Angle_Pitch_Deg_delta_filtered )
+//         Angle_Pitch_Deg_max_hold_pos = Angle_Pitch_Deg_delta_filtered;
+// }
 
     MPU_temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
 
