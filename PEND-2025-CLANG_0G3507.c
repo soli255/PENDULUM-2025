@@ -4,7 +4,7 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler CLANG -xx          *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2025-11-25 1930             *****
+*****   2025-12-04 2015             *****
 ****************************************/
 #include <stdbool.h>
 #include <string.h>
@@ -28,6 +28,16 @@
 #define     TIME_MPU_READ_MS        (2U)        // reading rate of MPU
 #define     TIME_MPU_READ_SEC       (0.002f)    // in seconds
 #define     TIME_PID_CONTROLLER_MS  (4U)        // MAIN PID loop control sample time
+#define     TIME_CRSF_MS            (50U)       //
+#define     TIME_FAIL_SAFE_MS       (1500U)     //
+
+#define     CRSF_MESSAGE_HEADER_SIZE (3U)
+#define     CRSF_MESSAGE_DATA_SIZE  (22U)
+#define     CRSF_MESSAGE_CRC_SIZE   (1U)
+#define     CRSF_MESSAGE_SIZE   CRSF_MESSAGE_HEADER_SIZE+CRSF_MESSAGE_DATA_SIZE+CRSF_MESSAGE_CRC_SIZE
+#define     CRSF_CHANNEL_COUNT      (16U)
+
+#define     POLYNOMIAL              (0xD5)      // Example CRC-8 polynomial
 
 #define     ANGLE_DEG_LIMIT_NEG     (-45.0f)    // negative angle limit - beyond PID controll os OFF    
 #define     ANGLE_DEG_LIMIT_POS     (45.0f)     // positive limit
@@ -84,6 +94,24 @@
 #define     PHASE_D                 (3U)
 #define     PHASE_COUNT             (4U)
 
+volatile uint8_t crc8tab[256] = {
+    0x00, 0xD5, 0x7F, 0xAA, 0xFE, 0x2B, 0x81, 0x54, 0x29, 0xFC, 0x56, 0x83, 0xD7, 0x02, 0xA8, 0x7D,
+    0x52, 0x87, 0x2D, 0xF8, 0xAC, 0x79, 0xD3, 0x06, 0x7B, 0xAE, 0x04, 0xD1, 0x85, 0x50, 0xFA, 0x2F,
+    0xA4, 0x71, 0xDB, 0x0E, 0x5A, 0x8F, 0x25, 0xF0, 0x8D, 0x58, 0xF2, 0x27, 0x73, 0xA6, 0x0C, 0xD9,
+    0xF6, 0x23, 0x89, 0x5C, 0x08, 0xDD, 0x77, 0xA2, 0xDF, 0x0A, 0xA0, 0x75, 0x21, 0xF4, 0x5E, 0x8B,
+    0x9D, 0x48, 0xE2, 0x37, 0x63, 0xB6, 0x1C, 0xC9, 0xB4, 0x61, 0xCB, 0x1E, 0x4A, 0x9F, 0x35, 0xE0,
+    0xCF, 0x1A, 0xB0, 0x65, 0x31, 0xE4, 0x4E, 0x9B, 0xE6, 0x33, 0x99, 0x4C, 0x18, 0xCD, 0x67, 0xB2,
+    0x39, 0xEC, 0x46, 0x93, 0xC7, 0x12, 0xB8, 0x6D, 0x10, 0xC5, 0x6F, 0xBA, 0xEE, 0x3B, 0x91, 0x44,
+    0x6B, 0xBE, 0x14, 0xC1, 0x95, 0x40, 0xEA, 0x3F, 0x42, 0x97, 0x3D, 0xE8, 0xBC, 0x69, 0xC3, 0x16,
+    0xEF, 0x3A, 0x90, 0x45, 0x11, 0xC4, 0x6E, 0xBB, 0xC6, 0x13, 0xB9, 0x6C, 0x38, 0xED, 0x47, 0x92,
+    0xBD, 0x68, 0xC2, 0x17, 0x43, 0x96, 0x3C, 0xE9, 0x94, 0x41, 0xEB, 0x3E, 0x6A, 0xBF, 0x15, 0xC0,
+    0x4B, 0x9E, 0x34, 0xE1, 0xB5, 0x60, 0xCA, 0x1F, 0x62, 0xB7, 0x1D, 0xC8, 0x9C, 0x49, 0xE3, 0x36,
+    0x19, 0xCC, 0x66, 0xB3, 0xE7, 0x32, 0x98, 0x4D, 0x30, 0xE5, 0x4F, 0x9A, 0xCE, 0x1B, 0xB1, 0x64,
+    0x72, 0xA7, 0x0D, 0xD8, 0x8C, 0x59, 0xF3, 0x26, 0x5B, 0x8E, 0x24, 0xF1, 0xA5, 0x70, 0xDA, 0x0F,
+    0x20, 0xF5, 0x5F, 0x8A, 0xDE, 0x0B, 0xA1, 0x74, 0x09, 0xDC, 0x76, 0xA3, 0xF7, 0x22, 0x88, 0x5D,
+    0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
+    0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
+
 volatile    uint8_t     gprecision_level = 1U;
 
 volatile    uint16_t    LED_Sequence_Actual    = LED_SEQUENCE_1;
@@ -102,6 +130,7 @@ volatile    bool        fQuadD          = false , fQuadD_1 = false;
 volatile    bool        fMotorOmega     = false;
 volatile    bool        fPIDcontroller  = false;
 volatile    bool        fMotorEnable    = false;
+volatile    bool        FlagCRSF = false;
 
 // ----- COUNTERS -----
 volatile    uint32_t    cHeartLED       = LED_HEART_ON_MS;
@@ -111,6 +140,8 @@ volatile    uint32_t    cMPUdelay       = TIME_MPU_DELAY_MS;
 volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
 volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    cPIDcontroller  = TIME_PID_CONTROLLER_MS;
+volatile    uint32_t    CounterFailSafe = 0U;
+volatile    uint32_t    CounterCRSF     = TIME_CRSF_MS;
 
 volatile    uint32_t    er_ct[ 24 ];
 volatile    uint16_t    dt_us[ 3 ]      = { 0U , 0U , 0U };   // delta time in us
@@ -164,7 +195,7 @@ volatile    float       PID_D_term_volt = 0.0f;
 volatile    float       PID_G_damp_volt = 0.0f;
 volatile    float       PID_C_LHRH_volt = 0.0f;
 
-// ----- USART0 -----
+// ----- UART0 -----
 // RX
 #define     RX0_BUFF_N  (4U) 
 #define     UART0_RX_BUFFER_SIZE (1U<<RX0_BUFF_N)
@@ -181,6 +212,7 @@ volatile    int16_t     G_Gain_received = 0;    // damping from Gyro
 volatile    int16_t     A_Filt_received = 0;    // Alpha coef. for MPU (complementary filter)
 volatile    int16_t     B_Filt_received = 0;    // Beta  coef. for Battery Voltage
 volatile    int16_t     Z_Filt_received = 0;    // Zeta  coef. for Motor Current
+volatile    int16_t     Y_Offs_received = 0;    // Y (PITCH) offset received
 // TX
 #define     SIGNAL_CNT  (28U)                                           // count of Signals that will be sended over UART
 #define     SIGNAL_RNG  (7U)                                            // Signals -99999 to +99999 range (6 characters max) + coma separator
@@ -188,6 +220,29 @@ volatile    int32_t     UART0_signals[ SIGNAL_CNT ];                    // Signa
 volatile    uint8_t     UART0_message[ SIGNAL_CNT * SIGNAL_RNG + 1 ];   // array with message (Signals + separators + terminator) - max. size
 volatile    uint8_t     UART0_MessageLength = 0;
 volatile    uint8_t     UART0_TXbytes = 0;
+
+// ----- UART1 -----
+#define     RX1_BUFF_N  (5U) 
+#define     UART1_RX_BUFFER_SIZE (1U<<RX1_BUFF_N)
+volatile    uint8_t     UART1_RXbuffer[ UART1_RX_BUFFER_SIZE ];
+volatile    uint8_t     UART1_RXbuffer_index = 0;
+volatile    uint8_t     UART1_TX_counter = 0;
+// Cross Fire
+volatile    uint32_t    CSFR_Header_match = 0;
+volatile    uint32_t    CSFR_CRC_match = 0;
+volatile    uint32_t    CSFR_CRC_error = 0;
+
+
+volatile    uint8_t     CSFR_Data_RX[ CRSF_MESSAGE_DATA_SIZE + CRSF_MESSAGE_CRC_SIZE ];
+volatile    uint8_t     CSFR_Data_Reversed[ CRSF_MESSAGE_DATA_SIZE ];
+volatile    uint8_t     CSFR_CRC_Received = 0;
+volatile    uint8_t     CSFR_CRC_Calculated = 0;
+volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
+
+volatile    int16_t    RC_roll     = 0; // Ch. 1
+volatile    int16_t    RC_pitch    = 0; // Ch. 2
+volatile    uint16_t   RC_throttle = 0; // Ch. 3
+volatile    int16_t    RC_yaw      = 0; // Ch. 4
 
 // ----- I2C1 -----
 #define     I2C_TX_MAX_PACKET_SIZE (16U)
@@ -249,6 +304,8 @@ volatile    float       Motor1_omega_rads;   // [rad/sec]
 
 volatile    float       Motor0_theta_rad;    // [rad]        motor Angle
 volatile    float       Motor1_theta_rad;    // [rad]     
+volatile    float       Motors_theta_error;
+volatile    float       Motors_theta_ref    = 0.0f;
 
 volatile    float       robot_pos_m;     // [m]
 volatile    float       robot_pos_m_1;
@@ -278,6 +335,11 @@ static inline float atan2_fast(float y, float x, int precision_level);
 // static inline float atan2_fast_cordic(float y, float x, int precision_level);
 int32_t median3(int32_t a, int32_t b, int32_t c);
 float find_max(const volatile float *arr, int size);
+uint8_t table_crc8( void );
+uint8_t compute_crc8( void );
+bool     CSFR_Extract_Data( void );
+void     CSFR_Parse_Data( void );
+uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev );
 
 // *****************************************  *****************************************  *****************************************
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
@@ -303,8 +365,37 @@ int main( void ) {
         
         OMEGA_check();  // calculate speed
 
-    }
+        // >> CROSS FIRE MESSAGE DETECTOR
+        if ( FlagCRSF )
+        {
+// DL_GPIO_setPins( PB15_PORT,DL_GPIO_PIN_16 );
+            FlagCRSF = false;
+            if ( CSFR_Extract_Data() && CounterFailSafe > 0 )
+            {
+                CSFR_Parse_Data();
+                //run motors
+                RC_roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+                RC_pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+                
+                Motors_theta_ref += 0.001f*RC_roll;
+                if ( Motors_theta_ref > 20.0f ) { Motors_theta_ref = 20.0f; }
+                if ( Motors_theta_ref < -20.0f ) { Motors_theta_ref = -20.0f; }
 
+                PID_angle_ref = ( -0.2f*RC_pitch );
+                if ( PID_angle_ref > 20.0f ) { PID_angle_ref = 20.0f; }
+                if ( PID_angle_ref < -20.0f ) { PID_angle_ref = -20.0f; }
+                
+            }
+            else
+            {
+                // default
+                PID_angle_ref = PID_angle_ref * 0.9f; // exp decay
+                RC_roll = 0;
+                RC_pitch = 0;
+            }
+// DL_GPIO_clearPins( PB15_PORT,DL_GPIO_PIN_16 );
+        }
+    }
 }
 
 // *****************************************  *****************************************  *****************************************
@@ -359,6 +450,14 @@ void TIMER_0_INST_IRQHandler()
         cSendData = TIME_SEND_DATA_MS;
         fSendData = true;
     }
+    if ( --CounterCRSF == 0 )
+    {
+        CounterCRSF = TIME_CRSF_MS;
+        FlagCRSF = true;
+    }
+    // COMMUNICATION TIME OUT - motors STOP
+    if ( CounterFailSafe > 0 )
+        --CounterFailSafe;
 }
 
 // Chan 0: VS1(Battery)
@@ -412,9 +511,8 @@ void ADC12_1_INST_IRQHandler( void )
 }
 
 /****************************************
-*****   UART 3 TRANSMITTER          *****
+*****   UART 0 TRANSCEIVER          *****
 ****************************************/
-
 void UART_0_INST_IRQHandler( void )
 {
     switch ( DL_UART_Main_getPendingInterrupt( UART_0_INST ) )
@@ -439,6 +537,28 @@ DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
                 UART0_TXbytes = 0;
 DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
             }
+        break;
+
+        default:
+            break;
+    }
+}
+
+/****************************************
+*****   UART 1 TRANSCEIVER          *****
+****************************************/
+void UART_1_INST_IRQHandler( void )
+{
+    switch ( DL_UART_Main_getPendingInterrupt( UART_1_INST ) )
+    {
+        case DL_UART_MAIN_IIDX_RX:
+            UART1_RXbuffer[ UART1_RXbuffer_index ] = DL_UART_Main_receiveData( UART_1_INST );
+            UART1_RXbuffer_index = ( UART1_RXbuffer_index + 1 ) % UART1_RX_BUFFER_SIZE;
+                // UART1_RXbuffer[ UART1_RXbuffer_index++ % UART1_RX_BUFFER_SIZE ] = DL_UART_Main_receiveData( UART_1_INST );  
+        break;
+
+        case DL_UART_MAIN_IIDX_TX:
+
         break;
 
         default:
@@ -529,6 +649,8 @@ void MCU_Init( void )
     // ***** UART 0 - enable interrupt *****
     NVIC_ClearPendingIRQ( UART_0_INST_INT_IRQN );
     NVIC_EnableIRQ( UART_0_INST_INT_IRQN );
+    NVIC_ClearPendingIRQ( UART_1_INST_INT_IRQN );
+    NVIC_EnableIRQ( UART_1_INST_INT_IRQN );
     // ***** I2C 1 - enable interrupt *****
     NVIC_EnableIRQ( I2C1_INST_INT_IRQN);
     // ***** default motor value - motor stop *****
@@ -571,7 +693,12 @@ void PID_check( void )
         PID_error_0 = PID_error;
         PID_actVal = PID_P_term_volt + PID_I_term_volt + PID_D_term_volt + PID_G_damp_volt;
 
-        PID_C_LHRH_volt = ( Motor0_theta_rad - Motor1_theta_rad ) * C_gain_LH_RH; 
+        Motors_theta_error = Motors_theta_ref - ( Motor0_theta_rad - Motor1_theta_rad );
+        PID_C_LHRH_volt = Motors_theta_error * C_gain_LH_RH; 
+
+        if ( PID_C_LHRH_volt > 2.5f ) { PID_C_LHRH_volt = 2.5f ; }
+        if ( PID_C_LHRH_volt < -2.5f ) { PID_C_LHRH_volt = -2.5f ; }
+        // PID_C_LHRH_volt = ( Motor0_theta_rad - Motor1_theta_rad ) * C_gain_LH_RH; 
 
         // PID_D_term_volt  = Gyro_Y_RateDegs         * D_gain;   // D
         
@@ -597,8 +724,10 @@ void PID_check( void )
                          ( Angle_Pitch_Deg_CoFil > ANGLE_DEG_LIMIT_NEG )
                         )            
                     {
-                        Motor_M0_volt( PID_actVal - PID_C_LHRH_volt );
-                        Motor_M1_volt( PID_actVal + PID_C_LHRH_volt );
+                        // Motor_M0_volt( PID_actVal - PID_C_LHRH_volt );
+                        // Motor_M1_volt( PID_actVal + PID_C_LHRH_volt );
+                        Motor_M0_volt( PID_actVal + PID_C_LHRH_volt );
+                        Motor_M1_volt( PID_actVal - PID_C_LHRH_volt );
                     }
         } else {
             Motor_M0_volt( 0.0f );
@@ -610,7 +739,6 @@ void PID_check( void )
 /*****************************
 *****   MOTOR VOLTAGE   *****
 *****************************/
-
 void Motor_M0_volt( float argVoltM0 )
 {
     uint16_t pwm_uint_value_M0 = 0;
@@ -777,19 +905,6 @@ void ADC_check( void )
             }
         }
     }
-    
-    // Exponential Moving Average
-    
-    // Motor1_curr_mA_ema  = Zeta_ema_curr * Motor1_curr_mA   + (1.0f-Zeta_ema_curr) * Motor1_curr_mA_ema;
-    // Median Buffer for Filtered Motors currents
-    // Motor0_buffer[ Motors_buff_idx ] = Motor0_curr_mA_ema;
-    // Motor1_buffer[ Motors_buff_idx ] = Motor1_curr_mA_ema;
-    // if ( ++Motors_buff_idx >= MEDIAN_MOTOR_CURRENT )
-    //     Motors_buff_idx = 0;
-    // Motor0_curr_mA_max = find_max( Motor0_buffer , MEDIAN_MOTOR_CURRENT );
-    // Motor1_curr_mA_max = find_max( Motor1_buffer , MEDIAN_MOTOR_CURRENT );
-    // Motor0_curr_mA_med = median7(Motor0_buffer);
-    // Motor1_curr_mA_med = median7(Motor1_buffer);
 }
 
 void UART_check( void )
@@ -798,7 +913,8 @@ void UART_check( void )
     if ( UART0_terminator_detected ) {
         UART0_terminator_detected = false;
 
-        checkForGainCommand();   
+        // checkForGainCommand();   
+        checkForCommand2();
 
         clearUART0_RXbuffer_Zero();   
     }
@@ -1062,10 +1178,16 @@ bool checkForCommand2( void )
                     int16_t value=atoi(valueStr);
 
                     // Example: assign to offset variable
-                    switch(typeChar)
+                    switch( typeChar )
                     {
                         // case 'X': X_offset=value; break;
-                        // case 'Y': Y_offset=value; break;
+                        case 'Y':
+                            Y_Offs_received = value;
+                            if( 1 == value || value == -1 )
+                                PID_angle_ref += value;
+                            else if ( value == 0 )
+                                PID_angle_ref = ANGLE_DEG_DEFAULT;
+                        break;
                         // case 'Z': Z_offset=value; break;
                         // add other OFFS parameters here
                         default: return false;
@@ -1079,7 +1201,6 @@ bool checkForCommand2( void )
     return false;
 }
 
-
 void clearUART0_RXbuffer_Zero( void )
 {
     for ( int i = 0; i < UART0_RX_BUFFER_SIZE; ++i )
@@ -1087,6 +1208,135 @@ void clearUART0_RXbuffer_Zero( void )
         UART0_RXbuffer[i] = 0x00;
     }
     UART0_RXbytes = 0;
+}
+
+uint8_t table_crc8( void )
+{
+    uint8_t crc = 0;
+
+    crc = crc8tab[ crc ^ 0x16 ];
+
+    for ( uint8_t i = 0 ; i < CRSF_MESSAGE_DATA_SIZE ; i++ )
+        crc = crc8tab[ crc ^ CSFR_Data_RX[ i ] ];
+    return crc;
+}    
+
+uint8_t compute_crc8( void )
+{
+    uint8_t crc = 0;
+
+    crc ^= 0x16; // XOR with fitst byte
+
+    for ( uint8_t j = 0 ; j < 8 ; j++ )
+    {
+        if ( crc & 0x80 )
+        {
+            crc = ( crc << 1 ) ^ POLYNOMIAL; // Apply polynomial if MSB is set
+        } else {
+            crc <<= 1;
+        }
+    }
+
+    for ( uint8_t i = 0 ; i < CRSF_MESSAGE_DATA_SIZE ; i++ )
+    {
+        crc ^= CSFR_Data_RX[ i ]; // XOR with current byte
+
+        for ( uint8_t j = 0 ; j < 8 ; j++ )
+        {
+            if ( crc & 0x80 )
+            {
+                crc = ( crc << 1 ) ^ POLYNOMIAL; // Apply polynomial if MSB is set
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// Function to extract data following the header
+bool CSFR_Extract_Data( void ) 
+{
+    // Define header sequence - Sync Byte, Bytes count, 16 RC channels
+    uint8_t header[ CRSF_MESSAGE_HEADER_SIZE ] = { 0xC8 , 0x18 , 0x16 };
+
+    // Search for header in the buffer
+    for ( int i = 0 ; i < UART1_RX_BUFFER_SIZE ; i++ )
+    {
+        // Check for header match
+        if ( UART1_RXbuffer[  i ] == header[ 0 ] &&
+            UART1_RXbuffer[ ( i + 1 ) % UART1_RX_BUFFER_SIZE ] == header[ 1 ] &&
+            UART1_RXbuffer[ ( i + 2 ) % UART1_RX_BUFFER_SIZE ] == header[ 2 ] )
+        {
+            CSFR_Header_match++;
+            // run Fail Safe Timer
+            CounterFailSafe = TIME_FAIL_SAFE_MS;
+            // Extract the 22 bytes following the header
+            for ( int j = 0 ; j < CRSF_MESSAGE_DATA_SIZE + CRSF_MESSAGE_CRC_SIZE ; j++ )
+            {
+                CSFR_Data_RX[ j ] = UART1_RXbuffer[ ( i + CRSF_MESSAGE_HEADER_SIZE + j ) % UART1_RX_BUFFER_SIZE ];
+            }
+            // clear UART buffer
+            for ( int k = 0 ; k < UART1_RX_BUFFER_SIZE ; k++ )
+                UART1_RXbuffer[ k ] = 0x00;
+
+            CSFR_CRC_Calculated = table_crc8();
+
+            if ( CSFR_CRC_Calculated == CSFR_Data_RX[ 22 ] )   // CRC match?
+            {
+                CSFR_CRC_match++;
+                return true; // Data extraction successful and CRC is OK
+            }
+            else
+            {
+                CSFR_CRC_error++;
+                return false; // Header found but CRC error
+            }            
+        }
+    }
+    return false; // Header not found or CRC error
+}
+
+uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev )
+{
+    uint16_t reversed11 = 0;
+    // reverse bits in each channel
+    for ( uint8_t j = 0 ; j < 11 ; j++ )
+    {
+        if ( ( arg_data_for_rev >> j ) & 0x001 )
+            reversed11 |= 1 << ( 10 - j );
+    }
+    return reversed11;
+}
+
+void CSFR_Parse_Data( void )
+{
+    uint8_t reversed = 0;
+    
+    // reverse bits in each byte
+    for ( uint8_t i = 0 ; i < CRSF_MESSAGE_DATA_SIZE ; i++ )
+    {
+        reversed = 0;
+        
+        for ( uint8_t j = 0 ; j < 8 ; j++ )
+        {
+            if ( ( CSFR_Data_RX[ i ] >> j ) & 0x01 )
+                reversed |= 1 << ( 7 - j );
+        }
+        CSFR_Data_Reversed[ i ] = reversed;
+        
+    }
+    
+    RC_channels[ 0 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 0 ] & 0xFF ) << 3 ) | ( CSFR_Data_Reversed[  1 ] >> 5 ) );
+    RC_channels[ 1 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 1 ] & 0x1F ) << 6 ) | ( CSFR_Data_Reversed[  2 ] >> 2 ) );
+    RC_channels[ 2 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 2 ] & 0x3F ) << 9 ) | ( CSFR_Data_Reversed[  3 ] << 1 ) | ( CSFR_Data_Reversed[ 4 ] >> 7 ) );
+    RC_channels[ 3 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 4 ] & 0x7F ) << 4 ) | ( CSFR_Data_Reversed[  5 ] >> 4 ) );
+    
+    RC_channels[ 4 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 5 ] & 0x0F ) << 7 ) | ( CSFR_Data_Reversed[  6 ] >> 1 ) );
+    RC_channels[ 5 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 6 ] & 0x01 ) << 10 )| ( CSFR_Data_Reversed[  7 ] << 2 ) | ( CSFR_Data_Reversed[ 8 ] >> 6 ) );
+    RC_channels[ 6 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 8 ] & 0x3F ) << 5 ) | ( CSFR_Data_Reversed[  9 ] >> 3 ) );
+    RC_channels[ 7 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 9 ] & 0x07 ) << 8 ) | ( CSFR_Data_Reversed[ 10 ] >> 0 ) );
+    
 }
 
 // ----- MOTOR PWM -----
