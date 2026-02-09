@@ -5,19 +5,22 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler Clang v4.0.0 -O2   *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2026-02-08 1645             *****
+*****   2026-02-09 1645             *****
 ****************************************/
 
 // ** LAST UPDATE **
-// - functions to change colors and brightness added
-// - WS2812B increased to 16 LEDs (8 front, 8 rear)
+// - Position and Speed Contollers added
+// - Savitzky-Golay Derivative Filter added for speed and rates measurement
+// - Massive variable change and reorganization
+// - WS2812B LED Battery Indicator added
+// - WS2812B LED Tilt Indicator added
 
-#include <stdbool.h>
-#include <string.h>
-#include <stdlib.h>
+#include    <stdbool.h>
+#include    <string.h>
+#include    <stdlib.h>
 
-#include "ti/driverlib/dl_gpio.h"
-#include "ti_msp_dl_config.h"
+#include    "ti/driverlib/dl_gpio.h"
+#include    "ti_msp_dl_config.h"
 
 #define     GLOBAL_IQ 16
 #include    <ti/iqmath/include/IQmathLib.h>
@@ -40,9 +43,6 @@
 #define     TIME_MPU_DELAY_MS       (250U)      // delay before MPU is initiated
 #define     TIME_MPU_READ_MS        (2U)        // reading rate of MPU
 #define     TIME_MPU_READ_SEC       (0.002f)    // in seconds
-#define     TIME_PID_0_INN_LOOP_MS  (4U)        // MAIN   PID control loop sample time - balancing
-#define     TIME_PID_1_MID_LOOP_MS  (50U)       // MIDDLE PID control loop sample time - common mode - LH to RH aligment
-#define     TIME_PID_2_OUT_LOOP_MS  (50U)       // OUTER  PID control loop sample time - position
 #define     TIME_CRSF_MS            (50U)       // Cross Fire (Radio Control) protocol
 #define     TIME_FAIL_SAFE_MS       (1500U)     // No command received
 
@@ -60,6 +60,11 @@
 #define     ANGLE_WINDUP_NEG_DEG    (-5.00f)    // Integrator Term value limit - negative angle - OUTER LOOP
 #define     ANGLE_WINDUP_POS_DEG    (+5.00f)    // Integrator Term value limit - positive angle - OUTER LOOP
 
+#define     ALPHA_IQ             _IQ(0.02f)     // Alpha
+#define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
+#define     VOLT_MOTOR_LIM_HI       (8.50f)     // Action value limit for Inner Loop
+#define     VOLT_MOTOR_LIM_LO       (2.50f)     // Action value limit for Side Loop
+
 #define     VOLT_MOTOR_LIMIT_NEG    (-8.50f)    // Action value limit - motor negative voltage
 #define     VOLT_MOTOR_LIMIT_POS    (+8.50f)    // Action value limit - motor positive voltage
 #define     VOLT_MOTOR_MINIM_NEG    (-0.15f)    // Motor voltage minimum value - negative
@@ -73,45 +78,18 @@
 #define     ADC_CHANNELS            (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
-#define     ROBO_MOT_GEAR_RATIO     (50.0f)     // gear ratio
-#define     ROBO_MOT_CPR_RATIO      (64.0f)     // 64 counts per revolution (quadrature)
-#define     ROBO_WHEEL_DIA_M        (0.125f)    // 125mm
-#define     ROBO_WHEEL_R_M          (ROBO_WHEEL_DIA_M/2.0f)
+#define     MOTOR_GEAR_RATIO        (50.0f)     // gear ratio
+#define     IMPULSES_PER_REVOLUTION (64.0f)     // 64 counts per revolution (quadrature)
+#define     WHEEL_DIAMETER_M        (0.125f)    // 125mm
+#define     WHEEL_RADIUS_M          (WHEEL_DIAMETER_M/2.0f)
+#define     WHEEL_TRACK_M           (0.21f)     // 210mm - wheels separation distance
 #define     ROBO_STATE_INIT         (0U)        // MPU not initiated or found
 #define     ROBO_STATE_BALA         (1U)        //
 #define     ROBO_STATE_CALIB        (2U)        //
-// #define     ROBO_MOTOR_CNT          (2U)        // M0 and M1
 
 #define     ALFA_COFIL_MPU          (0.03f)     // Complementary filter coefficient - Acc Gyro
-#define     BETA_EMA_BAT_VOLT       (0.05f)     // Exponential Moving Average coef - Battery voltage
+#define     BETA_EMA_BAT_COEF       (0.05f)     // Exponential Moving Average coef - Battery voltage
 #define     ZETA_EMA_MOT_CURR       (0.01f)     // Exponential Moving Average coef - Motor Current
-
-#define     P_GAIN_INN_LOOP_DEF     (0.10f)     // INNER LOOP - BALANCING - PD
-#define     I_GAIN_INN_LOOP_DEF     (0.00001f)
-#define     D_GAIN_INN_LOOP_DEF     (0.02f)
-#define     N_COEF_INN_LOOP_DEF     (2.0f)      // Smaller N means stronger filtering.
-
-#define     P_GAIN_LxR_LOOP_DEF     (1.10f)     // MIDDLE LOOP - LH to RH motor compensation - PI
-#define     I_GAIN_LxR_LOOP_DEF     (0.00001f)
-#define     D_GAIN_LxR_LOOP_DEF     (0.00f)
-#define     N_COEF_LxR_LOOP_DEF     (2.0f)      // Smaller N means stronger filtering.
-
-#define     P_GAIN_OUT_LOOP_DEF     (0.00f)     // OUTER LOOP - POSITION CONTROL - PI
-#define     I_GAIN_OUT_LOOP_DEF     (0.00001f)
-#define     D_GAIN_OUT_LOOP_DEF     (0.00f)
-#define     N_COEF_OUT_LOOP_DEF     (2.0f)      // Smaller N means stronger filtering.
-
-#define     FIR_A0                  (0.5f)
-#define     FIR_A1                  (0.3f)
-#define     FIR_A2                  (0.2f)
-
-#define     GYRO_DAMP_def           (15.0f)     // Use angular velocity (from gyroscope) as a damping term
-
-#define     PI_2                    (6.2831853070f)
-#define     PI                      (3.1415926535f)
-#define     PI_HALF                 (1.5707963267f)
-#define     PI_QUART                (0.7853981633f)
-#define     PI_3QUART               (2.3561944901f)
 
 #define     RAD_TO_DEG              (57.2958f)
 
@@ -158,21 +136,6 @@ volatile    uint8_t     gLEDColors_8b_GRB[ (WS2812B_LED_COUNT+WS2812B_DUMY_BYTE)
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } , // DUMMY
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 }   // DUMMY  
 };
-// // 8bit PWM pattern: zero pulse - 0x1C (28*12.5ns=0.35us), one pulse - 0x38 (56*12.5ns=0.7us)
-// volatile    uint8_t     gLEDColors_8b_GRB[ (WS2812B_LED_COUNT+WS2812B_DUMY_BYTE) ][ WS2812B_COLOR_CNT*WS2812B_PWM_PATTR ] =
-// {   
-//     // GREEN color (MSB first),                RED color (MSB first),                  BLUE color (MSB first)
-//     { 0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED0
-//     { 0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED1
-//     { 0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED2
-//     { 0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED3
-//     { 0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED4
-//     { 0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED5
-//     { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED6
-//     { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED7
-//     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } , // DUMMY
-//     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 }   // DUMMY  
-// };
 
 volatile uint8_t crc8tab[256] = {
     0x00, 0xD5, 0x7F, 0xAA, 0xFE, 0x2B, 0x81, 0x54, 0x29, 0xFC, 0x56, 0x83, 0xD7, 0x02, 0xA8, 0x7D,
@@ -192,7 +155,7 @@ volatile uint8_t crc8tab[256] = {
     0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
     0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
 
-volatile    uint8_t     gprecision_level = 1U;
+// volatile    uint8_t     gprecision_level = 1U;
 
 volatile    uint16_t    LED_Sequence_Actual    = LED_SEQUENCE_1;
 volatile    uint8_t     Robot_State     = ROBO_STATE_BALA;
@@ -203,14 +166,12 @@ volatile    bool        fHeartLED       = false;
 volatile    bool        fMPUread        = false;
 volatile    bool        fADC[ ADC_CHANNELS ];
 volatile    bool        fSendData       = false;
-volatile    bool        fQuadA          = false , fQuadA_1 = false;
-volatile    bool        fQuadB          = false , fQuadB_1 = false;
-volatile    bool        fQuadC          = false , fQuadC_1 = false;
-volatile    bool        fQuadD          = false , fQuadD_1 = false;
 volatile    bool        fMotorOmega     = false;
-volatile    bool        flg_PID_0  = false;
+volatile    bool        flagInnerLoop  = false;
 volatile    bool        fMotorEnable    = false;
 volatile    bool        FlagCRSF        = false;
+#define     QUAD_CNT    (2U)
+volatile    bool        A_0[QUAD_CNT] , B_0[QUAD_CNT];
 
 // ----- COUNTERS -----
 volatile    uint32_t    cHeartLED       = LED_HEART_ON_MS;
@@ -219,34 +180,25 @@ volatile    uint32_t    cMPUread        = TIME_MPU_READ_MS;
 volatile    uint32_t    cMPUdelay       = TIME_MPU_DELAY_MS;
 volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
 volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
-volatile    uint32_t    cnt_PID_0  = TIME_PID_0_INN_LOOP_MS;
 volatile    uint32_t    CounterFailSafe = 0U;
 volatile    uint32_t    CounterCRSF     = TIME_CRSF_MS;
 
 volatile    uint32_t    er_ct[ 24 ];
-volatile    uint16_t    dt_us[ 3 ]      = { 0U , 0U , 0U };   // delta time in us
-volatile    uint16_t    t0_us[ 3 ]      = { 0U , 0U , 0U };   // save timer value
 volatile    uint32_t    ab_ct[ 24 ]; 
-
-// ----- MOTOR QUADRATURE ENCODERS -----
-volatile    int32_t     cQuadM0_K0 = 0, cQuadM0_K1 = 0;
-volatile    int32_t     cQuadM1_K0 = 0, cQuadM1_K1 = 0;
-volatile    int32_t     QdiffM0_K0 = 0, QdiffM0_K1 = 0, QdiffM0_K2 = 0;
-volatile    int32_t     QdiffM1_K0 = 0, QdiffM1_K1 = 0, QdiffM1_K2 = 0;
-volatile    int32_t     QdiffM0_raw = 0, QdiffM1_raw = 0;
-volatile    int32_t     QdiffM0_fir = 0, QdiffM1_fir = 0;
-volatile    float       fir_a0 = FIR_A0;
-volatile    float       fir_a1 = FIR_A1;
-volatile    float       fir_a2 = FIR_A2;    //  3‑tap weighted FIR
+#define     MAX_TIMERS  (10U)
+volatile    uint16_t    dt_us[ MAX_TIMERS ];    // delta time in us
+volatile    uint16_t    t0_us[ MAX_TIMERS ];    // save timer value
+#define     STORE_TIMER6(i) ( t0_us[i] = (uint16_t)DL_TimerG_getTimerCount( TIMER_6_INST ) )
+#define     GET_DURATION(i) ( dt_us[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0_us[i]) )
 
 // ----- ANALOG -----
 #define     MOV_AVG_ADC             (16U)
 #define     MEDIAN_MOTOR_CURRENT    (7U)
 volatile    uint32_t    ADC_LSB[  ADC_CHANNELS ];       // [ LSB ]
 volatile    float       ADC_volt[ ADC_CHANNELS ];       // [ V ]
-volatile    float       Batt_volt       = VOLT_BATTERY_DEF;
-volatile    float       Batt_volt_ema   = VOLT_BATTERY_DEF;
-volatile    float       Beta_ema_volt   = BETA_EMA_BAT_VOLT;
+volatile    float       gBatt_volt       = VOLT_BATTERY_DEF;
+volatile    float       gBatt_volt_ema   = VOLT_BATTERY_DEF;
+volatile    float       gBeta_ema_coef   = BETA_EMA_BAT_COEF;
 volatile    float       Zeta_ema_curr   = ZETA_EMA_MOT_CURR;
 volatile    float       Motor0_curr_mA      = 0.0f , Motor1_curr_mA     = 0.0f;
 volatile    float       Motor0_curr_mA_med  = 0.0f , Motor1_curr_mA_med = 0.0f;
@@ -263,116 +215,28 @@ volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
 
 // ----- PID 0 INNER LOOP -----
 // Attitude (Tilt) Stabilization
-volatile    float       T_PID_0_sec     = TIME_PID_0_INN_LOOP_MS / 1000.0f; // Sample time [sec]
-volatile    float       P_0_gain        = P_GAIN_INN_LOOP_DEF;              // proportional gain
-volatile    float       I_0_gain        = I_GAIN_INN_LOOP_DEF;              // Integral gain
-volatile    float       D_0_gain        = D_GAIN_INN_LOOP_DEF;              // Derivative gain
-volatile    float       N_0_coef        = N_COEF_INN_LOOP_DEF;              // Smaller N means stronger filtering of D
-volatile    float       G_0_damp        = GYRO_DAMP_def;                    // Angular velocity (from gyroscope) as a damping term
-volatile    float       PID_0_angle_ref = ANGLE_UPRIGHT_DEG;                // Reference angle - default close to 0deg for balancing
-volatile    float       PID_error       = 0.0f;                     // Controll Error
-volatile    float       PID_error_0     = 0.0f;                     // Previous Error
-volatile    float       PID_actVal      = 0.0f;                     // Action value [volt] - Sum of P and I and D terms contributions
-volatile    float       PID_P_term_volt = 0.0f;                     // P term [volt] contribution to Action Value
-volatile    float       PID_I_term_volt = 0.0f;                     // I term [volt] contribution to Action Value
-volatile    float       PID_I_integral  = 0.0f;                     // Sum of all Errors
-volatile    float       PID_D_raw       = 0.0f;                     // No-Filtered D term Error
-volatile    float       PID_D_sigma     = 0.0f;                     // Filtered D term coeficient
-volatile    float       PID_D_fil       = 0.0f;                     // Filtered D term Error
-volatile    float       PID_D_term_volt = 0.0f;                     // D term [volt] contribution to Action Value
-volatile    float       PID_G_damp_volt = 0.0f;                     // Gyro Dumping term [volt] contribution to Action Value
+volatile    float       gDamp_gain      = 0.0f;                    // Angular velocity (from gyroscope) as a damping term
+volatile    float       gAngle_gain     = 0.0f;              // P Gain for ANGLE - Inner Loop
 
-// ----- PID 1 MIDDLE LOOP -----
-// Wheel Alignment / Common‑Mode Tracking
-volatile    float       C_gain_LH_RH    = P_GAIN_LxR_LOOP_DEF;
-volatile    float       PID_C_LHRH_volt = 0.0f;
+volatile    float       gPID_AV_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
+volatile    float       gPID_AV_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
+volatile    float       gPID_AV_LH_RH_Volt  = 0.0f;     // Side loop  - Motor voltage - From Motor angle difference (LH-RH)
+volatile    float       gPID_AV_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
+volatile    float       gPID_AV_Robot_Msec  = 0.0f;     // Outer Loop - Robot speed in m/s
+volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
 
-// ----- PID 2 OUTER LOOP -----
-// Position Control
+volatile    float       gP_Gain_LH_RH_angle = 0.0f;
+volatile    float       gP_Gain_LH_RH_rate  = 0.0f;
+volatile    float       gYAW_setPoint_rad   = 0.0f;
+volatile    float       gYAW_error_rad      = 0.0f;
+volatile    float       gYAWrate_SP_rads    = 0.0f;
+volatile    float       gYAWrate_ER_rads    = 0.0f;
 
-// >>>>> NEW PLAY GROUND BEGIN <<<<<
-typedef struct
-{
-    // --- Timing ---
-    float   T_sec;              // Sample time [sec]
-    int16_t Cnt_ms;             // Counter
-    bool    flag;               // Flag
+volatile    float       gYAW_rad            = 0.0f;
+volatile    float       gYAWrate_radsec     = 0.0f;
 
-    // --- Gains ---
-    float   P_gain;             // Proportional gain
-    float   I_gain;             // Integral gain
-    float   D_gain;             // Derivative gain
-    float   N_coef;             // D-term filter coefficient
-    float   G_damp;             // Gyro damping coefficient
-
-    // --- References ---
-    float   ref;                // Reference value (angle, velocity, position...)
-
-    // --- Error state ---
-    float   err;                // Current error
-    float   err_prev;           // Previous error
-
-    // --- Integral -----
-    float   I_integral;         // Integral accumulator
-    float   I_max;              // Integral accumulator limiter
-    float   I_min;              // Integral accumulator limiter
-
-    // --- D-term filtering ---
-    float   D_raw;              // Unfiltered D error
-    float   D_sigma;            // Filtered D coefficient
-    float   D_fil;              // Filtered D error
-
-    // --- Output terms ---
-    float   P_term;             // P contribution [volt, deg, m ...]
-    float   I_term;             // I contribution [volt, deg, m ...]
-    float   D_term;             // D contribution [volt, deg, m ...]
-    float   G_term;             // Gyro damping contribution [volt, deg, m ...]
-    float   actVal;             // Final action value [volt, deg, m ...]
-
-} PID_Regulator_t;
-
-volatile PID_Regulator_t PID_Inner = {
-    .T_sec  = TIME_PID_0_INN_LOOP_MS / 1000.0f,
-    .Cnt_ms = TIME_PID_0_INN_LOOP_MS,
-    .flag   = false,
-    .P_gain = P_GAIN_INN_LOOP_DEF,
-    .I_gain = I_GAIN_INN_LOOP_DEF,
-    .D_gain = D_GAIN_INN_LOOP_DEF,
-    .N_coef = N_COEF_INN_LOOP_DEF,
-    .G_damp = GYRO_DAMP_def,
-    .ref    = ANGLE_UPRIGHT_DEG,
-    .I_max  = VOLT_WINDUP_LIMIT_POS / I_GAIN_INN_LOOP_DEF,
-    .I_min  = VOLT_WINDUP_LIMIT_NEG / I_GAIN_INN_LOOP_DEF
-};
-
-volatile PID_Regulator_t PID_Middle = {
-    .T_sec  = TIME_PID_1_MID_LOOP_MS / 1000.0f,
-    .Cnt_ms = TIME_PID_1_MID_LOOP_MS,
-    .flag   = false,
-    .P_gain = P_GAIN_LxR_LOOP_DEF,
-    .I_gain = I_GAIN_LxR_LOOP_DEF,
-    .D_gain = D_GAIN_LxR_LOOP_DEF,
-    .N_coef = N_COEF_LxR_LOOP_DEF,
-    .G_damp = 0.0f,
-    .ref    = 0.0f,
-    .I_max  = VOLT_WINDUP_LIMIT_POS / I_GAIN_LxR_LOOP_DEF,
-    .I_min  = VOLT_WINDUP_LIMIT_NEG / I_GAIN_LxR_LOOP_DEF
-};
-
-volatile PID_Regulator_t PID_Outer = {
-    .T_sec  = TIME_PID_2_OUT_LOOP_MS / 1000.0f,
-    .Cnt_ms = TIME_PID_2_OUT_LOOP_MS,
-    .flag   = false,
-    .P_gain = P_GAIN_OUT_LOOP_DEF,
-    .I_gain = I_GAIN_OUT_LOOP_DEF,
-    .D_gain = D_GAIN_OUT_LOOP_DEF,
-    .N_coef = N_COEF_OUT_LOOP_DEF,
-    .G_damp = 0.0f,
-    .ref    = 0.0f,
-    .I_max  = ANGLE_WINDUP_POS_DEG / I_GAIN_OUT_LOOP_DEF,
-    .I_min  = ANGLE_WINDUP_NEG_DEG / I_GAIN_OUT_LOOP_DEF
-};
-// >>>>> NEW PLAY GROUND THE END <<<<<
+volatile    float       gT1_sample = TIME_MPU_READ_SEC;     // sample time [sec] Inner loop
+volatile    float       gT2_sample = TIME_MOTOR_OMEGA_S;    // sample time [sec] Outer loop
 
 // ----- UART0 -----
 // RX
@@ -464,40 +328,54 @@ volatile	 int16_t	MPU_accX_offset  =  400 , MPU_accY_offset  = -250 , MPU_accZ_o
 volatile	 int16_t	MPU_gyroX_offset =  100 , MPU_gyroY_offset =  -50 , MPU_gyroZ_offset =  75; // 2025-09-13
 // calculated data
 volatile    float       MPU_temp_C = 0.0f , MPU_accX_g = 0.0f , MPU_accY_g = 0.0f , MPU_accZ_g = 0.0f;
-volatile	float		Gyro_X_RateDegs = 0.0f , Gyro_Y_RateDegs = 0.0f , Gyro_Z_RateDegs = 0.0f;
+volatile	float		Gyro_X_RateDegs = 0.0f , gRate_Y_degs_f = 0.0f , Gyro_Z_RateDegs = 0.0f;
 volatile    float       Angle_Pitch_Deg = 0.0f , Angle_Roll_Deg = 0.0f , Angle_Yaw_Deg = 0.0f;
 volatile    float       Angle_Pitch_Deg_delta = 0.0f , Angle_Pitch_Deg_delta_filtered = 0.0f;
 volatile    float       Angle_Pitch_Deg_max_hold_neg = 0 , Angle_Pitch_Deg_max_hold_pos = 0;
 volatile    float       Angle_Pitch_Deg_rp_fast = 0.0f , Angle_Roll_Deg_rp_fast = 0.0f , Angle_Yaw_Deg_rp_fast = 0.0f; // Reduced precision by atan2_fast
-// volatile    float       Angle_Pitch_Deg_rp_cord = 0.0f , Angle_Roll_Deg_rp_cord = 0.0f , Angle_Yaw_Deg_rp_cord = 0.0f; // Reduced precision by atan2_fast
 // ----- COMPLEMENTARY FILTER -----
 volatile    float       Alpha_cf_MPU = ALFA_COFIL_MPU;
-volatile    float       Angle_Pitch_Deg_CoFil = 0.0f , Angle_Pitch_DegN_1 = 0.0f;
+volatile    float       gAngle_PITCH_deg_CoFil = 0.0f , Angle_Pitch_DegN_1 = 0.0f;
 volatile    float       Angle_Roll_Deg_CoFil  = 0.0f , Angle_Roll_DegN_1  = 0.0f;
 volatile    float       Angle_Yaw_Deg_CoFil   = 0.0f , Angle_Yaw_DegN_1    = 0.0f;
 
 // ----- MOTOR/ROBOT -----
-volatile    float       Motor0_omega_rads;   // [rad/sec]    motor Angular Velocity
-volatile    float       Motor1_omega_rads;   // [rad/sec]     
+volatile    int32_t     gTheta_0_RH_pos , gTheta_1_LH_pos;      // encoder position in CPR
+volatile    float       gTheta_0_RH_rad , gTheta_1_LH_rad;      // motor Angle [rad]
+volatile    float       gWheel_LH_m     , gWheel_RH_m;          // wheel distance [m]
+volatile    float       gWheel_LH_msec  , gWheel_RH_msec;       // wheel speed [m/sec]
+volatile    float       gWheel_LH_hist_m[5];    // history buffers: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
+volatile    float       gWheel_RH_hist_m[5];    // history buffers: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
 
-volatile    float       Motor0_theta_rad;    // [rad]        motor Angle
-volatile    float       Motor1_theta_rad;    // [rad]     
-volatile    float       Motors_theta_error;
-volatile    float       Motors_theta_ref    = 0.0f;
+volatile    float       gPosition_m;            // position in m
+volatile    float       gPosition_error_m;      // position error in m
+volatile    float       gPosition_setPoint_m;   // position set point in m
+volatile    float       gPosition_ActVal_deg;   // position ACTION value in deg
+volatile    float       gPosition_Gain;         // position GAIN [deg/m]
+volatile    float       gPosition_hist_m[5];    // x[k-2], x[k-1], x[k], x[k+1], x[k+2]
+// --- Savitzky-Golay Derivative Filter ---
+#define     DT_S        (0.05f)                 // TIME_MOTOR_OMEGA_S
+#define     SG_K        (1.0f / (12.0f * DT_S)) // 1 / (12*dt)
 
-volatile    float       robot_pos_m;     // [m]
-volatile    float       robot_pos_m_1;
-volatile    float       robot_speed_ms;  // [m/sec]
-volatile    float       robot_angle_rad; // [rad] 
-volatile    float       robot_rate_rads; // [rad/s]
+volatile    float       gSpeed_msec;            // speed in m/sec
+volatile    float       gSpeed_error_msec;      // speed error in m/sec
+volatile    float       gSpeed_setPoint_msec;   // speed set point in m/sec
+volatile    float       gSpeed_ActVal_deg;      // speed ACTION value in deg
+volatile    float       gSpeed_Gain;            // speed GAIN [deg/msec]
+
+volatile    float       gAngle_error_deg;       // angle error in deg
+volatile    float       gAngle_setPoint_deg;    // angle set point in deg
+volatile    float       gYaw_hist_rad[5];       // x[k-2], x[k-1], x[k], x[k+1], x[k+2]
 
 // ----- FUNCTIONS -----
 void    MCU_Init( void );
-void    PID_check( void );
+void    PID_Outer_Loop( void );
+void    PID_Inner_Loop( void );
 void    ADC_check( void );
 void    UART_check( void );
 void    QUAD_check( void );
-void    OMEGA_check( void );
+void    Update_Quad_0_RH( void );
+void    Update_Quad_1_LH( void );
 void    MPU_check ( void );
 void    SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
 void    Motor_M0_volt( float argVoltM0 );
@@ -510,19 +388,24 @@ uint16_t MPU_ExitSleep( void );
 uint16_t MPU_WhoAmI( void );
 uint16_t MPU_GetAccTempGyro( void );
 uint16_t Send_integers_over_UART( uint8_t argCount );
-static inline float atan2_fast(float y, float x, int precision_level);
-// static inline float atan2_fast_cordic(float y, float x, int precision_level);
 int32_t median3(int32_t a, int32_t b, int32_t c);
-float find_max(const volatile float *arr, int size);
 uint8_t table_crc8( void );
 uint8_t compute_crc8( void );
+
 bool     CSFR_Extract_Data( void );
 void     CSFR_Parse_Data( void );
 uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev );
 
-void    WS2812B_LED_Col(uint8_t led, uint8_t G, uint8_t R, uint8_t B);
+void    WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B);
 void    WS2812B_All_LED(uint8_t ArgColor, uint8_t ArgBrightness);
 void    WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2, uint8_t argBrg1, uint8_t argBrg2);
+
+void    Wheel_GetSpeed_SG(void);
+float   Robot_GetSpeed_SG(void);
+float   Robot_GetYawRate_SG(void);
+
+void    BatteryGauge_8LED(float voltage);
+void    TiltGauge_8LED(float tilt_deg);
 
 // *****************************************  *****************************************  *****************************************
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
@@ -531,9 +414,17 @@ void    WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2, uint8_t argBrg1, uint
 int main( void ) {
     MCU_Init();
 
-    // WS2812B_LED_Col(1, 0x00, 0x00, 0x10);
+    gPosition_Gain = 0.1f;
+    gSpeed_Gain    = 0.1f;
 
-    // WS2812B_All_LED(2, 0x20);
+    gPosition_setPoint_m = 0.0f;   // position set point 0 m
+    gSpeed_setPoint_msec = 0.0f;   // speed set point 0 m/sec
+
+    gP_Gain_LH_RH_angle = 1.0f;
+    gP_Gain_LH_RH_rate  = 1.0f;
+
+    gDamp_gain          = -15.0f;
+    gAngle_gain         = 0.1f;
 
     WS2812B_Half_LED( 2 , 0 , 0x20 , 0x40 );
 
@@ -542,29 +433,48 @@ int main( void ) {
 // *****************************************  *****************************************  *****************************************
     while ( 1 ) {
 
-        MPU_check();    // read IMS
-        
-        PID_check();    // Regulate
-        
-        ADC_check();    // read Vs and Motor
-        
-        UART_check();   // send diagnostic data or receive command
-        
-        QUAD_check();   // calculate motor RPM
-        
-        OMEGA_check();  // calculate speed
+        BatteryGauge_8LED( gBatt_volt_ema );
 
-//         PID_update(&PID_Inner, measured_angle, gyro_rate);
-// PID_update(&PID_Middle, measured_velocity, 0.0f);
-// PID_update(&PID_Outer, measured_position, 0.0f);
+        TiltGauge_8LED( gAngle_PITCH_deg_CoFil);
 
-// PID_Inner.P_gain = new_P;
-
-
-        // >> CROSS FIRE MESSAGE DETECTOR
+        // ----- 10. QUAD -----
+    STORE_TIMER6(1);
+        Update_Quad_0_RH();
+        Update_Quad_1_LH();
+    GET_DURATION(1);
+        
+        // ----- 20. READ MPU -----        
+    STORE_TIMER6(2);
+        MPU_check();
+    GET_DURATION(2);
+        
+        // ----- 30. (A) OUTER LOOP -----
+    STORE_TIMER6(3);
+        PID_Outer_Loop();
+    GET_DURATION(3);
+        
+        // ----- 40. (B) INNER LOOP -----
+    STORE_TIMER6(4);
+        PID_Inner_Loop();
+    GET_DURATION(4);
+        
+        // ----- 50. SEND DATA OVER UART -----
+    STORE_TIMER6(5);
+        UART_check();
+    GET_DURATION(5);
+        
+        // ----- 60. FREE -----
+        // ----- 70. FREE -----
+        // ----- 80. FREE -----
+        // nothing
+        
+        // ----- 90. ANALOG MEASUREMENT -----
+    STORE_TIMER6(9);
+        ADC_check();
+    GET_DURATION(9);
+        // ----- 100. CROSS FIRE DETECTOR -----
         if ( FlagCRSF )
         {
-// DL_GPIO_setPins( PB15_PORT,DL_GPIO_PIN_16 );
             FlagCRSF = false;
             if ( CSFR_Extract_Data() && CounterFailSafe > 0 )
             {
@@ -572,24 +482,24 @@ int main( void ) {
                 //run motors
                 RC_roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
                 RC_pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
-                
-                Motors_theta_ref += -0.005f*RC_roll;
-                if ( Motors_theta_ref > 20.0f ) { Motors_theta_ref = 20.0f; }
-                if ( Motors_theta_ref < -20.0f ) { Motors_theta_ref = -20.0f; }
 
-                PID_0_angle_ref = ( -0.25f*RC_pitch );
-                if ( PID_0_angle_ref > 25.0f ) { PID_0_angle_ref = 25.0f; }
-                if ( PID_0_angle_ref < -25.0f ) { PID_0_angle_ref = -25.0f; }
+                // ROLL is actually used as YAW command
+                gYAWrate_SP_rads = -0.025f*RC_roll;
+
+                // PITCH
+                gAngle_setPoint_deg = -0.25f*RC_pitch;
+                #define PITCH_ANGLE_LIMIT (25.0f)
+                if ( gAngle_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg =  PITCH_ANGLE_LIMIT; }
+                if ( gAngle_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg = -PITCH_ANGLE_LIMIT; }
                 
             }
             else
             {
                 // default
-                PID_0_angle_ref = PID_0_angle_ref * 0.9f; // exp decay
+                gAngle_setPoint_deg = gAngle_setPoint_deg * 0.9f; // exp decay
                 RC_roll = 0;
                 RC_pitch = 0;
             }
-// DL_GPIO_clearPins( PB15_PORT,DL_GPIO_PIN_16 );
         }
     }
 }
@@ -618,17 +528,6 @@ void TIMER_0_INST_IRQHandler()
 
         cHeartTick++;
         cHeartTick %= LED_TICK_COUNT;
-    }
-    // ----- PID REGULATION -----
-    if ( --cnt_PID_0 == 0 )
-    {
-        cnt_PID_0 = TIME_PID_0_INN_LOOP_MS;
-        flg_PID_0 = true;
-    }
-    if ( --PID_Inner.Cnt_ms == 0 )
-    {
-        PID_Inner.Cnt_ms = TIME_PID_0_INN_LOOP_MS;
-        PID_Inner.flag = true;
     }
     // ----- MOTOR SPEED/OMEGA MEASUREMENT -----
     if ( --cMotorOmega == 0 )
@@ -728,7 +627,6 @@ void UART_0_INST_IRQHandler( void )
         break;
 
         case DL_UART_MAIN_IIDX_TX:
-// DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
             //transmit byte
             DL_UART_Main_transmitData ( UART_0_INST , UART0_message[ UART0_TXbytes++ ] );
             // Disable transmit interrupt if no more bytes
@@ -736,7 +634,6 @@ void UART_0_INST_IRQHandler( void )
             {
                 DL_UART_Main_disableInterrupt( UART_0_INST , DL_UART_MAIN_INTERRUPT_TX );
                 UART0_TXbytes = 0;
-// DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM1_PIN );
             }
         break;
 
@@ -869,113 +766,105 @@ void MCU_Init( void )
 /*****************************
 *****   PID CONTROLLER   *****
 *****************************/
-void PID_check( void )
+void PID_Inner_Loop( void )
 {
-    if ( PID_Inner.flag )
+    if ( flagInnerLoop )
     {
-        PID_Inner.flag       = false;
-        
-        PID_Inner.err        =  PID_Inner.ref - Angle_Pitch_Deg_CoFil;
-        
-        PID_Inner.P_term     =  PID_Inner.err * PID_Inner.P_gain;
-        
-        PID_Inner.I_integral += PID_Inner.err * PID_Inner.T_sec;
-        
-        if ( PID_Inner.I_gain != I_GAIN_INN_LOOP_DEF ) {    // when I gain is updated during debug
-            PID_Inner.I_max = VOLT_WINDUP_LIMIT_POS / PID_Inner.I_gain;
-            PID_Inner.I_min = VOLT_WINDUP_LIMIT_NEG / PID_Inner.I_gain;
-        }
+        flagInnerLoop = false;
 
-        // Clamp integrator
-        if ( PID_Inner.I_integral > PID_Inner.I_max )
-            PID_Inner.I_integral = PID_Inner.I_max;
-        else if ( PID_Inner.I_integral < PID_Inner.I_min )
-            PID_Inner.I_integral = PID_Inner.I_min;
-        
-        PID_Inner.I_term     =  PID_Inner.I_integral * PID_Inner.I_gain;
+        // ------------------------------
+        // ----- 40. (B) INNER LOOP -----
+        // ------------------------------
+        // --- 41. Calculate DUMPING (no error) ---
+        gPID_AV_Rates_Volt   = gDamp_gain * gRate_Y_degs_f;         // Damping for preventing flip over
+        // --- 43. Calculate Gain from Angle (error) ---
+        gPID_Error_Angle_Deg = gAngle_setPoint_deg - gAngle_PITCH_deg_CoFil;
+        gPID_AV_Angle_Volt   = gAngle_gain * gPID_Error_Angle_Deg;  // Angle gain for upright position
+        // --- 44. Combine action values ---
+        gPID_AV_Robot_Volt = gPID_AV_Angle_Volt + gPID_AV_Rates_Volt;
+        // --- 45. Motor Voltage Limit ---
+        if ( gPID_AV_Robot_Volt > VOLT_MOTOR_LIM_HI ) gPID_AV_Robot_Volt = VOLT_MOTOR_LIM_HI;
+        if ( gPID_AV_Robot_Volt < -VOLT_MOTOR_LIM_HI ) gPID_AV_Robot_Volt = -VOLT_MOTOR_LIM_HI;
 
-        PID_Inner.D_raw      = ( PID_Inner.err - PID_Inner.err_prev ) / PID_Inner.T_sec;
-        PID_Inner.D_sigma    = PID_Inner.T_sec / ( PID_Inner.T_sec + ( 1.0f / PID_Inner.N_coef ) );
-        PID_Inner.D_fil      = PID_Inner.D_sigma * PID_Inner.D_raw + ( 1.0f - PID_Inner.D_sigma ) * PID_Inner.D_fil;
-        PID_Inner.D_term     = PID_Inner.D_fil * PID_Inner.D_gain;
-
-        PID_Inner.G_term     = PID_Inner.G_damp * Gyro_Y_RateDegs;
-
-        PID_Inner.err_prev   = PID_Inner.err;
-        PID_Inner.actVal     = PID_Inner.P_term + PID_Inner.I_term + PID_Inner.D_term + PID_Inner.G_term;
-        
-        // Clamp Action Value
-        if ( PID_Inner.actVal > VOLT_MOTOR_LIMIT_POS ) PID_Inner.actVal = VOLT_MOTOR_LIMIT_POS;
-        if ( PID_Inner.actVal < VOLT_MOTOR_LIMIT_NEG ) PID_Inner.actVal = VOLT_MOTOR_LIMIT_NEG;
-    
-    }
-
-    if ( flg_PID_0 )
-    {
-        flg_PID_0 = false;
-
-        PID_error = PID_0_angle_ref - Angle_Pitch_Deg_CoFil;
-
-        // P term
-        PID_P_term_volt = PID_error * P_0_gain;
-
-        // I term
-        PID_I_integral += PID_error * T_PID_0_sec;
-        PID_I_term_volt = PID_I_integral * I_0_gain;
-
-        // D term with filtered derivative
-        PID_D_raw = (PID_error - PID_error_0) / T_PID_0_sec;
-        PID_D_sigma = T_PID_0_sec / (T_PID_0_sec + (1.0f / N_0_coef));  // Filter coefficient
-        PID_D_fil = PID_D_sigma * PID_D_raw + (1.0f - PID_D_sigma) * PID_D_fil;
-        PID_D_term_volt = PID_D_fil * D_0_gain;
-
-        //
-        PID_G_damp_volt = G_0_damp * Gyro_Y_RateDegs;
-
-        // Final output
-        PID_error_0 = PID_error;
-        PID_actVal = PID_P_term_volt + PID_I_term_volt + PID_D_term_volt + PID_G_damp_volt;
-
-        Motors_theta_error = Motors_theta_ref - ( Motor0_theta_rad - Motor1_theta_rad );
-        PID_C_LHRH_volt = Motors_theta_error * C_gain_LH_RH; 
-
-        if ( PID_C_LHRH_volt > 2.5f ) { PID_C_LHRH_volt = 2.5f ; }
-        if ( PID_C_LHRH_volt < -2.5f ) { PID_C_LHRH_volt = -2.5f ; }
-        // PID_C_LHRH_volt = ( Motor0_theta_rad - Motor1_theta_rad ) * C_gain_LH_RH; 
-
-        // PID_D_term_volt  = Gyro_Y_RateDegs         * D_0_gain;   // D
-        
-        if ( PID_actVal > VOLT_MOTOR_LIMIT_POS )
-            PID_actVal = VOLT_MOTOR_LIMIT_POS;
-
-        if ( PID_actVal < VOLT_MOTOR_LIMIT_NEG )
-            PID_actVal = VOLT_MOTOR_LIMIT_NEG;
-
-        if ( fMotorEnable && ( Batt_volt_ema > VOLT_BATTERY_MIN ) )
+        // --------------------------
+        // ---- 46. MOTOR CONTROL ---
+        // --------------------------
+        if ( fMotorEnable && ( gBatt_volt_ema > VOLT_BATTERY_MIN ) )
         {
-            if ( Angle_Pitch_Deg_CoFil > ANGLE_LIMIT_POS_DEG + ANGLE_LIM_HYST_DEG )
+            if ( gAngle_PITCH_deg_CoFil > ANGLE_LIMIT_POS_DEG + ANGLE_LIM_HYST_DEG )
             {
                 Motor_M0_volt( 0.0f );
                 Motor_M1_volt( 0.0f );
             } else
-                if ( Angle_Pitch_Deg_CoFil < ANGLE_LIMIT_NEG_DEG - ANGLE_LIM_HYST_DEG )
+                if ( gAngle_PITCH_deg_CoFil < ANGLE_LIMIT_NEG_DEG - ANGLE_LIM_HYST_DEG )
                 {
                     Motor_M0_volt( 0.0f );
                     Motor_M1_volt( 0.0f );
                 } else
-                    if ( ( Angle_Pitch_Deg_CoFil < ANGLE_LIMIT_POS_DEG ) &&
-                         ( Angle_Pitch_Deg_CoFil > ANGLE_LIMIT_NEG_DEG )
+                    if ( ( gAngle_PITCH_deg_CoFil < ANGLE_LIMIT_POS_DEG ) &&
+                         ( gAngle_PITCH_deg_CoFil > ANGLE_LIMIT_NEG_DEG )
                         )            
                     {
-                        // Motor_M0_volt( PID_actVal - PID_C_LHRH_volt );
-                        // Motor_M1_volt( PID_actVal + PID_C_LHRH_volt );
-                        Motor_M0_volt( PID_actVal + PID_C_LHRH_volt );
-                        Motor_M1_volt( PID_actVal - PID_C_LHRH_volt );
+                        Motor_M0_volt( gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt );
+                        Motor_M1_volt( gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt );
                     }
         } else {
             Motor_M0_volt( 0.0f );
             Motor_M1_volt( 0.0f );
         }
+    }
+}
+
+// ----- OMEGA CALCULATION -----
+void PID_Outer_Loop( void )
+{
+    if ( fMotorOmega )
+    {
+        fMotorOmega = false;
+        
+        // -------------------------
+        // ----- (B) OUTER LOOP ----
+        // -------------------------
+        // --- 310. Calculate Wheel Angle ---
+        gTheta_1_LH_rad = 2.0f * 3.14159f * gTheta_1_LH_pos / MOTOR_GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        gTheta_0_RH_rad = 2.0f * 3.14159f * gTheta_0_RH_pos / MOTOR_GEAR_RATIO / IMPULSES_PER_REVOLUTION;
+        // --- 311. Calculate Wheel distance ---
+        gWheel_LH_m     = gTheta_1_LH_rad * WHEEL_RADIUS_M;
+        gWheel_RH_m     = gTheta_0_RH_rad * WHEEL_RADIUS_M;
+        // --- 312. Calculate Wheel speed ---
+        Wheel_GetSpeed_SG();
+        // --- 320. Calculate ROBOT Position ---
+        gPosition_m     = 0.5f * ( gWheel_LH_m + gWheel_RH_m );
+        // --- 330. Calculate ROBOT Speed ---
+        gSpeed_msec     = Robot_GetSpeed_SG();      // Savitzky-Golay Derivative Filter
+        // --- 335. Calculate ROBOT Angle ---
+        gYAW_rad = (gWheel_RH_m - gWheel_LH_m) / WHEEL_TRACK_M;
+        // --- 336. Calculate ROBOT Angle rate ---
+        gYAWrate_radsec = Robot_GetYawRate_SG();    // Savitzky-Golay Derivative Filter
+        // --- 340. Position Controller ---
+        gPosition_error_m    = gPosition_setPoint_m - gPosition_m;
+        gPosition_ActVal_deg = gPosition_error_m * gPosition_Gain;  // [deg] = [m] * [deg/m]
+        // --- 350. Speed Controller ---
+        gSpeed_error_msec    = gSpeed_setPoint_msec - gSpeed_msec;
+        gSpeed_ActVal_deg    = gSpeed_error_msec * gSpeed_Gain;     // [deg] = [m/sec] * [deg/m/sec]
+        // --- 360. Angle Set Point ---
+        gAngle_setPoint_deg  = gPosition_ActVal_deg + gSpeed_ActVal_deg;
+        // --- 370. Angle Set Point Limit ---
+        #define     ANGLE_LIMIT     ( 2.0f )
+        if ( gAngle_setPoint_deg > ANGLE_LIMIT ) gAngle_setPoint_deg = ANGLE_LIMIT;
+        if ( gAngle_setPoint_deg < -ANGLE_LIMIT ) gAngle_setPoint_deg = -ANGLE_LIMIT;
+        
+        // -------------------------
+        // ----- (C) SIDE LOOP -----
+        // -------------------------
+        // --- 380. Calculate Gain from Motors Angles (error) ---
+        gYAW_error_rad      = gYAW_setPoint_rad - gYAW_rad;
+        gYAWrate_ER_rads    = gYAWrate_SP_rads  - gYAWrate_radsec;
+        gPID_AV_LH_RH_Volt  = ( gP_Gain_LH_RH_angle * gYAW_error_rad ) + ( gP_Gain_LH_RH_rate * gYAWrate_ER_rads );
+        // --- 390. Motor Voltage Limit ---
+        if ( gPID_AV_LH_RH_Volt > VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = VOLT_MOTOR_LIM_LO;
+        if ( gPID_AV_LH_RH_Volt < -VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = -VOLT_MOTOR_LIM_LO;
+
     }
 }
 
@@ -990,14 +879,14 @@ void Motor_M0_volt( float argVoltM0 )
 {
     uint16_t pwm_uint_value_M0 = 0U;
 
-    if ( Batt_volt_ema > VOLT_BATTERY_MIN ) {
+    if ( gBatt_volt_ema > VOLT_BATTERY_MIN ) {
        if ( argVoltM0 > VOLT_MOTOR_MINIM_POS ) {
-            pwm_uint_value_M0 = (uint16_t)( 100.0f * argVoltM0 / Batt_volt_ema );
+            pwm_uint_value_M0 = (uint16_t)( 100.0f * argVoltM0 / gBatt_volt_ema );
             // run ROBOT FORWARD
             SET_PWM_DUTY( PHASE_A , 0U );
             SET_PWM_DUTY( PHASE_B , pwm_uint_value_M0 );
         } else if ( argVoltM0 < VOLT_MOTOR_MINIM_NEG ) {
-            pwm_uint_value_M0 = (uint16_t)( -100.0f * argVoltM0 / Batt_volt_ema );
+            pwm_uint_value_M0 = (uint16_t)( -100.0f * argVoltM0 / gBatt_volt_ema );
             // run ROBOT REVERSE
             SET_PWM_DUTY( PHASE_A , pwm_uint_value_M0 );
             SET_PWM_DUTY( PHASE_B , 0U );
@@ -1017,14 +906,14 @@ void Motor_M1_volt( float argVoltM1 )
 {
     uint16_t pwm_uint_value_M1 = 0U;
 
-    if ( Batt_volt_ema > VOLT_BATTERY_MIN ) {
+    if ( gBatt_volt_ema > VOLT_BATTERY_MIN ) {
         if ( argVoltM1 > VOLT_MOTOR_MINIM_POS ) {
-            pwm_uint_value_M1 = (uint16_t)( 100.0f * argVoltM1 / Batt_volt_ema );
+            pwm_uint_value_M1 = (uint16_t)( 100.0f * argVoltM1 / gBatt_volt_ema );
             // run ROBOT FORWARD
             SET_PWM_DUTY( PHASE_C , pwm_uint_value_M1 );
             SET_PWM_DUTY( PHASE_D , 0U );
         } else if ( argVoltM1 < VOLT_MOTOR_MINIM_NEG ) {
-            pwm_uint_value_M1 = (uint16_t)( -100.0f * argVoltM1 / Batt_volt_ema );
+            pwm_uint_value_M1 = (uint16_t)( -100.0f * argVoltM1 / gBatt_volt_ema );
             // run ROBOT REVERSE
             SET_PWM_DUTY( PHASE_C , 0U );
             SET_PWM_DUTY( PHASE_D , pwm_uint_value_M1 );
@@ -1130,8 +1019,8 @@ void ADC_check( void )
 
             // >> BATTERY <<
             if ( i == 0 ) {
-                Batt_volt       = VOLT_SCHTKY_DROP + ADC_volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
-                Batt_volt_ema   = Beta_ema_volt * Batt_volt + (1.0f-Beta_ema_volt) * Batt_volt_ema;   // Exponential Moving Average
+                gBatt_volt       = VOLT_SCHTKY_DROP + ADC_volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
+                gBatt_volt_ema   = gBeta_ema_coef * gBatt_volt + (1.0f-gBeta_ema_coef) * gBatt_volt_ema;   // Exponential Moving Average
             }
             // else
             //     ADC_volt[ i ] = (float)ADC_LSB[ i ] * VOLT_ADC_REF / 4096.0f;
@@ -1190,33 +1079,33 @@ void UART_check( void )
             // ----- REGULATION ------    
             case ROBO_STATE_BALA:                    
                 UART0_signals[  0 ] = 100.0f * Angle_Pitch_Deg;         // raw Pitch FAST
-                UART0_signals[  1 ] = 100.0f * Angle_Pitch_Deg_CoFil;   // filtered Pitch
-                UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
-                UART0_signals[  3 ] = 100.0f * PID_P_term_volt;         // P volt
-                UART0_signals[  4 ] = 100.0f * PID_I_term_volt;         // I volt
-                UART0_signals[  5 ] = 100.0f * PID_D_term_volt;         // D volt
-                UART0_signals[  6 ] = 100.0f * PID_C_LHRH_volt;         // C volt
-                UART0_signals[  7 ] = 100.0f * PID_G_damp_volt;         // G volt
+                UART0_signals[  1 ] = 100.0f * gAngle_PITCH_deg_CoFil;   // filtered Pitch
+                // UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
+                // UART0_signals[  3 ] = 100.0f * PID_P_term_volt;         // P volt
+                // UART0_signals[  4 ] = 100.0f * PID_I_term_volt;         // I volt
+                // UART0_signals[  5 ] = 100.0f * PID_D_term_volt;         // D volt
+                // UART0_signals[  6 ] = 100.0f * PID_C_LHRH_volt;         // C volt
+                UART0_signals[  7 ] = 100.0f * gPID_AV_Rates_Volt ;         // G volt
 
                 UART0_signals[  8 ] = 1.000f * Motor0_curr_mA;          // raw Motor I
                 UART0_signals[  9 ] = 1.000f * Motor0_curr_mA_ema;      // filtered Motor I
                 UART0_signals[ 10 ] = 1.000f * Motor1_curr_mA;          // raw Motor I
                 UART0_signals[ 11 ] = 1.000f * Motor1_curr_mA_ema;      // filtered Motor I
-                UART0_signals[ 12 ] = 100.0f * Motor0_theta_rad;        // motor shaft angle
-                UART0_signals[ 13 ] = 100.0f * Motor1_theta_rad;        // motor shaft angle
-                UART0_signals[ 14 ] = 100.0f * Motor0_omega_rads;       // motor speed
-                UART0_signals[ 15 ] = 100.0f * Motor1_omega_rads;       // motor speed
+                // UART0_signals[ 12 ] = 100.0f * Motor0_theta_rad;        // motor shaft angle
+                // UART0_signals[ 13 ] = 100.0f * Motor1_theta_rad;        // motor shaft angle
+                // UART0_signals[ 14 ] = 100.0f * Motor0_omega_rads;       // motor speed
+                // UART0_signals[ 15 ] = 100.0f * Motor1_omega_rads;       // motor speed
                 
-                UART0_signals[ 16 ] = 100.0f * P_0_gain;                  // P gain
-                UART0_signals[ 17 ] = 100.0f * I_0_gain;                  // I gain
-                UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
-                UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
-                UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
-                UART0_signals[ 21 ] = 100.0f * G_0_damp;                  // G damping - gyro
+                // UART0_signals[ 16 ] = 100.0f * P_0_gain;                  // P gain
+                // UART0_signals[ 17 ] = 100.0f * I_0_gain;                  // I gain
+                // UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
+                // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
+                // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
+                UART0_signals[ 21 ] = 100.0f * gDamp_gain;                  // G damping - gyro
                 UART0_signals[ 22 ] = 100.0f * Alpha_cf_MPU;            // Alpha coef. for complementary filter Acc+Gyro
                 UART0_signals[ 23 ] = 100.0f * Zeta_ema_curr;           // Zeta coef. for Exponencial
 
-                UART0_signals[ 24 ] = 100.0f * Batt_volt_ema;           // Filtered battery voltage
+                UART0_signals[ 24 ] = 100.0f * gBatt_volt_ema;           // Filtered battery voltage
                 UART0_signals[ 25 ] = 100.0f * MPU_temp_C;              // temperature of MPU
                 UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
                 UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
@@ -1267,37 +1156,37 @@ bool checkForGainCommand( void )
                         case 'P': 
                             P_Gain_received = value;
                             if ( 100 >= P_Gain_received && P_Gain_received >= 0 ) { // P shall be small and positive
-                                P_0_gain = (float)P_Gain_received / 100.0f;
+                                // P_0_gain = (float)P_Gain_received / 100.0f;
                             }
                             break;
                         case 'I': 
                             I_Gain_received = value;
                             if ( 100 >= I_Gain_received && I_Gain_received >= 0 ) { // I shall be small and positive
-                                I_0_gain = (float)I_Gain_received / 10000.0f;
+                                // I_0_gain = (float)I_Gain_received / 10000.0f;
                             }
                             break;
                         case 'D':
                             D_Gain_received = value;
                             if ( 100 >= D_Gain_received && D_Gain_received >= -100  ) { // D shall be small
-                                D_0_gain = (float)D_Gain_received / 100.0f;
+                                // D_0_gain = (float)D_Gain_received / 100.0f;
                             }
                             break;
                         case 'C':
                             C_Gain_received = value;
                             if ( 10000 >= C_Gain_received && C_Gain_received >= 0 ) {   // C could be large and positive
-                                C_gain_LH_RH = (float)C_Gain_received / 100.0f;
+                                // C_gain_LH_RH = (float)C_Gain_received / 100.0f;
                             }
                             break;
                         case 'N':
                             N_Gain_received = value;
                             if ( 2000 >= N_Gain_received && N_Gain_received >= 0 ) {    // N could be large and positive
-                                N_0_coef = (float)N_Gain_received / 100.0f;
+                                // N_0_coef = (float)N_Gain_received / 100.0f;
                             }
                             break;
                         case 'G':
                             G_Gain_received = value;
                             if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                G_0_damp = (float)G_Gain_received / 100.0f;
+                                gDamp_gain = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         case 'A':
@@ -1349,27 +1238,27 @@ bool checkForCommand2( void )
                     {
                         case 'P': P_Gain_received=value;
                                   if(value>=0 && value<=100)
-                                      P_0_gain=(float)value/100.0f;
+                                    //   P_0_gain=(float)value/100.0f;
                                   break;
                         case 'I': I_Gain_received=value;
                                   if(value>=0 && value<=100)
-                                      I_0_gain=(float)value/10000.0f;
+                                    //   I_0_gain=(float)value/10000.0f;
                                   break;
                         case 'D': D_Gain_received=value;
                                   if(value>=-100 && value<=100)
-                                      D_0_gain=(float)value/100.0f;
+                                    //   D_0_gain=(float)value/100.0f;
                                   break;
                         case 'C': C_Gain_received=value;
                                   if(value>=0 && value<=10000)
-                                      C_gain_LH_RH=(float)value/100.0f;
+                                    //   C_gain_LH_RH=(float)value/100.0f;
                                   break;
                         case 'N': N_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      N_0_coef=(float)value/100.0f;
+                                    //   N_0_coef=(float)value/100.0f;
                                   break;
                         case 'G': G_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      G_0_damp=(float)value/100.0f;
+                                      gDamp_gain=(float)value/100.0f;
                                   break;
                         case 'A': A_Filt_received=value;
                                   if(value>=0 && value<=100)
@@ -1443,9 +1332,9 @@ bool checkForCommand2( void )
                         case 'Y':
                             Y_Offs_received = value;
                             if( 1 == value || value == -1 )
-                                PID_0_angle_ref += value;
-                            else if ( value == 0 )
-                                PID_0_angle_ref = ANGLE_UPRIGHT_DEG;
+                                // PID_0_angle_ref += value;
+                            // else if ( value == 0 )
+                                // PID_0_angle_ref = ANGLE_UPRIGHT_DEG;
                         break;
                         // case 'Z': Z_offset=value; break;
                         // add other OFFS parameters here
@@ -1607,28 +1496,22 @@ void SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty )
     else if ( argDuty < PWM_MIN_DUTY )
         argDuty = 0;
 
-    if ( argPhase > PHASE_COUNT-1 )     // if greather than 3 (4 phases)
-        argPhase %= PHASE_COUNT-1 ;
+    if ( argPhase > (PHASE_COUNT-1U) )     // if greather than 3 (4 phases)
+        argPhase %= (PHASE_COUNT-1U) ;
 
     switch ( argPhase )
     {
         case 0:
-            // DL_Timer_setCaptureCompareOutCtl( PWM_0_INST , DL_TIMER_CC_OCTL_INIT_VAL_LOW , DL_TIMER_CC_OCTL_INV_OUT_DISABLED , DL_TIMER_CC_OCTL_SRC_FUNCVAL , GPIO_PWM_0_C0_IDX );
-            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty ,                                                                                    GPIO_PWM_0_C0_IDX );
-            // DL_Timer_overrideCCPOut(          PWM_0_INST , DL_TIMER_FORCE_OUT_DISABLED , DL_TIMER_FORCE_CMPL_OUT_DISABLED ,                                   GPIO_PWM_0_C0_IDX );
+            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty , GPIO_PWM_0_C0_IDX );
             break;
         case 1:
-            // DL_Timer_setCaptureCompareOutCtl( PWM_0_INST , DL_TIMER_CC_OCTL_INIT_VAL_LOW , DL_TIMER_CC_OCTL_INV_OUT_DISABLED , DL_TIMER_CC_OCTL_SRC_FUNCVAL , GPIO_PWM_0_C1_IDX );
-            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty ,                                                                                    GPIO_PWM_0_C1_IDX );
-            // DL_Timer_overrideCCPOut(          PWM_0_INST , DL_TIMER_FORCE_OUT_DISABLED , DL_TIMER_FORCE_CMPL_OUT_DISABLED ,                                   GPIO_PWM_0_C1_IDX );
+            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty , GPIO_PWM_0_C1_IDX );
             break;
         case 2:
-            // DL_Timer_setCaptureCompareOutCtl( PWM_0_INST , DL_TIMER_CC_OCTL_INIT_VAL_LOW , DL_TIMER_CC_OCTL_INV_OUT_DISABLED , DL_TIMER_CC_OCTL_SRC_FUNCVAL , GPIO_PWM_0_C2_IDX );
-            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty ,                                                                                    GPIO_PWM_0_C2_IDX );
-            // DL_Timer_overrideCCPOut(          PWM_0_INST , DL_TIMER_FORCE_OUT_DISABLED , DL_TIMER_FORCE_CMPL_OUT_DISABLED ,                                   GPIO_PWM_0_C2_IDX );
+            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty , GPIO_PWM_0_C2_IDX );
             break;       
         case 3:
-            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty ,                                                                                    GPIO_PWM_0_C3_IDX );
+            DL_TimerA_setCaptureCompareValue( PWM_0_INST , 100U-argDuty , GPIO_PWM_0_C3_IDX );
             break;    
     }
     
@@ -1683,9 +1566,7 @@ void MPU_check ( void )
                 }
                 break;
             case 2:      
-        // DL_GPIO_setPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
                 MPU_GetAccTempGyro_Return = MPU_GetAccTempGyro();   // takes ~410us @400kHz
-        // DL_GPIO_clearPins( GPIO_PORT , GPIO_RC_PWM0_PIN );
                 if ( MPU_GetAccTempGyro_Return != 0 ) { 
                     MPU_switch = 0;
                     fMotorEnable = false;
@@ -1903,12 +1784,12 @@ uint16_t MPU_GetAccTempGyro( void )
     // Send data to Slave - Request to read (14 bytes - 2*(ACCx+ACCy+ACCz+GYROx+GYROy+GYROz+TEMP))
     DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
 
-t0_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
+// t0_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
     // ANTIBLOCK - count down to 8549 -> this takes 366us
     for ( I2C_Anti_Block = 10000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
     ab_ct[ 17 ] = I2C_Anti_Block;
-dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
+// dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
 
     if ( I2C_Anti_Block == 0 ) {
         I2C_Flag_Block++;
@@ -1936,27 +1817,10 @@ dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
 
 // TRIGINOMETRY USED TO DETERMINE ANGLES - theta, psi, phi
 // https://www.analog.com/en/resources/app-notes/an-1057.html
-t0_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
+
     Angle_Pitch_Deg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
     Angle_Roll_Deg  = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
     Angle_Yaw_Deg   = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
-dt_us[1] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[1];
-
-t0_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
-    Angle_Pitch_Deg_rp_fast = RAD_TO_DEG * atan2_fast( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) , gprecision_level );
-    Angle_Roll_Deg_rp_fast  = RAD_TO_DEG * atan2_fast( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) , gprecision_level );
-    Angle_Yaw_Deg_rp_fast   = RAD_TO_DEG * atan2_fast( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g , gprecision_level );
-dt_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[2];
-
-// Angle_Pitch_Deg_delta = Angle_Pitch_Deg - Angle_Pitch_Deg_rp_fast;
-// Angle_Pitch_Deg_delta_filtered = (0.1f) * Angle_Pitch_Deg_delta + (1.0f - 0.1f) * Angle_Pitch_Deg_delta_filtered; // Apply exponential filter
-// if ( Angle_Pitch_Deg_delta_filtered <= 0.0f ) {
-//     if ( Angle_Pitch_Deg_max_hold_neg > Angle_Pitch_Deg_delta_filtered )
-//         Angle_Pitch_Deg_max_hold_neg = Angle_Pitch_Deg_delta_filtered;
-// } else {
-//     if (  Angle_Pitch_Deg_max_hold_pos < Angle_Pitch_Deg_delta_filtered )
-//         Angle_Pitch_Deg_max_hold_pos = Angle_Pitch_Deg_delta_filtered;
-// }
 
     MPU_temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
 
@@ -1981,207 +1845,131 @@ dt_us[2] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[2];
 
     // T_sampling, sensitivity 131LSB / deg/s
 	Gyro_X_RateDegs = ( ( MPU_gyroX * TIME_MPU_READ_SEC ) / 131.0f );
-    Gyro_Y_RateDegs = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / 131.0f );
-    Gyro_Z_RateDegs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );   // 3 lines 125us	
+    gRate_Y_degs_f = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / -131.0f );       // it seems this axis is reversed
+    Gyro_Z_RateDegs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );       // 3 lines 125us	
 	
-    Angle_Pitch_Deg_CoFil = ( 1 - Alpha_cf_MPU ) * ( Angle_Pitch_DegN_1 + Gyro_Y_RateDegs ) + Alpha_cf_MPU * Angle_Pitch_Deg;
+    gAngle_PITCH_deg_CoFil = ( 1 - Alpha_cf_MPU ) * ( Angle_Pitch_DegN_1 + gRate_Y_degs_f ) + Alpha_cf_MPU * Angle_Pitch_Deg;
 	Angle_Roll_Deg_CoFil  = ( 1 - Alpha_cf_MPU ) * ( Angle_Roll_DegN_1  + Gyro_X_RateDegs ) + Alpha_cf_MPU * Angle_Roll_Deg;
     Angle_Yaw_Deg_CoFil   = ( 1 - Alpha_cf_MPU ) * ( Angle_Yaw_DegN_1   + Gyro_Z_RateDegs ) + Alpha_cf_MPU * Angle_Yaw_Deg;  // 3 lines 120us
 
     // re-shift
-    Angle_Pitch_DegN_1 = Angle_Pitch_Deg_CoFil;
+    Angle_Pitch_DegN_1 = gAngle_PITCH_deg_CoFil;
     Angle_Roll_DegN_1  = Angle_Roll_Deg_CoFil;
     Angle_Yaw_DegN_1   = Angle_Yaw_Deg_CoFil;
+
+    // RUN PID
+    flagInnerLoop = true;
 
     return I2C_Flag_Block;
 
 }
 
-// ----- OMEGA CALCULATION -----
-void OMEGA_check( void )
-{
-    if ( fMotorOmega )
-    {
-        fMotorOmega = false;
-
-        QdiffM0_raw = cQuadM0_K0 - cQuadM0_K1;
-        QdiffM1_raw = cQuadM1_K0 - cQuadM1_K1;
-
-        QdiffM0_K0 = QdiffM0_raw;
-        QdiffM1_K0 = QdiffM1_raw;
-
-        QdiffM0_fir = fir_a0 * QdiffM0_K0 + fir_a1 * QdiffM0_K1 + fir_a2 * QdiffM0_K2;
-        QdiffM1_fir = fir_a0 * QdiffM1_K0 + fir_a1 * QdiffM1_K1 + fir_a2 * QdiffM1_K2;
-
-        Motor0_theta_rad  = -2.0f * PI * (float)( cQuadM0_K0 ) / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        Motor0_omega_rads = -PI_2 * ( (float)(QdiffM0_raw) ) * 1.0f/TIME_MOTOR_OMEGA_S / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        // Motor0_omega_rads = -2.0f * PI * ( (float)( cQuadM0_K0 - cQuadM0_K1 ) ) * 1/TIME_MOTOR_OMEGA_S / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        
-        Motor1_theta_rad  = 2.0f * PI * (float)( cQuadM1_K0 ) / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        Motor1_omega_rads = PI_2 * ( (float)(QdiffM1_raw) ) * 1.0f/TIME_MOTOR_OMEGA_S / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        // Motor1_omega_rads = 2.0f * PI * ( (float)( cQuadM1_K0 - cQuadM1_K1 ) ) * 1/TIME_MOTOR_OMEGA_S / ROBO_MOT_GEAR_RATIO / ROBO_MOT_CPR_RATIO;
-        
-        cQuadM0_K1 = cQuadM0_K0;
-        cQuadM1_K1 = cQuadM1_K0;
-
-        QdiffM0_K2 = QdiffM0_K1;
-        QdiffM0_K1 = QdiffM0_K0;
-
-        QdiffM1_K2 = QdiffM1_K1;
-        QdiffM1_K1 = QdiffM1_K0;
-
-        // Robot speed and position calculation
-        robot_pos_m = 0.5f * ( Motor0_theta_rad + Motor1_theta_rad ) * ROBO_WHEEL_R_M;
-        robot_speed_ms = ( robot_pos_m - robot_pos_m_1 ) * 1.0f/TIME_MOTOR_OMEGA_S;
-        robot_pos_m_1 = robot_pos_m;
-    }
-}
-
 /*******************************
 *****   QUADRATURE FUNCT   *****
 ********************************/
-void QUAD_check( void )
+void    Update_Quad_0_RH( void )   // RH MOTOR
 {
     // ----- MOTOR 0 quad channels -----
-    fQuadA = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_A_PIN );
-    fQuadB = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_B_PIN );
-    // ----- A-channel -----
-    if ( fQuadA != fQuadA_1 )
-    {
-        fQuadA_1 = fQuadA;
-        // increment or decrement in depend of A channel EDGE and level on B channel
-        // rising edge		
-        if ( fQuadA )
-        {
-            if ( fQuadB )
-                --cQuadM0_K0;
-            else
-                ++cQuadM0_K0;
-        }
-        else
-        {
-            if ( fQuadB )
-                ++cQuadM0_K0;
-            else
-                --cQuadM0_K0;
-        }
-    }
-    // ----- B-channel -----
-    if ( fQuadB != fQuadB_1 )
-    {
-        fQuadB_1 = fQuadB;
-        // increment or decrement in depend of B channel EDGE and level on A channel
-        // rising edge
-        if ( fQuadB )
-        {
-            if ( fQuadA )
-                ++cQuadM0_K0;
-            else
-                --cQuadM0_K0;
-        }
-        else
-        {
-            if ( fQuadA )
-                --cQuadM0_K0;
-            else
-                ++cQuadM0_K0;
-        }	
-    }  
+    bool A = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_A_PIN );
+    bool B = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_B_PIN );
 
-    // ----- MOTOR 1 quad channels -----
-    fQuadC = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_C_PIN );
-    fQuadD = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_D_PIN );
-    // ----- D-channel -----
-    if ( fQuadC != fQuadC_1 )
+    // --- A channel edge ---
+    if ( A != A_0[0] )
     {
-        fQuadC_1 = fQuadC;
-        // increment or decrement in depend of C channel EDGE and level on D channel
-        // rising edge		
-        if ( fQuadC )
-        {
-            if ( fQuadD )
-                --cQuadM1_K0;
-            else
-                ++cQuadM1_K0;
-        }
-        else
-        {
-            if ( fQuadD )
-                ++cQuadM1_K0;
-            else
-                --cQuadM1_K0;
-        }
+        A_0[0] = A;
+        gTheta_0_RH_pos += ( A ^ B ) ? -1 : +1;
     }
-    // ----- D-channel -----
-    if ( fQuadD != fQuadD_1 )
+
+    // --- B channel edge ---
+    if ( B != B_0[0] )
     {
-        fQuadD_1 = fQuadD;
-        // increment or decrement in depend of B channel EDGE and level on A channel
-        // rising edge
-        if ( fQuadD )
-        {
-            if ( fQuadC )
-                ++cQuadM1_K0;
-            else
-                --cQuadM1_K0;
-        }
-        else
-        {
-            if ( fQuadC )
-                --cQuadM1_K0;
-            else
-                ++cQuadM1_K0;
-        }	
-    } 
+        B_0[0] = B;
+        gTheta_0_RH_pos += ( B ^ A ) ? +1 : -1;
+    }
+}
+void    Update_Quad_1_LH( void )   // LH MOTOR inversed due to motor is inverted
+{
+    // ----- MOTOR 0 quad channels -----
+    bool A = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_C_PIN );
+    bool B = DL_GPIO_readPins( QUAD_M1_PORT,QUAD_M1_D_PIN );
+
+    // --- A channel edge ---
+    if ( A != A_0[1] )
+    {
+        A_0[1] = A;
+        gTheta_1_LH_pos += ( A ^ B ) ? +1 : -1;
+    }
+
+    // --- B channel edge ---
+    if ( B != B_0[1] )
+    {
+        B_0[1] = B;
+        gTheta_1_LH_pos += ( B ^ A ) ? -1 : +1;
+    }
 }
 
-// ----- AI/COPILOT ASISTED CODE -----
-
-// Fast atan2 approximation in radians
-// precision_level: 1 = ~1° error, 2 = ~0.1° error, 3 = ~0.01° error
-static inline float atan2_fast(float y, float x, int precision_level)
+void Wheel_GetSpeed_SG(void)
 {
-    // Handle special cases
-    if (x == 0.0f) {
-        if (y > 0.0f) return PI_HALF;
-        if (y < 0.0f) return -PI_HALF;
-        return 0.0f;
-    }
+    // ----- SHIFT LEFT WHEEL HISTORY -----
+    gWheel_LH_hist_m[0] = gWheel_LH_hist_m[1];
+    gWheel_LH_hist_m[1] = gWheel_LH_hist_m[2];
+    gWheel_LH_hist_m[2] = gWheel_LH_hist_m[3];
+    gWheel_LH_hist_m[3] = gWheel_LH_hist_m[4];
+    gWheel_LH_hist_m[4] = gWheel_LH_m;      // newest sample
 
-    float abs_y = (y < 0.0f) ? -y : y;
-    float angle;
+    // ----- SHIFT RIGHT WHEEL HISTORY -----
+    gWheel_RH_hist_m[0] = gWheel_RH_hist_m[1];
+    gWheel_RH_hist_m[1] = gWheel_RH_hist_m[2];
+    gWheel_RH_hist_m[2] = gWheel_RH_hist_m[3];
+    gWheel_RH_hist_m[3] = gWheel_RH_hist_m[4];
+    gWheel_RH_hist_m[4] = gWheel_RH_m;      // newest sample
 
-    // Ratio for approximation
-    float r = (x >= 0.0f) ? (x - abs_y) / (x + abs_y)
-                          : (x + abs_y) / (abs_y - x);
+    // ----- SG DERIVATIVE FOR LEFT WHEEL -----
+    gWheel_LH_msec =
+        SG_K * ( gWheel_LH_hist_m[0]
+                - 8.0f * gWheel_LH_hist_m[1]
+                + 8.0f * gWheel_LH_hist_m[3]
+                - gWheel_LH_hist_m[4] );
 
-    // Polynomial approximation of atan in radians
-    switch (precision_level) {
-        case 1: // ~1° precision (fastest, linear)
-            angle = PI_QUART - PI_QUART * r;
-            break;
+    // ----- SG DERIVATIVE FOR RIGHT WHEEL -----
+    gWheel_RH_msec =
+        SG_K * ( gWheel_RH_hist_m[0]
+                - 8.0f * gWheel_RH_hist_m[1]
+                + 8.0f * gWheel_RH_hist_m[3]
+                - gWheel_RH_hist_m[4] );
+}
 
-        case 2: // ~0.1° precision (quadratic)
-            angle = (PI_QUART - PI_QUART * r) * (1.0f + 0.273f * r * r);
-            break;
+// Call this every 50 ms after updating gPosition_m
+float Robot_GetSpeed_SG(void)
+{
+    // Shift history: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
+    gPosition_hist_m[0] = gPosition_hist_m[1];
+    gPosition_hist_m[1] = gPosition_hist_m[2];
+    gPosition_hist_m[2] = gPosition_hist_m[3];
+    gPosition_hist_m[3] = gPosition_hist_m[4];
+    gPosition_hist_m[4] = gPosition_m;   // newest sample
 
-        case 3: // ~0.01° precision (cubic, slower)
-            angle = (PI_QUART - PI_QUART * r) * (1.0f + 0.273f * r * r - 0.020f * r * r * r);
-            break;
+    // Only valid after initial fill; you can gate this if needed
+    float v = SG_K * ( gPosition_hist_m[0]
+                     - 8.0f * gPosition_hist_m[1]
+                     + 8.0f * gPosition_hist_m[3]
+                     - gPosition_hist_m[4] );
 
-        default: // fallback to linear
-            angle = PI_QUART - PI_QUART * r;
-            break;
-    }
+    return v;   // [m/s]
+}
+float Robot_GetYawRate_SG(void)
+{
+    gYaw_hist_rad[0] = gYaw_hist_rad[1];
+    gYaw_hist_rad[1] = gYaw_hist_rad[2];
+    gYaw_hist_rad[2] = gYaw_hist_rad[3];
+    gYaw_hist_rad[3] = gYaw_hist_rad[4];
+    gYaw_hist_rad[4] = gYAW_rad;
 
-    // Quadrant correction
-    if (x < 0.0f) {
-        angle = (y < 0.0f) ? angle - PI_HALF : angle + PI_HALF;
-    } else {
-        if (y < 0.0f) angle = -angle;
-    }
-
-    return angle; // radians
+    return (1.0f / (12.0f * TIME_MOTOR_OMEGA_S)) *
+           ( gYaw_hist_rad[0]
+           - 8.0f * gYaw_hist_rad[1]
+           + 8.0f * gYaw_hist_rad[3]
+           - gYaw_hist_rad[4] );
 }
 
 // Median of 3 values
@@ -2208,28 +1996,11 @@ int32_t median3(int32_t a, int32_t b, int32_t c)
         b = tmp;
     } 
 
-    // SWAP(a,b);
-    // SWAP(b,c);
-    // SWAP(a,b);
     return b; // middle value
 }
 
-// Function to find maximum in float array
-float find_max(const volatile float *arr, int size)
-{
-    if (size <= 0) return 0.0f; // safety check
-
-    float max_val = arr[0];
-    for (int i = 1; i < size; i++) {
-        if (arr[i] > max_val) {
-            max_val = arr[i];
-        }
-    }
-    return max_val;
-}
-
-// Converts 8-bit GRB color into WS2812 PWM pattern (0x1C = 0, 0x38 = 1)
-void WS2812B_LED_Col(uint8_t led, uint8_t G, uint8_t R, uint8_t B)
+// Converts 8-bit RGB color into WS2812 PWM pattern (0x1C = 0, 0x38 = 1)
+void WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B)
 {
     volatile uint8_t *p = gLEDColors_8b_GRB[led];
 
@@ -2255,7 +2026,7 @@ void WS2812B_All_LED(uint8_t ArgColor, uint8_t ArgBrightness)
     else if (ArgColor == 2) { B = ArgBrightness; }
 
     for (uint8_t i = 0; i < WS2812B_LED_COUNT; i++)
-        WS2812B_LED_Col(i, G, R, B);
+        WS2812B_LED_Col(i, R, G, B);
 }
 
 void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
@@ -2278,10 +2049,88 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
 
     // ----- FIRST HALF -----
     for (uint8_t i = 0; i < half; i++)
-        WS2812B_LED_Col(i, G1, R1, B1);
+        WS2812B_LED_Col(i, R1, G1, B1);
 
     // ----- SECOND HALF -----
     for (uint8_t i = half; i < WS2812B_LED_COUNT; i++)
-        WS2812B_LED_Col(i, G2, R2, B2);
+        WS2812B_LED_Col(i, R2, G2, B2);
 }
+
+void BatteryGauge_8LED(float voltage)
+{
+    const float Vmax = 12.4f;
+    const float Vmin = 10.2f;
+    const uint8_t LEDcount = 8;
+    const uint8_t LEDoffset = 0;
+
+    // --- Normalize voltage into 0..1 range ---
+    float norm = (voltage - Vmin) / (Vmax - Vmin);
+    if (norm < 0.0f) norm = 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
+
+    // --- Convert to LED steps ---
+    uint8_t active = (uint8_t)(norm * (LEDcount+LEDoffset));
+    if (active == 0) active = 1;   // always show at least 1 LED
+
+    // --- Draw the gauge ---
+    for (uint8_t i = LEDoffset; i < (LEDcount+LEDoffset); i++)
+    {
+        if (i < active - 1)
+        {
+            // Full green LEDs
+            WS2812B_LED_Col(i, 0, 0x0F, 0);   // R,G,B
+        }
+        else if (i == active - 1)
+        {
+            // Last LED: color depends on battery level
+            if (active == 1)
+                WS2812B_LED_Col(i, 0x10, 0, 0);   // RED (low battery)
+            else
+                WS2812B_LED_Col(i, 0x10, 0x04, 0); // Yellow (transition)
+        }
+        else
+        {
+            // LEDs above active level = OFF
+            WS2812B_LED_Col(i, 0, 0, 0);
+        }
+    }
+}
+
+void TiltGauge_8LED(float tilt_deg)
+{
+    const float TILT_MIN = -10.0f;
+    const float TILT_MAX =  10.0f;
+    const uint8_t LEDcount  = 8;
+    const uint8_t LEDoffset = 8;   // tilt LEDs start at index 8
+
+    // Clamp tilt
+    if (tilt_deg < TILT_MIN) tilt_deg = TILT_MIN;
+    if (tilt_deg > TILT_MAX) tilt_deg = TILT_MAX;
+
+    // Normalize tilt into 0..1
+    float norm = (tilt_deg - TILT_MIN) / (TILT_MAX - TILT_MIN);
+
+    // Map to LED index 0..6 (left LED of the pair)
+    float pos = norm * 6.0f;
+
+    // Apply offset correctly
+    uint8_t idxA = (uint8_t)pos + LEDoffset;  // left LED
+    uint8_t idxB = idxA + 1;                  // right LED (adjacent!)
+
+    // Draw LEDs
+    for (uint8_t i = LEDoffset; i < (LEDoffset + LEDcount); i++)
+    {
+        if (i == idxA || i == idxB)
+        {
+            // Active pair = RED
+            WS2812B_LED_Col(i, 0x0F, 0, 0);   // R,G,B
+        }
+        else
+        {
+            // Off
+            WS2812B_LED_Col(i, 0, 0, 0);
+        }
+    }
+}
+
 
