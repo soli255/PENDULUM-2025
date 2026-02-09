@@ -5,15 +5,13 @@
 *****   MSPM0G3507@80MHz/12.5ns     *****
 *****   Compiler Clang v4.0.0 -O2   *****
 *****   Ing. TOMAS SOLARSKI         *****
-*****   2026-02-09 1645             *****
+*****   2026-02-09 2324             *****
 ****************************************/
 
 // ** LAST UPDATE **
-// - Position and Speed Contollers added
-// - Savitzky-Golay Derivative Filter added for speed and rates measurement
-// - Massive variable change and reorganization
 // - WS2812B LED Battery Indicator added
 // - WS2812B LED Tilt Indicator added
+// - Motor Mixing added (Balancing and Yaw Control) - still need to be tuned
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -55,26 +53,20 @@
 
 #define     ANGLE_LIMIT_NEG_DEG     (-45.0f)    // negative angle limit - beyond PID controll is OFF    
 #define     ANGLE_LIMIT_POS_DEG     (+45.0f)    // positive angle limit - beyond PID controll is OFF    
-#define     ANGLE_LIM_HYST_DEG      (9.90f)     // hysteresis - preventing oscilations
-#define     ANGLE_UPRIGHT_DEG       (0.01f)     // default upright angle for ballancing
-#define     ANGLE_WINDUP_NEG_DEG    (-5.00f)    // Integrator Term value limit - negative angle - OUTER LOOP
-#define     ANGLE_WINDUP_POS_DEG    (+5.00f)    // Integrator Term value limit - positive angle - OUTER LOOP
+#define     ANGLE_LIM_HYST_DEG      (+22.5f)    // hysteresis - preventing oscilations
 
 #define     ALPHA_IQ             _IQ(0.02f)     // Alpha
 #define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
-#define     VOLT_MOTOR_LIM_HI       (8.50f)     // Action value limit for Inner Loop
-#define     VOLT_MOTOR_LIM_LO       (2.50f)     // Action value limit for Side Loop
 
-#define     VOLT_MOTOR_LIMIT_NEG    (-8.50f)    // Action value limit - motor negative voltage
-#define     VOLT_MOTOR_LIMIT_POS    (+8.50f)    // Action value limit - motor positive voltage
+#define     VOLT_MOTOR_LIM_HI       (8.00f)     // Action value limit for Inner Loop
+#define     VOLT_MOTOR_LIM_LO       (4.00f)     // Action value limit for Side Loop
+
 #define     VOLT_MOTOR_MINIM_NEG    (-0.15f)    // Motor voltage minimum value - negative
 #define     VOLT_MOTOR_MINIM_POS    (+0.15f)    // Motor voltage minimum value - positive
-#define     VOLT_BATTERY_MIN        (9.90f)     // Li-Pol low voltage - 3.3V per cell
+#define     VOLT_BATTERY_MIN        (10.2f)     // Li-Pol low voltage - 3.4V per cell
 #define     VOLT_BATTERY_DEF        (11.1f)     // Supply default voltage - also for filter
 #define     VOLT_ADC_REF            (3.60f)     // ADC reference voltage
 #define     VOLT_SCHTKY_DROP        (0.15f)     // Input rectifier drop
-#define     VOLT_WINDUP_LIMIT_NEG   (-0.75f)    // Integrator Term value limit - negative voltage - anti wind up
-#define     VOLT_WINDUP_LIMIT_POS   (+0.75f)    // Integrator Term value limit - positive voltage - anti wind up
 #define     ADC_CHANNELS            (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
@@ -88,8 +80,6 @@
 #define     ROBO_STATE_CALIB        (2U)        //
 
 #define     ALFA_COFIL_MPU          (0.03f)     // Complementary filter coefficient - Acc Gyro
-#define     BETA_EMA_BAT_COEF       (0.05f)     // Exponential Moving Average coef - Battery voltage
-#define     ZETA_EMA_MOT_CURR       (0.01f)     // Exponential Moving Average coef - Motor Current
 
 #define     RAD_TO_DEG              (57.2958f)
 
@@ -192,8 +182,8 @@ volatile    uint16_t    t0_us[ MAX_TIMERS ];    // save timer value
 #define     GET_DURATION(i) ( dt_us[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0_us[i]) )
 
 // ----- ANALOG -----
-#define     MOV_AVG_ADC             (16U)
-#define     MEDIAN_MOTOR_CURRENT    (7U)
+#define     BETA_EMA_BAT_COEF       (0.02f)     // Exponential Moving Average coef - Battery voltage
+#define     ZETA_EMA_MOT_CURR       (0.01f)     // Exponential Moving Average coef - Motor Current
 volatile    uint32_t    ADC_LSB[  ADC_CHANNELS ];       // [ LSB ]
 volatile    float       ADC_volt[ ADC_CHANNELS ];       // [ V ]
 volatile    float       gBatt_volt       = VOLT_BATTERY_DEF;
@@ -207,7 +197,6 @@ volatile    float       Motor0_curr_mA_ema  = 0.0f , Motor1_curr_mA_ema = 0.0f;
 volatile    uint32_t    ADC_LSB_M0_X = 0U , ADC_LSB_M0_Y = 0U , ADC_LSB_M0_Z = 0U , ADC_LSB_M0_MED3 = 0U;
 volatile    uint32_t    ADC_LSB_M1_X = 0U , ADC_LSB_M1_Y = 0U , ADC_LSB_M1_Z = 0U , ADC_LSB_M1_MED3 = 0U;
 volatile    float       Motor0_curr_mA_max  = 0.0f , Motor1_curr_mA_max = 0.0f;
-volatile    float       Motor0_buffer[ MEDIAN_MOTOR_CURRENT ] , Motor1_buffer[ MEDIAN_MOTOR_CURRENT ];
 volatile    uint8_t     Motors_buff_idx     = 0U;
 volatile    float       Drive0_temp_C       = 0.0f , Drive1_temp_C      = 0.0f;
 volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
@@ -215,8 +204,10 @@ volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
 
 // ----- PID 0 INNER LOOP -----
 // Attitude (Tilt) Stabilization
-volatile    float       gDamp_gain      = 0.0f;                    // Angular velocity (from gyroscope) as a damping term
-volatile    float       gAngle_gain     = 0.0f;              // P Gain for ANGLE - Inner Loop
+#define     K_DAMPIMG_DEF   (-15.0f)
+#define     K_BALANCE_DEF   (0.1f)
+volatile    float       gK_dynamicDamp      = K_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
+volatile    float       gK_balanceAngle     = K_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
 
 volatile    float       gPID_AV_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
 volatile    float       gPID_AV_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
@@ -225,8 +216,10 @@ volatile    float       gPID_AV_Robot_Volt  = 0.0f;     // Total Inner Loop Moto
 volatile    float       gPID_AV_Robot_Msec  = 0.0f;     // Outer Loop - Robot speed in m/s
 volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
 
-volatile    float       gP_Gain_LH_RH_angle = 0.0f;
-volatile    float       gP_Gain_LH_RH_rate  = 0.0f;
+#define     K_YAW_ANG_DEF   (0.0f)
+#define     K_YAW_RAT_DEF   (1.0f)
+volatile    float       gP_Gain_LH_RH_angle = K_YAW_ANG_DEF;
+volatile    float       gP_Gain_LH_RH_rate  = K_YAW_RAT_DEF;
 volatile    float       gYAW_setPoint_rad   = 0.0f;
 volatile    float       gYAW_error_rad      = 0.0f;
 volatile    float       gYAWrate_SP_rads    = 0.0f;
@@ -281,10 +274,15 @@ volatile    uint8_t     CSFR_CRC_Received = 0;
 volatile    uint8_t     CSFR_CRC_Calculated = 0;
 volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
 
-volatile    int16_t    RC_roll     = 0; // Received Ch. 1
-volatile    int16_t    RC_pitch    = 0; // Received Ch. 2
-volatile    uint16_t   RC_throttle = 0; // Received Ch. 3
-volatile    int16_t    RC_yaw      = 0; // Received Ch. 4
+volatile    int16_t     RC_roll     = 0;    // Received Ch. 1 - buffer idx 0
+volatile    int16_t     RC_pitch    = 0;    // Received Ch. 2 - buffer idx 1
+volatile    uint16_t    RC_throttle = 0;    // Received Ch. 3 - buffer idx 2
+volatile    int16_t     RC_yaw      = 0;    // Received Ch. 4 - buffer idx 3
+
+volatile    int16_t     RC_latch_left = 0;  // Received Ch. 5 - buffer idx 4
+volatile    int16_t     RC_latch_right = 0; // Received Ch. 6 - buffer idx 5
+volatile    int16_t     RC_3state_left = 0; // Received Ch. 7 - buffer idx 6
+volatile    int16_t     RC_3state_right= 0; // Received Ch. 8 - buffer idx 7
 
 // ----- I2C1 -----
 #define     I2C_TX_MAX_PACKET_SIZE (16U)
@@ -340,6 +338,9 @@ volatile    float       Angle_Roll_Deg_CoFil  = 0.0f , Angle_Roll_DegN_1  = 0.0f
 volatile    float       Angle_Yaw_Deg_CoFil   = 0.0f , Angle_Yaw_DegN_1    = 0.0f;
 
 // ----- MOTOR/ROBOT -----
+volatile    float       gYAW_Limit_Volt;    // limit voltage for yaw control to not become bigger than Balancing Voltage
+volatile    float       gMotor_LH_Volt;     // Left Hand motor voltage
+volatile    float       gMotor_RH_Volt;     // Right Hand motor voltage
 volatile    int32_t     gTheta_0_RH_pos , gTheta_1_LH_pos;      // encoder position in CPR
 volatile    float       gTheta_0_RH_rad , gTheta_1_LH_rad;      // motor Angle [rad]
 volatile    float       gWheel_LH_m     , gWheel_RH_m;          // wheel distance [m]
@@ -371,6 +372,7 @@ volatile    float       gYaw_hist_rad[5];       // x[k-2], x[k-1], x[k], x[k+1],
 void    MCU_Init( void );
 void    PID_Outer_Loop( void );
 void    PID_Inner_Loop( void );
+void    CSFR_check ( void );
 void    ADC_check( void );
 void    UART_check( void );
 void    QUAD_check( void );
@@ -420,12 +422,6 @@ int main( void ) {
     gPosition_setPoint_m = 0.0f;   // position set point 0 m
     gSpeed_setPoint_msec = 0.0f;   // speed set point 0 m/sec
 
-    gP_Gain_LH_RH_angle = 1.0f;
-    gP_Gain_LH_RH_rate  = 1.0f;
-
-    gDamp_gain          = -15.0f;
-    gAngle_gain         = 0.1f;
-
     WS2812B_Half_LED( 2 , 0 , 0x20 , 0x40 );
 
 // *****************************************  *****************************************  *****************************************
@@ -438,30 +434,20 @@ int main( void ) {
         TiltGauge_8LED( gAngle_PITCH_deg_CoFil);
 
         // ----- 10. QUAD -----
-    STORE_TIMER6(1);
         Update_Quad_0_RH();
         Update_Quad_1_LH();
-    GET_DURATION(1);
         
         // ----- 20. READ MPU -----        
-    STORE_TIMER6(2);
         MPU_check();
-    GET_DURATION(2);
         
         // ----- 30. (A) OUTER LOOP -----
-    STORE_TIMER6(3);
         PID_Outer_Loop();
-    GET_DURATION(3);
         
         // ----- 40. (B) INNER LOOP -----
-    STORE_TIMER6(4);
         PID_Inner_Loop();
-    GET_DURATION(4);
         
         // ----- 50. SEND DATA OVER UART -----
-    STORE_TIMER6(5);
         UART_check();
-    GET_DURATION(5);
         
         // ----- 60. FREE -----
         // ----- 70. FREE -----
@@ -469,38 +455,9 @@ int main( void ) {
         // nothing
         
         // ----- 90. ANALOG MEASUREMENT -----
-    STORE_TIMER6(9);
         ADC_check();
-    GET_DURATION(9);
         // ----- 100. CROSS FIRE DETECTOR -----
-        if ( FlagCRSF )
-        {
-            FlagCRSF = false;
-            if ( CSFR_Extract_Data() && CounterFailSafe > 0 )
-            {
-                CSFR_Parse_Data();
-                //run motors
-                RC_roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
-                RC_pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
-
-                // ROLL is actually used as YAW command
-                gYAWrate_SP_rads = -0.025f*RC_roll;
-
-                // PITCH
-                gAngle_setPoint_deg = -0.25f*RC_pitch;
-                #define PITCH_ANGLE_LIMIT (25.0f)
-                if ( gAngle_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg =  PITCH_ANGLE_LIMIT; }
-                if ( gAngle_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg = -PITCH_ANGLE_LIMIT; }
-                
-            }
-            else
-            {
-                // default
-                gAngle_setPoint_deg = gAngle_setPoint_deg * 0.9f; // exp decay
-                RC_roll = 0;
-                RC_pitch = 0;
-            }
-        }
+        CSFR_check();
     }
 }
 
@@ -770,16 +727,17 @@ void PID_Inner_Loop( void )
 {
     if ( flagInnerLoop )
     {
+STORE_TIMER6(4);
         flagInnerLoop = false;
 
         // ------------------------------
         // ----- 40. (B) INNER LOOP -----
         // ------------------------------
         // --- 41. Calculate DUMPING (no error) ---
-        gPID_AV_Rates_Volt   = gDamp_gain * gRate_Y_degs_f;         // Damping for preventing flip over
+        gPID_AV_Rates_Volt   = gK_dynamicDamp * gRate_Y_degs_f;         // Damping for preventing flip over
         // --- 43. Calculate Gain from Angle (error) ---
         gPID_Error_Angle_Deg = gAngle_setPoint_deg - gAngle_PITCH_deg_CoFil;
-        gPID_AV_Angle_Volt   = gAngle_gain * gPID_Error_Angle_Deg;  // Angle gain for upright position
+        gPID_AV_Angle_Volt   = gK_balanceAngle * gPID_Error_Angle_Deg;  // Angle gain for upright position
         // --- 44. Combine action values ---
         gPID_AV_Robot_Volt = gPID_AV_Angle_Volt + gPID_AV_Rates_Volt;
         // --- 45. Motor Voltage Limit ---
@@ -805,13 +763,56 @@ void PID_Inner_Loop( void )
                          ( gAngle_PITCH_deg_CoFil > ANGLE_LIMIT_NEG_DEG )
                         )            
                     {
-                        Motor_M0_volt( gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt );
-                        Motor_M1_volt( gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt );
+                        // -----------------------------------
+                        // ---- 47. MOTOR MIXING ALGORITHM ---
+                        // -----------------------------------
+                        // Default: no mixing yet
+                        gMotor_LH_Volt = 0.0f;
+                        gMotor_RH_Volt = 0.0f;
+                        // --- Check if we are in UPRIGHT POSITION ---
+                        if ( ( gAngle_PITCH_deg_CoFil < +3.5f ) &&
+                             ( gAngle_PITCH_deg_CoFil > -3.5f )
+                            )
+                        {
+                            // --- Check if we have YAW command [rad/s] ---
+                            if ( ( gYAWrate_SP_rads > 0.01f ) || ( gYAWrate_SP_rads < -0.01f ) )
+                            {
+                                // --- UPRIGHT and YAW command detected ---
+                                gMotor_LH_Volt += gPID_AV_LH_RH_Volt;
+                                gMotor_RH_Volt -= gPID_AV_LH_RH_Volt;
+                            } else {
+                                // --- UPRIGHT and NO YAW ---
+                            }
+                        // --- We are PROBABLY in Balancing ---
+                        } else {
+                            // 1) Limit YAW to 50% of forward AV when AV is NOT significant, default is 4.0V
+                            gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO;
+                            if ( ( gPID_AV_Robot_Volt < +VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt > 0.00f ) ) gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO * 0.5f;
+                            if ( ( gPID_AV_Robot_Volt > -VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt < 0.00f ) ) gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO * 0.5f;
+                            // --- Limit ---
+                            if ( gPID_AV_LH_RH_Volt >  gYAW_Limit_Volt) gPID_AV_LH_RH_Volt =  gYAW_Limit_Volt;
+                            if ( gPID_AV_LH_RH_Volt < -gYAW_Limit_Volt) gPID_AV_LH_RH_Volt = -gYAW_Limit_Volt;
+
+
+                            // 3) Anti-stall only when TILTED
+                        }
+                        // Standard mixing
+                        gMotor_LH_Volt = gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt;
+                        gMotor_RH_Volt = gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt;
+                        // --- Output ---
+                        Motor_M0_volt(gMotor_LH_Volt);
+                        Motor_M1_volt(gMotor_RH_Volt);
+
+
+
+                        // Motor_M0_volt( gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt );
+                        // Motor_M1_volt( gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt );
                     }
         } else {
             Motor_M0_volt( 0.0f );
             Motor_M1_volt( 0.0f );
         }
+GET_DURATION(4);    
     }
 }
 
@@ -820,6 +821,7 @@ void PID_Outer_Loop( void )
 {
     if ( fMotorOmega )
     {
+STORE_TIMER6(3);
         fMotorOmega = false;
         
         // -------------------------
@@ -848,11 +850,11 @@ void PID_Outer_Loop( void )
         gSpeed_error_msec    = gSpeed_setPoint_msec - gSpeed_msec;
         gSpeed_ActVal_deg    = gSpeed_error_msec * gSpeed_Gain;     // [deg] = [m/sec] * [deg/m/sec]
         // --- 360. Angle Set Point ---
-        gAngle_setPoint_deg  = gPosition_ActVal_deg + gSpeed_ActVal_deg;
+        // gAngle_setPoint_deg  = gPosition_ActVal_deg + gSpeed_ActVal_deg;
         // --- 370. Angle Set Point Limit ---
-        #define     ANGLE_LIMIT     ( 2.0f )
-        if ( gAngle_setPoint_deg > ANGLE_LIMIT ) gAngle_setPoint_deg = ANGLE_LIMIT;
-        if ( gAngle_setPoint_deg < -ANGLE_LIMIT ) gAngle_setPoint_deg = -ANGLE_LIMIT;
+        // #define     ANGLE_LIMIT     ( 2.0f )
+        // if ( gAngle_setPoint_deg > ANGLE_LIMIT ) gAngle_setPoint_deg = ANGLE_LIMIT;
+        // if ( gAngle_setPoint_deg < -ANGLE_LIMIT ) gAngle_setPoint_deg = -ANGLE_LIMIT;
         
         // -------------------------
         // ----- (C) SIDE LOOP -----
@@ -865,6 +867,53 @@ void PID_Outer_Loop( void )
         if ( gPID_AV_LH_RH_Volt > VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = VOLT_MOTOR_LIM_LO;
         if ( gPID_AV_LH_RH_Volt < -VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = -VOLT_MOTOR_LIM_LO;
 
+GET_DURATION(3);    
+    }
+}
+
+void    CSFR_check ( void )
+{
+    if ( FlagCRSF )
+    {
+        FlagCRSF = false;
+        if ( CSFR_Extract_Data() && CounterFailSafe > 0 )
+        {
+            CSFR_Parse_Data();
+            //run motors
+            RC_roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+            RC_pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+            // manipulate gains based on RC
+            // Input range (from your RC receiver)
+            const float x1 = 191.0f;    // min RC value
+            const float x2 = 1792.0f;   // max RC value
+            // Output range (your desired scaling)
+            const float y1 = 1.00f;
+            const float y2 = 1.50f;
+            // Compute linear coefficients
+            float a = (y2 - y1) / (x2 - x1);
+            float b = y1 - (a * x1);
+            // --- apply new gains ---
+            gK_balanceAngle = K_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
+            gK_dynamicDamp  = K_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
+
+            // ROLL is actually used as YAW command
+            gYAWrate_SP_rads = -0.0125f*RC_roll;
+            // gYAW_setPoint_rad += -0.001f*RC_roll;
+
+            // PITCH
+            gAngle_setPoint_deg = -0.50f*RC_pitch;
+            #define PITCH_ANGLE_LIMIT (25.0f)
+            if ( gAngle_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg =  PITCH_ANGLE_LIMIT; }
+            if ( gAngle_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg = -PITCH_ANGLE_LIMIT; }
+            
+        }
+        else
+        {
+            // default
+            gAngle_setPoint_deg = gAngle_setPoint_deg * 0.9f; // exp decay
+            RC_roll = 0;
+            RC_pitch = 0;
+        }
     }
 }
 
@@ -1022,11 +1071,6 @@ void ADC_check( void )
                 gBatt_volt       = VOLT_SCHTKY_DROP + ADC_volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
                 gBatt_volt_ema   = gBeta_ema_coef * gBatt_volt + (1.0f-gBeta_ema_coef) * gBatt_volt_ema;   // Exponential Moving Average
             }
-            // else
-            //     ADC_volt[ i ] = (float)ADC_LSB[ i ] * VOLT_ADC_REF / 4096.0f;
-            
-            // volt_Tmp[ i ] = volt_Tmp[ i ] - ( volt_Tmp[ i ] / MOV_AVG_ADC ) + ADC_volt[ i ];
-            // volt_AVG[ i ] = volt_Tmp[ i ] / MOV_AVG_ADC;
 
             // >> MOTOR 0 <<
             // Motor_current[A] = V_sns[V] / ( R_sns[R] * INA_GAIN[-] ) => Motor_cuureent = V_sns / 0.033R * 20
@@ -1059,16 +1103,20 @@ void UART_check( void )
 {
     // ----- COMMAND RECEIVED CHECK -----
     if ( UART0_terminator_detected ) {
+STORE_TIMER6(5);
+            
         UART0_terminator_detected = false;
 
         // checkForGainCommand();   
         checkForCommand2();
 
         clearUART0_RXbuffer_Zero();   
+GET_DURATION(5);
     }
     // ----- SEND DATA OVER UART -----
     if ( fSendData )
     {
+STORE_TIMER6(6);
         fSendData = false;
 
         switch ( Robot_State )
@@ -1101,7 +1149,7 @@ void UART_check( void )
                 // UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
                 // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
                 // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
-                UART0_signals[ 21 ] = 100.0f * gDamp_gain;                  // G damping - gyro
+                UART0_signals[ 21 ] = 100.0f * gK_dynamicDamp;                  // G damping - gyro
                 UART0_signals[ 22 ] = 100.0f * Alpha_cf_MPU;            // Alpha coef. for complementary filter Acc+Gyro
                 UART0_signals[ 23 ] = 100.0f * Zeta_ema_curr;           // Zeta coef. for Exponencial
 
@@ -1118,6 +1166,7 @@ void UART_check( void )
             case ROBO_STATE_CALIB:                  
                 break;    
         } 
+GET_DURATION(6);
     }
 }
 
@@ -1186,7 +1235,7 @@ bool checkForGainCommand( void )
                         case 'G':
                             G_Gain_received = value;
                             if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                gDamp_gain = (float)G_Gain_received / 100.0f;
+                                gK_dynamicDamp = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         case 'A':
@@ -1258,7 +1307,7 @@ bool checkForCommand2( void )
                                   break;
                         case 'G': G_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      gDamp_gain=(float)value/100.0f;
+                                      gK_dynamicDamp=(float)value/100.0f;
                                   break;
                         case 'A': A_Filt_received=value;
                                   if(value>=0 && value<=100)
@@ -1526,8 +1575,9 @@ void MPU_check ( void )
     // ----- READ MPU DATA -----        
     if ( fMPUread && ( cMPUdelay==0 ) )
     {
+STORE_TIMER6(2);
         fMPUread = false;     
-
+    
         switch ( MPU_switch )
         {
             case 0:
@@ -1581,6 +1631,7 @@ void MPU_check ( void )
                 er_ct[4]++;
                 break;
         }
+GET_DURATION(2);
     }
 }
 
@@ -1869,6 +1920,7 @@ uint16_t MPU_GetAccTempGyro( void )
 ********************************/
 void    Update_Quad_0_RH( void )   // RH MOTOR
 {
+STORE_TIMER6(1);
     // ----- MOTOR 0 quad channels -----
     bool A = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_A_PIN );
     bool B = DL_GPIO_readPins( QUAD_M0_PORT,QUAD_M0_B_PIN );
@@ -1906,6 +1958,7 @@ void    Update_Quad_1_LH( void )   // LH MOTOR inversed due to motor is inverted
         B_0[1] = B;
         gTheta_1_LH_pos += ( B ^ A ) ? -1 : +1;
     }
+GET_DURATION(1);   
 }
 
 void Wheel_GetSpeed_SG(void)
@@ -2058,8 +2111,8 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
 
 void BatteryGauge_8LED(float voltage)
 {
-    const float Vmax = 12.4f;
-    const float Vmin = 10.2f;
+    const float Vmax = VOLT_BATTERY_DEF + 1.0f;
+    const float Vmin = VOLT_BATTERY_MIN + 0.1f;
     const uint8_t LEDcount = 8;
     const uint8_t LEDoffset = 0;
 
