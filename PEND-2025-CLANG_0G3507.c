@@ -1,17 +1,16 @@
-/****************************************
-*****   PROGRAM NAME: PEND-2025     *****
-*****   PENDULUM (Balancing Robot)  *****
-*****   2xPOLOLU MOTOR 4753 12V 10W *****
-*****   MSPM0G3507@80MHz/12.5ns     *****
-*****   Compiler Clang v4.0.0 -O2   *****
-*****   Ing. TOMAS SOLARSKI         *****
-*****   2026-02-09 2324             *****
-****************************************/
+/**********************************************************************
+ * PROGRAM NAME: PEND-2025-CLANG_0G3507.c
+ * PROGRAM FUNCTION: Balancing Robot
+ * HARDWARE SPECIFICATIONS:
+ *   - 2xPOLOLU 4753 (50:1 Metal Gearmotor 37Dx70Lmm/12V/64CPR)
+ *   - MSPM0G3507@80MHz/12.5ns
+ * COMPILER VERSION: Clang v4.0.0 -O2
+ * PROGRAMMER: Tomas Solarski
+ * LAST MODIFIED: 2026-02-10 19:31:28
+ **********************************************************************/
 
 // ** LAST UPDATE **
-// - WS2812B LED Battery Indicator added
-// - WS2812B LED Tilt Indicator added
-// - Motor Mixing added (Balancing and Yaw Control) - still need to be tuned
+// - Turning by simple Voltage mixing added
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -23,17 +22,17 @@
 #define     GLOBAL_IQ 16
 #include    <ti/iqmath/include/IQmathLib.h>
 
-#define     LED_HEART_ON_MS         (100U)
-#define     LED_HEART_OFF_MS        (100U)
-#define     LED_TICK_COUNT          (15U)
+#define     LED_HEART_ON_MS     (100U)
+#define     LED_HEART_OFF_MS    (100U)
+#define     LED_TICK_COUNT      (15U)
 
-#define     LED_SEQUENCE_0          (0b111111)      // long  blink
-#define     LED_SEQUENCE_1          (0b111)         // one   blink
-#define     LED_SEQUENCE_2          (0b111000111)   // two   blink
-#define     LED_SEQUENCE_3          (0b1100110011)  // three blink
-#define     LED_SEQUENCE_4          (0b11011011011) // four blink
-#define     LED_SEQUENCE_5          (0b101010101)   // five blink
-#define     LED_SEQUENCE_6          (0b10101010101) // six blink
+#define     LED_SEQUENCE_0      (0b111111)      // long  blink
+#define     LED_SEQUENCE_1      (0b111)         // one   blink
+#define     LED_SEQUENCE_2      (0b111000111)   // two   blink
+#define     LED_SEQUENCE_3      (0b1100110011)  // three blink
+#define     LED_SEQUENCE_4      (0b11011011011) // four blink
+#define     LED_SEQUENCE_5      (0b101010101)   // five blink
+#define     LED_SEQUENCE_6      (0b10101010101) // six blink
 
 #define     TIME_SEND_DATA_MS       (100U)      // 10Hz send data rate
 #define     TIME_MOTOR_OMEGA_MS     (50U)       // rate to calculate impulses to determine motor speed
@@ -51,23 +50,21 @@
 #define     CRSF_CHANNEL_COUNT      (16U)
 #define     CRSF_CRC_POLY           (0xD5)      // 0xD5 gives better burst‑error detection for short frames
 
-#define     ANGLE_LIMIT_NEG_DEG     (-45.0f)    // negative angle limit - beyond PID controll is OFF    
-#define     ANGLE_LIMIT_POS_DEG     (+45.0f)    // positive angle limit - beyond PID controll is OFF    
-#define     ANGLE_LIM_HYST_DEG      (+22.5f)    // hysteresis - preventing oscilations
-
-#define     ALPHA_IQ             _IQ(0.02f)     // Alpha
-#define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
+// #define     ANGLE_LIMIT_NEG_DEG     (-45.0f)    // negative angle limit - beyond Controller controll is OFF    
+#define     ANGLE_LIM_BODY_DEG      (45.0f)     // Angle limit - beyond Controller controll is OFF    
+#define     ANGLE_LIM_HYST_DEG      (22.5f)     // Angle hysteresis - preventing oscilations
 
 #define     VOLT_MOTOR_LIM_HI       (8.00f)     // Action value limit for Inner Loop
 #define     VOLT_MOTOR_LIM_LO       (4.00f)     // Action value limit for Side Loop
 
-#define     VOLT_MOTOR_MINIM_NEG    (-0.15f)    // Motor voltage minimum value - negative
-#define     VOLT_MOTOR_MINIM_POS    (+0.15f)    // Motor voltage minimum value - positive
+// #define     VOLT_MOTOR_MIN    (-0.15f)    // Motor voltage minimum value - negative
+#define     VOLT_MOTOR_MIN          (0.25f)     // Motor voltage minimum value - positive
+#define     VOLT_MOTOR_HYST         (0.10f)     // Small hysteresis to prevent oscillations
 #define     VOLT_BATTERY_MIN        (10.2f)     // Li-Pol low voltage - 3.4V per cell
-#define     VOLT_BATTERY_DEF        (11.1f)     // Supply default voltage - also for filter
+#define     VOLT_BATTERY_DEF        (11.3f)     // Li-Pol default voltage - 3.75V per cell
 #define     VOLT_ADC_REF            (3.60f)     // ADC reference voltage
 #define     VOLT_SCHTKY_DROP        (0.15f)     // Input rectifier drop
-#define     ADC_CHANNELS            (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
+#define     ADC_CNT                 (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
 #define     MOTOR_GEAR_RATIO        (50.0f)     // gear ratio
@@ -75,16 +72,19 @@
 #define     WHEEL_DIAMETER_M        (0.125f)    // 125mm
 #define     WHEEL_RADIUS_M          (WHEEL_DIAMETER_M/2.0f)
 #define     WHEEL_TRACK_M           (0.21f)     // 210mm - wheels separation distance
+
 #define     ROBO_STATE_INIT         (0U)        // MPU not initiated or found
 #define     ROBO_STATE_BALA         (1U)        //
 #define     ROBO_STATE_CALIB        (2U)        //
 
-#define     ALFA_COFIL_MPU          (0.03f)     // Complementary filter coefficient - Acc Gyro
+#define     ALFA_CF_COEF            (0.03f)     // Complementary filter coefficient - Acc Gyro
+#define     ALPHA_IQ             _IQ(0.02f)     // Alpha
+#define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
 
 #define     RAD_TO_DEG              (57.2958f)
 
-#define     PWM_MAX_DUTY            (90U)  // [ % ] -> 0.90*12V => 10.8V
-#define     PWM_MIN_DUTY            (2U)   // [ % ] -> 0.02*12V => 0.24V
+#define     PWM_MAX_DUTY            (90U)       // [ % ] -> 0.90*12V => 10.8V
+#define     PWM_MIN_DUTY            (2U)        // [ % ] -> 0.02*12V => 0.24V
 
 // TIMER CHANNELS ASSIGNED TO OUTPUTS
 #define     PHASE_A                 (1U)
@@ -145,33 +145,33 @@ volatile uint8_t crc8tab[256] = {
     0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
     0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
 
-// volatile    uint8_t     gprecision_level = 1U;
 
-volatile    uint16_t    LED_Sequence_Actual    = LED_SEQUENCE_1;
-volatile    uint8_t     Robot_State     = ROBO_STATE_BALA;
-volatile    uint8_t     Robot_State_1   = ROBO_STATE_BALA;
+volatile    uint16_t    gLED_Seq_Now    = LED_SEQUENCE_1;
+volatile    uint8_t     gRobot_State    = ROBO_STATE_BALA;
+volatile    uint8_t     gRobot_State_1  = ROBO_STATE_BALA;
 
 // ----- FLAGS -----
-volatile    bool        fHeartLED       = false;
-volatile    bool        fMPUread        = false;
-volatile    bool        fADC[ ADC_CHANNELS ];
-volatile    bool        fSendData       = false;
-volatile    bool        fMotorOmega     = false;
-volatile    bool        flagInnerLoop  = false;
-volatile    bool        fMotorEnable    = false;
-volatile    bool        FlagCRSF        = false;
 #define     QUAD_CNT    (2U)
-volatile    bool        A_0[QUAD_CNT] , B_0[QUAD_CNT];
+volatile    bool    flg_Heart_LED     = false;
+volatile    bool    flg_Read_MPU      = false;
+volatile    bool    flg_ADC[ADC_CNT]  = { false };
+volatile    bool    flg_Send_UART     = false;
+volatile    bool    flg_RUN_OuterLoop = false;
+volatile    bool    flg_RUN_InnerLoop = false;
+volatile    bool    flg_Motor_EN      = false;
+volatile    bool    flg_Read_CRSF     = false;
+volatile    bool    A_0[QUAD_CNT]     = { false };
+volatile    bool    B_0[QUAD_CNT]     = { false };
 
 // ----- COUNTERS -----
-volatile    uint32_t    cHeartLED       = LED_HEART_ON_MS;
-volatile    uint8_t     cHeartTick      = 0;
-volatile    uint32_t    cMPUread        = TIME_MPU_READ_MS;
-volatile    uint32_t    cMPUdelay       = TIME_MPU_DELAY_MS;
-volatile    uint32_t    cSendData       = TIME_SEND_DATA_MS;
-volatile    uint32_t    cMotorOmega     = TIME_MOTOR_OMEGA_MS;
-volatile    uint32_t    CounterFailSafe = 0U;
-volatile    uint32_t    CounterCRSF     = TIME_CRSF_MS;
+volatile    uint32_t    cnt_Heart_LED   = LED_HEART_ON_MS;
+volatile    uint8_t     cnt_Heart_Tick  = 0U;
+volatile    uint32_t    cnt_Read_MPU    = TIME_MPU_READ_MS;
+volatile    uint32_t    cnt_Delay_MPU   = TIME_MPU_DELAY_MS;
+volatile    uint32_t    cnt_Send_UART   = TIME_SEND_DATA_MS;
+volatile    uint32_t    cnt_OuterLoop   = TIME_MOTOR_OMEGA_MS;
+volatile    uint32_t    cnt_Fail_Safe   = 0U;
+volatile    uint32_t    cnt_Read_CRSF   = TIME_CRSF_MS;
 
 volatile    uint32_t    er_ct[ 24 ];
 volatile    uint32_t    ab_ct[ 24 ]; 
@@ -182,17 +182,23 @@ volatile    uint16_t    t0_us[ MAX_TIMERS ];    // save timer value
 #define     GET_DURATION(i) ( dt_us[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0_us[i]) )
 
 // ----- ANALOG -----
-#define     BETA_EMA_BAT_COEF       (0.02f)     // Exponential Moving Average coef - Battery voltage
-#define     ZETA_EMA_MOT_CURR       (0.01f)     // Exponential Moving Average coef - Motor Current
-volatile    uint32_t    ADC_LSB[  ADC_CHANNELS ];       // [ LSB ]
-volatile    float       ADC_volt[ ADC_CHANNELS ];       // [ V ]
-volatile    float       gBatt_volt       = VOLT_BATTERY_DEF;
-volatile    float       gBatt_volt_ema   = VOLT_BATTERY_DEF;
-volatile    float       gBeta_ema_coef   = BETA_EMA_BAT_COEF;
-volatile    float       Zeta_ema_curr   = ZETA_EMA_MOT_CURR;
-volatile    float       Motor0_curr_mA      = 0.0f , Motor1_curr_mA     = 0.0f;
-volatile    float       Motor0_curr_mA_med  = 0.0f , Motor1_curr_mA_med = 0.0f;
-volatile    float       Motor0_curr_mA_ema  = 0.0f , Motor1_curr_mA_ema = 0.0f;
+#define     BETA_EMA_COEF       (0.01f)     // Exponential Moving Average coef - Battery voltage
+#define     ZETA_EMA_COEF       (0.01f)     // Exponential Moving Average coef - Motor Current
+volatile    uint32_t    ADC_LSB[  ADC_CNT ];       // [ LSB ]
+volatile    float       ADC_Volt[ ADC_CNT ];       // [ V ]
+
+volatile    float       gBatt_Volt       = VOLT_BATTERY_DEF;
+volatile    float       gBatt_Volt_EMA   = VOLT_BATTERY_DEF;
+volatile    float       gBETA_EMA_Coef   = BETA_EMA_COEF;
+volatile    float       gZETA_EMA_Coef   = ZETA_EMA_COEF;
+
+volatile    float       gM0_RH_Curr_mA      = 0.0f;
+volatile    float       gM1_LH_Curr_mA      = 0.0f;
+volatile    float       gM0_RH_Curr_mA_Med  = 0.0f;
+volatile    float       gM1_LH_Curr_mA_Med  = 0.0f;
+volatile    float       gM0_RH_Curr_mA_EMA  = 0.0f;
+volatile    float       gM1_LH_Curr_mA_EMA  = 0.0f;
+
 // MEDIAN of 3
 volatile    uint32_t    ADC_LSB_M0_X = 0U , ADC_LSB_M0_Y = 0U , ADC_LSB_M0_Z = 0U , ADC_LSB_M0_MED3 = 0U;
 volatile    uint32_t    ADC_LSB_M1_X = 0U , ADC_LSB_M1_Y = 0U , ADC_LSB_M1_Z = 0U , ADC_LSB_M1_MED3 = 0U;
@@ -201,32 +207,30 @@ volatile    uint8_t     Motors_buff_idx     = 0U;
 volatile    float       Drive0_temp_C       = 0.0f , Drive1_temp_C      = 0.0f;
 volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
 
-
-// ----- PID 0 INNER LOOP -----
+// ----- Controller 0 INNER LOOP -----
 // Attitude (Tilt) Stabilization
-#define     K_DAMPIMG_DEF   (-15.0f)
-#define     K_BALANCE_DEF   (0.1f)
-volatile    float       gK_dynamicDamp      = K_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
-volatile    float       gK_balanceAngle     = K_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
+#define     K1_DAMPIMG_DEF   (-15.0f)       // Negative because Dumping is counteracting the tilt
+#define     K2_BALANCE_DEF   (0.1f)         // Default K Gain for ANGLE
+volatile    float       gK1_dynamicDamp     = K1_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
+volatile    float       gK2_balanceAngle    = K2_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
 
 volatile    float       gPID_AV_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
 volatile    float       gPID_AV_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
-volatile    float       gPID_AV_LH_RH_Volt  = 0.0f;     // Side loop  - Motor voltage - From Motor angle difference (LH-RH)
 volatile    float       gPID_AV_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
-volatile    float       gPID_AV_Robot_Msec  = 0.0f;     // Outer Loop - Robot speed in m/s
 volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
 
-#define     K_YAW_ANG_DEF   (0.0f)
-#define     K_YAW_RAT_DEF   (1.0f)
-volatile    float       gP_Gain_LH_RH_angle = K_YAW_ANG_DEF;
-volatile    float       gP_Gain_LH_RH_rate  = K_YAW_RAT_DEF;
-volatile    float       gYAW_setPoint_rad   = 0.0f;
-volatile    float       gYAW_error_rad      = 0.0f;
-volatile    float       gYAWrate_SP_rads    = 0.0f;
-volatile    float       gYAWrate_ER_rads    = 0.0f;
+#define     K3_TURN_RH_DEF   (+0.025f)      // As one wheel is countered, the other is turned
+#define     K4_TURN_LH_DEF   (-0.025f)      // one wheel gain must be opposite (negative) of the other
+volatile    float       gK3_Turn_Gain_RH    = K3_TURN_RH_DEF;
+volatile    float       gK4_Turn_Gain_LH    = K4_TURN_LH_DEF;
+volatile    float       gTurn_SetPoint_Rad  = 0.0f;     // Angle in radians, -1 means rotate LEFT, +1 means rotate RIGHT
+volatile    float       gTurn_Error_RH_Rad  = 0.0f;     // Outer loop - RIGHT WHEEL Angle error in radians
+volatile    float       gTurn_Error_LH_Rad  = 0.0f;     // Outer loop - LEFT WHEEL Angle error in radians
+volatile    float       gTurn_AV_RH_Volt    = 0.0f;     // Outer loop - RIGHT WHEEL Motor voltage compensation
+volatile    float       gTurn_AV_LH_Volt    = 0.0f;     // Outer loop - LEFT WHEEL Motor voltage compensation
 
-volatile    float       gYAW_rad            = 0.0f;
-volatile    float       gYAWrate_radsec     = 0.0f;
+volatile    float       gTurn_rad           = 0.0f;
+volatile    float       gTurnR_rads         = 0.0f;
 
 volatile    float       gT1_sample = TIME_MPU_READ_SEC;     // sample time [sec] Inner loop
 volatile    float       gT2_sample = TIME_MOTOR_OMEGA_S;    // sample time [sec] Outer loop
@@ -322,23 +326,41 @@ volatile	int16_t	    MPU_accX_raw = 0, MPU_accY_raw = 0, MPU_accZ_raw = 0;
 volatile	int16_t	    MPU_gyroX = 0, MPU_gyroY = 0, MPU_gyroZ = 0;
 volatile	int16_t	    MPU_gyroX_raw = 0, MPU_gyroY_raw = 0, MPU_gyroZ_raw = 0;
 // ----- OFFSET COMPENSATION -----
-volatile	 int16_t	MPU_accX_offset  =  400 , MPU_accY_offset  = -250 , MPU_accZ_offset  = 800; // 2025-09-13
-volatile	 int16_t	MPU_gyroX_offset =  100 , MPU_gyroY_offset =  -50 , MPU_gyroZ_offset =  75; // 2025-09-13
-// calculated data
-volatile    float       MPU_temp_C = 0.0f , MPU_accX_g = 0.0f , MPU_accY_g = 0.0f , MPU_accZ_g = 0.0f;
-volatile	float		Gyro_X_RateDegs = 0.0f , gRate_Y_degs_f = 0.0f , Gyro_Z_RateDegs = 0.0f;
-volatile    float       Angle_Pitch_Deg = 0.0f , Angle_Roll_Deg = 0.0f , Angle_Yaw_Deg = 0.0f;
-volatile    float       Angle_Pitch_Deg_delta = 0.0f , Angle_Pitch_Deg_delta_filtered = 0.0f;
-volatile    float       Angle_Pitch_Deg_max_hold_neg = 0 , Angle_Pitch_Deg_max_hold_pos = 0;
-volatile    float       Angle_Pitch_Deg_rp_fast = 0.0f , Angle_Roll_Deg_rp_fast = 0.0f , Angle_Yaw_Deg_rp_fast = 0.0f; // Reduced precision by atan2_fast
+volatile	 int16_t	gMPU_AccX_offset  =  400;
+volatile	 int16_t	gMPU_AccY_offset  = -250;
+volatile	 int16_t	gMPU_AccZ_offset  =  800; // 2025-09-13
+volatile	 int16_t	gMPU_GyroX_offset =  100;
+volatile	 int16_t	gMPU_GyroY_offset =  -50;
+volatile	 int16_t	gMPU_GyroZ_offset =  75; // 2025-09-13
+
+// ----- Calculated MPU data -----
+volatile    float       gMPU_Temp_C = 0.0f;     // Temperature in degrees Celcius
+
+volatile    float       gMPU_AccX_g = 0.0f;     // X Axis Acceleration in Gs
+volatile    float       gMPU_AccY_g = 0.0f;     // Y Axis Acceleration in Gs
+volatile    float       gMPU_AccZ_g = 0.0f;     // Z Axis Acceleration in Gs
+
+volatile	float		gRate_X_Degs = 0.0f;    // X Axis Rate in degrees per second
+volatile	float		gRate_Y_Degs = 0.0f;    // Y Axis Rate in degrees per second
+volatile	float		gRate_Z_Degs = 0.0f;    // Z Axis Rate in degrees per second
+
+volatile    float       gAngle_PITCH_Deg = 0.0f;// Pitch in degrees
+volatile    float       gAngle_ROLL_Deg = 0.0f; // Roll in degrees
+volatile    float       gAngle_YAW_Deg = 0.0f;  // Yaw in degrees
+
 // ----- COMPLEMENTARY FILTER -----
-volatile    float       Alpha_cf_MPU = ALFA_COFIL_MPU;
-volatile    float       gAngle_PITCH_deg_CoFil = 0.0f , Angle_Pitch_DegN_1 = 0.0f;
-volatile    float       Angle_Roll_Deg_CoFil  = 0.0f , Angle_Roll_DegN_1  = 0.0f;
-volatile    float       Angle_Yaw_Deg_CoFil   = 0.0f , Angle_Yaw_DegN_1    = 0.0f;
+volatile    float       gALPHA_CF_Coef = ALFA_CF_COEF;
+// filtered angles
+volatile    float       gAngle_PITCH_Deg_CF = 0.0f;
+volatile    float       gAngle_ROLL_Deg_CF  = 0.0f;
+volatile    float       gAngle_YAW_Deg_CF   = 0.0f;
+// N-1 filtered angles
+volatile    float       gAngle_PITCH_Deg_0 = 0.0f;
+volatile    float       gAngle_ROLL_Deg_0  = 0.0f;
+volatile    float       gAngle_YAW_Deg_0    = 0.0f;
 
 // ----- MOTOR/ROBOT -----
-volatile    float       gYAW_Limit_Volt;    // limit voltage for yaw control to not become bigger than Balancing Voltage
+volatile    float       gTURN_Limit_Volt;    // limit voltage for yaw control to not become bigger than Balancing Voltage
 volatile    float       gMotor_LH_Volt;     // Left Hand motor voltage
 volatile    float       gMotor_RH_Volt;     // Right Hand motor voltage
 volatile    int32_t     gTheta_0_RH_pos , gTheta_1_LH_pos;      // encoder position in CPR
@@ -382,7 +404,6 @@ void    MPU_check ( void );
 void    SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
 void    Motor_M0_volt( float argVoltM0 );
 void    Motor_M1_volt( float argVoltM1 );
-void    Motors_volt( float argVolt );
 bool    checkForGainCommand( void );
 bool    checkForCommand2( void );
 void    clearUART0_RXbuffer_Zero(void);
@@ -429,9 +450,9 @@ int main( void ) {
 // *****************************************  *****************************************  *****************************************
     while ( 1 ) {
 
-        BatteryGauge_8LED( gBatt_volt_ema );
+        BatteryGauge_8LED( gBatt_Volt_EMA );
 
-        TiltGauge_8LED( gAngle_PITCH_deg_CoFil);
+        TiltGauge_8LED( gAngle_PITCH_Deg_CF);
 
         // ----- 10. QUAD -----
         Update_Quad_0_RH();
@@ -471,50 +492,50 @@ int main( void ) {
 void TIMER_0_INST_IRQHandler()
 {
     // ----- Heart beat -----
-    if ( --cHeartLED == 0 )
+    if ( --cnt_Heart_LED == 0 )
     {
-        if ( LED_Sequence_Actual & ( 1 << cHeartTick ) )
+        if ( gLED_Seq_Now & ( 1 << cnt_Heart_Tick ) )
         {
             DL_GPIO_setPins( GPIO_PORT , GPIO_GRN4_PIN );
-            cHeartLED = LED_HEART_ON_MS;
+            cnt_Heart_LED = LED_HEART_ON_MS;
         }
         else {
             DL_GPIO_clearPins( GPIO_PORT , GPIO_GRN4_PIN );
-            cHeartLED = LED_HEART_OFF_MS;
+            cnt_Heart_LED = LED_HEART_OFF_MS;
         }        
 
-        cHeartTick++;
-        cHeartTick %= LED_TICK_COUNT;
+        cnt_Heart_Tick++;
+        cnt_Heart_Tick %= LED_TICK_COUNT;
     }
     // ----- MOTOR SPEED/OMEGA MEASUREMENT -----
-    if ( --cMotorOmega == 0 )
+    if ( --cnt_OuterLoop == 0 )
     {
-        cMotorOmega = TIME_MOTOR_OMEGA_MS;
-        fMotorOmega = true;
+        cnt_OuterLoop = TIME_MOTOR_OMEGA_MS;
+        flg_RUN_OuterLoop = true;
     }
     // ----- MPU DELAY -----
-    if ( cMPUdelay > 0 )
-        --cMPUdelay;
+    if ( cnt_Delay_MPU > 0 )
+        --cnt_Delay_MPU;
     // ----- READ DATA FROM MPU -----
-    if ( --cMPUread == 0 )
+    if ( --cnt_Read_MPU == 0 )
     {
-        cMPUread = TIME_MPU_READ_MS;
-        fMPUread = true;
+        cnt_Read_MPU = TIME_MPU_READ_MS;
+        flg_Read_MPU = true;
     }
     // ----- SEND DATA OVER UART -----
-    if ( --cSendData == 0 )
+    if ( --cnt_Send_UART == 0 )
     {
-        cSendData = TIME_SEND_DATA_MS;
-        fSendData = true;
+        cnt_Send_UART = TIME_SEND_DATA_MS;
+        flg_Send_UART = true;
     }
-    if ( --CounterCRSF == 0 )
+    if ( --cnt_Read_CRSF == 0 )
     {
-        CounterCRSF = TIME_CRSF_MS;
-        FlagCRSF = true;
+        cnt_Read_CRSF = TIME_CRSF_MS;
+        flg_Read_CRSF = true;
     }
     // COMMUNICATION TIME OUT - motors STOP
-    if ( CounterFailSafe > 0 )
-        --CounterFailSafe;
+    if ( cnt_Fail_Safe > 0 )
+        --cnt_Fail_Safe;
 }
 
 // Chan 0: VS1(Battery)
@@ -531,11 +552,11 @@ void ADC12_0_INST_IRQHandler( void )
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_0_INST ) )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
-            fADC[ 4 ] = true;
+            flg_ADC[ 4 ] = true;
             ADC_LSB[ 4 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_TEMP_M1 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
-            fADC[ 2 ] = true;
+            flg_ADC[ 2 ] = true;
             ADC_LSB[ 2 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_CURR_M1 );
             break;    
         default:
@@ -551,15 +572,15 @@ void ADC12_1_INST_IRQHandler( void )
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_1_INST ) )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
-            fADC[ 3 ] = true;
+            flg_ADC[ 3 ] = true;
             ADC_LSB[ 3 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_TEMP_M0 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
-            fADC[ 1 ] = true;
+            flg_ADC[ 1 ] = true;
             ADC_LSB[ 1 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_CURR_M0 );
             break;    
         case DL_ADC12_IIDX_MEM2_RESULT_LOADED:
-            fADC[ 0 ] = true;
+            flg_ADC[ 0 ] = true;
             ADC_LSB[ 0 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_VS1 );
             break; 
         default:
@@ -721,23 +742,23 @@ void MCU_Init( void )
 }
 
 /*****************************
-*****   PID CONTROLLER   *****
+*****   Controller CONTROLLER   *****
 *****************************/
 void PID_Inner_Loop( void )
 {
-    if ( flagInnerLoop )
+    if ( flg_RUN_InnerLoop )
     {
 STORE_TIMER6(4);
-        flagInnerLoop = false;
+        flg_RUN_InnerLoop = false;
 
         // ------------------------------
         // ----- 40. (B) INNER LOOP -----
         // ------------------------------
         // --- 41. Calculate DUMPING (no error) ---
-        gPID_AV_Rates_Volt   = gK_dynamicDamp * gRate_Y_degs_f;         // Damping for preventing flip over
+        gPID_AV_Rates_Volt   = gK1_dynamicDamp * gRate_Y_Degs;         // Damping for preventing flip over
         // --- 43. Calculate Gain from Angle (error) ---
-        gPID_Error_Angle_Deg = gAngle_setPoint_deg - gAngle_PITCH_deg_CoFil;
-        gPID_AV_Angle_Volt   = gK_balanceAngle * gPID_Error_Angle_Deg;  // Angle gain for upright position
+        gPID_Error_Angle_Deg = gAngle_setPoint_deg - gAngle_PITCH_Deg_CF;
+        gPID_AV_Angle_Volt   = gK2_balanceAngle * gPID_Error_Angle_Deg;  // Angle gain for upright position
         // --- 44. Combine action values ---
         gPID_AV_Robot_Volt = gPID_AV_Angle_Volt + gPID_AV_Rates_Volt;
         // --- 45. Motor Voltage Limit ---
@@ -747,63 +768,83 @@ STORE_TIMER6(4);
         // --------------------------
         // ---- 46. MOTOR CONTROL ---
         // --------------------------
-        if ( fMotorEnable && ( gBatt_volt_ema > VOLT_BATTERY_MIN ) )
+        if ( flg_Motor_EN && ( gBatt_Volt_EMA > VOLT_BATTERY_MIN ) )
         {
-            if ( gAngle_PITCH_deg_CoFil > ANGLE_LIMIT_POS_DEG + ANGLE_LIM_HYST_DEG )
+            // --- Positive Angle with Hysteresis ---
+            if ( gAngle_PITCH_Deg_CF > +ANGLE_LIM_BODY_DEG + ANGLE_LIM_HYST_DEG )
             {
+                // Motors OFF - Robot falling
                 Motor_M0_volt( 0.0f );
                 Motor_M1_volt( 0.0f );
             } else
-                if ( gAngle_PITCH_deg_CoFil < ANGLE_LIMIT_NEG_DEG - ANGLE_LIM_HYST_DEG )
+                // --- Negative Angle with Hysteresis ---
+                if ( gAngle_PITCH_Deg_CF < -ANGLE_LIM_BODY_DEG - ANGLE_LIM_HYST_DEG )
                 {
+                    // Motors OFF - Robot falling
                     Motor_M0_volt( 0.0f );
                     Motor_M1_volt( 0.0f );
                 } else
-                    if ( ( gAngle_PITCH_deg_CoFil < ANGLE_LIMIT_POS_DEG ) &&
-                         ( gAngle_PITCH_deg_CoFil > ANGLE_LIMIT_NEG_DEG )
+                    // --- Angle in Range ---
+                    if ( ( gAngle_PITCH_Deg_CF < +ANGLE_LIM_BODY_DEG ) &&
+                         ( gAngle_PITCH_Deg_CF > -ANGLE_LIM_BODY_DEG )
                         )            
                     {
-                        // -----------------------------------
-                        // ---- 47. MOTOR MIXING ALGORITHM ---
-                        // -----------------------------------
-                        // Default: no mixing yet
-                        gMotor_LH_Volt = 0.0f;
-                        gMotor_RH_Volt = 0.0f;
-                        // --- Check if we are in UPRIGHT POSITION ---
-                        if ( ( gAngle_PITCH_deg_CoFil < +3.5f ) &&
-                             ( gAngle_PITCH_deg_CoFil > -3.5f )
-                            )
-                        {
-                            // --- Check if we have YAW command [rad/s] ---
-                            if ( ( gYAWrate_SP_rads > 0.01f ) || ( gYAWrate_SP_rads < -0.01f ) )
-                            {
-                                // --- UPRIGHT and YAW command detected ---
-                                gMotor_LH_Volt += gPID_AV_LH_RH_Volt;
-                                gMotor_RH_Volt -= gPID_AV_LH_RH_Volt;
-                            } else {
-                                // --- UPRIGHT and NO YAW ---
-                            }
-                        // --- We are PROBABLY in Balancing ---
-                        } else {
-                            // 1) Limit YAW to 50% of forward AV when AV is NOT significant, default is 4.0V
-                            gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO;
-                            if ( ( gPID_AV_Robot_Volt < +VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt > 0.00f ) ) gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO * 0.5f;
-                            if ( ( gPID_AV_Robot_Volt > -VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt < 0.00f ) ) gYAW_Limit_Volt = VOLT_MOTOR_LIM_LO * 0.5f;
-                            // --- Limit ---
-                            if ( gPID_AV_LH_RH_Volt >  gYAW_Limit_Volt) gPID_AV_LH_RH_Volt =  gYAW_Limit_Volt;
-                            if ( gPID_AV_LH_RH_Volt < -gYAW_Limit_Volt) gPID_AV_LH_RH_Volt = -gYAW_Limit_Volt;
-
-
-                            // 3) Anti-stall only when TILTED
-                        }
-                        // Standard mixing
-                        gMotor_LH_Volt = gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt;
-                        gMotor_RH_Volt = gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt;
+                        // --- Standard mixing ---
+                        gMotor_RH_Volt = gPID_AV_Robot_Volt + gTurn_AV_RH_Volt;
+                        gMotor_LH_Volt = gPID_AV_Robot_Volt + gTurn_AV_LH_Volt;
                         // --- Output ---
                         Motor_M0_volt(gMotor_LH_Volt);
                         Motor_M1_volt(gMotor_RH_Volt);
+                        // // ------------------------------------
+                        // // ---- 47. MOTORS MIXING ALGORITHM ---
+                        // // ------------------------------------
+                        // // Default: no mixing yet
+                        // gMotor_LH_Volt = 0.0f;
+                        // gMotor_RH_Volt = 0.0f;
+                        // // --- Check if we are in UPRIGHT POSITION ---
+                        // if ( ( gAngle_PITCH_Deg_CF < +3.5f ) &&
+                        //      ( gAngle_PITCH_Deg_CF > -3.5f )
+                        //     )
+                        // {
+                        //     // --- Check if we have YAW command [rad/s] ---
+                        //     if ( ( gTurn_SetPoint_Rad > 0.02f ) || ( gTurn_SetPoint_Rad < -0.02f ) )
+                        //     {
+                        //         // --- UPRIGHT and YAW command detected ---
+                        //         gMotor_LH_Volt = +gTurn_AV_LH_Volt;
+                        //         gMotor_RH_Volt = -gTurn_AV_RH_Volt;
+                        //         // gMotor_LH_Volt = +gPID_AV_LH_RH_Volt;
+                        //         // gMotor_RH_Volt = -gPID_AV_LH_RH_Volt;
+                        //         // --- Check if we have Forward/Reverse command [deg] ---
+                        //     } else if ( ( gPID_AV_Robot_Volt > VOLT_MOTOR_MIN ) || 
+                        //                 ( gPID_AV_Robot_Volt < -VOLT_MOTOR_MIN )
+                        //               ) {
+                        //             // --- UPRIGHT, NO YAW but Forward/Reverse command detected ---
+                        //             gMotor_LH_Volt = gPID_AV_Robot_Volt;
+                        //             gMotor_RH_Volt = gPID_AV_Robot_Volt;
+                        //     } else {
+                        //         // --- NO command OR small voltage---
+                        //         gMotor_LH_Volt = 0.0f;
+                        //         gMotor_RH_Volt = 0.0f;
+                        //     }
+                        // // --- We are PROBABLY in Balancing ---
+                        // } else {
+                        //     // 1) Limit TURN to 50% of forward AV when AV is NOT significant, default is 4.0V
+                        //     gTURN_Limit_Volt = VOLT_MOTOR_LIM_LO;
+                        //     if ( ( gPID_AV_Robot_Volt   < +VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt   > 0.00f ) )
+                        //            gTURN_Limit_Volt      = VOLT_MOTOR_LIM_LO * 0.5f;
+                        //     if ( ( gPID_AV_Robot_Volt   > -VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt   < 0.00f ) ) 
+                        //            gTURN_Limit_Volt      = VOLT_MOTOR_LIM_LO * 0.5f;
+                        //     // --- Limit ---
+                        //     if ( gTurn_AV_RH_Volt > gTURN_Limit_Volt ) gTurn_AV_RH_Volt = gTURN_Limit_Volt;
+                        //     if ( gTurn_AV_RH_Volt < -gTURN_Limit_Volt ) gTurn_AV_RH_Volt = -gTURN_Limit_Volt;
+                        //     if ( gTurn_AV_LH_Volt > gTURN_Limit_Volt ) gTurn_AV_LH_Volt = gTURN_Limit_Volt;
+                        //     if ( gTurn_AV_LH_Volt < -gTURN_Limit_Volt ) gTurn_AV_LH_Volt = -gTURN_Limit_Volt;
+                        //     // if ( gPID_AV_LH_RH_Volt >  gYAW_Limit_Volt) gPID_AV_LH_RH_Volt =  gYAW_Limit_Volt;
+                        //     // if ( gPID_AV_LH_RH_Volt < -gYAW_Limit_Volt) gPID_AV_LH_RH_Volt = -gYAW_Limit_Volt;
 
-
+                        //     // gMotor_LH_Volt = gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt;
+                        //     // gMotor_RH_Volt = gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt;                            
+                        // }
 
                         // Motor_M0_volt( gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt );
                         // Motor_M1_volt( gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt );
@@ -819,10 +860,10 @@ GET_DURATION(4);
 // ----- OMEGA CALCULATION -----
 void PID_Outer_Loop( void )
 {
-    if ( fMotorOmega )
+    if ( flg_RUN_OuterLoop )
     {
 STORE_TIMER6(3);
-        fMotorOmega = false;
+        flg_RUN_OuterLoop = false;
         
         // -------------------------
         // ----- (B) OUTER LOOP ----
@@ -834,24 +875,24 @@ STORE_TIMER6(3);
         gWheel_LH_m     = gTheta_1_LH_rad * WHEEL_RADIUS_M;
         gWheel_RH_m     = gTheta_0_RH_rad * WHEEL_RADIUS_M;
         // --- 312. Calculate Wheel speed ---
-        Wheel_GetSpeed_SG();
-        // --- 320. Calculate ROBOT Position ---
+        Wheel_GetSpeed_SG();    // return value in variables: gWheel_LH_msec and gWheel_RH_msec
+        // --- 313. Calculate ROBOT Position ---
         gPosition_m     = 0.5f * ( gWheel_LH_m + gWheel_RH_m );
-        // --- 330. Calculate ROBOT Speed ---
+        // --- 314. Calculate ROBOT Speed ---
         gSpeed_msec     = Robot_GetSpeed_SG();      // Savitzky-Golay Derivative Filter
-        // --- 335. Calculate ROBOT Angle ---
-        gYAW_rad = (gWheel_RH_m - gWheel_LH_m) / WHEEL_TRACK_M;
-        // --- 336. Calculate ROBOT Angle rate ---
-        gYAWrate_radsec = Robot_GetYawRate_SG();    // Savitzky-Golay Derivative Filter
-        // --- 340. Position Controller ---
+        // --- 315. Calculate ROBOT Angle ---
+        gTurn_rad = (gWheel_RH_m - gWheel_LH_m) / WHEEL_TRACK_M;
+        // --- 316. Calculate ROBOT Angle rate ---
+        gTurnR_rads = Robot_GetYawRate_SG();    // Savitzky-Golay Derivative Filter
+        // --- 320. Position Controller ---
         gPosition_error_m    = gPosition_setPoint_m - gPosition_m;
         gPosition_ActVal_deg = gPosition_error_m * gPosition_Gain;  // [deg] = [m] * [deg/m]
-        // --- 350. Speed Controller ---
+        // --- 330. Speed Controller ---
         gSpeed_error_msec    = gSpeed_setPoint_msec - gSpeed_msec;
         gSpeed_ActVal_deg    = gSpeed_error_msec * gSpeed_Gain;     // [deg] = [m/sec] * [deg/m/sec]
-        // --- 360. Angle Set Point ---
+        // --- 340. POSITION CONTROLLER ---
         // gAngle_setPoint_deg  = gPosition_ActVal_deg + gSpeed_ActVal_deg;
-        // --- 370. Angle Set Point Limit ---
+        // --- 350. Angle Set Point Limit ---
         // #define     ANGLE_LIMIT     ( 2.0f )
         // if ( gAngle_setPoint_deg > ANGLE_LIMIT ) gAngle_setPoint_deg = ANGLE_LIMIT;
         // if ( gAngle_setPoint_deg < -ANGLE_LIMIT ) gAngle_setPoint_deg = -ANGLE_LIMIT;
@@ -859,13 +900,17 @@ STORE_TIMER6(3);
         // -------------------------
         // ----- (C) SIDE LOOP -----
         // -------------------------
-        // --- 380. Calculate Gain from Motors Angles (error) ---
-        gYAW_error_rad      = gYAW_setPoint_rad - gYAW_rad;
-        gYAWrate_ER_rads    = gYAWrate_SP_rads  - gYAWrate_radsec;
-        gPID_AV_LH_RH_Volt  = ( gP_Gain_LH_RH_angle * gYAW_error_rad ) + ( gP_Gain_LH_RH_rate * gYAWrate_ER_rads );
-        // --- 390. Motor Voltage Limit ---
-        if ( gPID_AV_LH_RH_Volt > VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = VOLT_MOTOR_LIM_LO;
-        if ( gPID_AV_LH_RH_Volt < -VOLT_MOTOR_LIM_LO ) gPID_AV_LH_RH_Volt = -VOLT_MOTOR_LIM_LO;
+        // --- 360. TURN CONTROLLER Error---
+        // gTurn_Error_RH_Rad  = gTurn_SetPoint_Rad - gTheta_0_RH_rad;
+        // gTurn_Error_LH_Rad  = gTurn_SetPoint_Rad - gTheta_1_LH_rad;
+        // --- 361. Action Value ---
+        // gTurn_AV_RH_Volt    = gK3_Turn_Gain_RH * gTurn_Error_RH_Rad;
+        // gTurn_AV_LH_Volt    = gK4_Turn_Gain_LH * gTurn_Error_LH_Rad;
+        // --- 362. Motor Voltage Limit ---
+        // if ( gTurn_AV_RH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = VOLT_MOTOR_LIM_LO;
+        // if ( gTurn_AV_RH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = -VOLT_MOTOR_LIM_LO;
+        // if ( gTurn_AV_LH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = VOLT_MOTOR_LIM_LO;
+        // if ( gTurn_AV_LH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = -VOLT_MOTOR_LIM_LO;
 
 GET_DURATION(3);    
     }
@@ -873,10 +918,10 @@ GET_DURATION(3);
 
 void    CSFR_check ( void )
 {
-    if ( FlagCRSF )
+    if ( flg_Read_CRSF )
     {
-        FlagCRSF = false;
-        if ( CSFR_Extract_Data() && CounterFailSafe > 0 )
+        flg_Read_CRSF = false;
+        if ( CSFR_Extract_Data() && cnt_Fail_Safe > 0 )
         {
             CSFR_Parse_Data();
             //run motors
@@ -893,12 +938,18 @@ void    CSFR_check ( void )
             float a = (y2 - y1) / (x2 - x1);
             float b = y1 - (a * x1);
             // --- apply new gains ---
-            gK_balanceAngle = K_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
-            gK_dynamicDamp  = K_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
+            gK2_balanceAngle = K2_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
+            gK1_dynamicDamp  = K1_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
 
-            // ROLL is actually used as YAW command
-            gYAWrate_SP_rads = -0.0125f*RC_roll;
-            // gYAW_setPoint_rad += -0.001f*RC_roll;
+            // ROLL is actually used as YAW/TURN command
+            gTurn_AV_RH_Volt    = gK3_Turn_Gain_RH * RC_roll;
+            gTurn_AV_LH_Volt    = gK4_Turn_Gain_LH * RC_roll;
+            
+            if ( gTurn_AV_RH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = VOLT_MOTOR_LIM_LO;
+            if ( gTurn_AV_RH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = -VOLT_MOTOR_LIM_LO;
+            if ( gTurn_AV_LH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = VOLT_MOTOR_LIM_LO;
+            if ( gTurn_AV_LH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = -VOLT_MOTOR_LIM_LO;
+            // gTurn_SetPoint_Rad += 0.015f*RC_roll; // integrate
 
             // PITCH
             gAngle_setPoint_deg = -0.50f*RC_pitch;
@@ -920,61 +971,112 @@ void    CSFR_check ( void )
 /*****************************
 *****   MOTOR VOLTAGE   *****
 *****************************/
-void Motors_volt( float argVolt )
-{
 
-}
 void Motor_M0_volt( float argVoltM0 )
 {
+    static int8_t m0_state = 0;   // -1 = reverse, 0 = stop, +1 = forward
     uint16_t pwm_uint_value_M0 = 0U;
 
-    if ( gBatt_volt_ema > VOLT_BATTERY_MIN ) {
-       if ( argVoltM0 > VOLT_MOTOR_MINIM_POS ) {
-            pwm_uint_value_M0 = (uint16_t)( 100.0f * argVoltM0 / gBatt_volt_ema );
-            // run ROBOT FORWARD
-            SET_PWM_DUTY( PHASE_A , 0U );
-            SET_PWM_DUTY( PHASE_B , pwm_uint_value_M0 );
-        } else if ( argVoltM0 < VOLT_MOTOR_MINIM_NEG ) {
-            pwm_uint_value_M0 = (uint16_t)( -100.0f * argVoltM0 / gBatt_volt_ema );
-            // run ROBOT REVERSE
-            SET_PWM_DUTY( PHASE_A , pwm_uint_value_M0 );
-            SET_PWM_DUTY( PHASE_B , 0U );
-        } else {
-            // STOP
-            SET_PWM_DUTY( PHASE_A , 0U );
-            SET_PWM_DUTY( PHASE_B , 0U );
-        } 
-    } else {
-        // STOP
-        SET_PWM_DUTY( PHASE_A , 0U );
-        SET_PWM_DUTY( PHASE_B , 0U );
+    // --- Battery OK? ---
+    if (gBatt_Volt_EMA > VOLT_BATTERY_MIN)
+    {
+        // --- Hysteresis decision ---
+        // Forward RUN threshold
+        if (argVoltM0 > (VOLT_MOTOR_MIN + VOLT_MOTOR_HYST))
+        {
+            m0_state = +1;
+        }
+        // Reverse RUN threshold
+        else if (argVoltM0 < -(VOLT_MOTOR_MIN + VOLT_MOTOR_HYST))
+        {
+            m0_state = -1;
+        }
+        // STOP threshold (both directions)
+        else if (argVoltM0 <  (VOLT_MOTOR_MIN - VOLT_MOTOR_HYST) &&
+                 argVoltM0 > -(VOLT_MOTOR_MIN - VOLT_MOTOR_HYST))
+        {
+            m0_state = 0;
+        }
+
+        // --- Apply state ---
+        if (m0_state == +1)
+        {
+            pwm_uint_value_M0 = (uint16_t)(100.0f * argVoltM0 / gBatt_Volt_EMA);
+            SET_PWM_DUTY(PHASE_A, 0U);
+            SET_PWM_DUTY(PHASE_B, pwm_uint_value_M0);
+        }
+        else if (m0_state == -1)
+        {
+            pwm_uint_value_M0 = (uint16_t)(-100.0f * argVoltM0 / gBatt_Volt_EMA);
+            SET_PWM_DUTY(PHASE_A, pwm_uint_value_M0);
+            SET_PWM_DUTY(PHASE_B, 0U);
+        }
+        else
+        {
+            SET_PWM_DUTY(PHASE_A, 0U);
+            SET_PWM_DUTY(PHASE_B, 0U);
+        }
+    }
+    else
+    {
+        // --- Battery LOW - STOP ---
+        m0_state = 0;
+        SET_PWM_DUTY(PHASE_A, 0U);
+        SET_PWM_DUTY(PHASE_B, 0U);
     }
 }
 
 void Motor_M1_volt( float argVoltM1 )
 {
+    static int8_t m1_state = 0;   // -1 = reverse, 0 = stop, +1 = forward
     uint16_t pwm_uint_value_M1 = 0U;
 
-    if ( gBatt_volt_ema > VOLT_BATTERY_MIN ) {
-        if ( argVoltM1 > VOLT_MOTOR_MINIM_POS ) {
-            pwm_uint_value_M1 = (uint16_t)( 100.0f * argVoltM1 / gBatt_volt_ema );
-            // run ROBOT FORWARD
-            SET_PWM_DUTY( PHASE_C , pwm_uint_value_M1 );
-            SET_PWM_DUTY( PHASE_D , 0U );
-        } else if ( argVoltM1 < VOLT_MOTOR_MINIM_NEG ) {
-            pwm_uint_value_M1 = (uint16_t)( -100.0f * argVoltM1 / gBatt_volt_ema );
-            // run ROBOT REVERSE
-            SET_PWM_DUTY( PHASE_C , 0U );
-            SET_PWM_DUTY( PHASE_D , pwm_uint_value_M1 );
-        } else {
-            // STOP
-            SET_PWM_DUTY( PHASE_C , 0U );
-            SET_PWM_DUTY( PHASE_D , 0U );
-        } 
-    } else {
-        // STOP
-        SET_PWM_DUTY( PHASE_A , 0U );
-        SET_PWM_DUTY( PHASE_B , 0U );
+    // --- Battery OK? ---
+    if (gBatt_Volt_EMA > VOLT_BATTERY_MIN)
+    {
+        // --- Hysteresis decision ---
+        // Forward RUN threshold
+        if (argVoltM1 > (VOLT_MOTOR_MIN + VOLT_MOTOR_HYST))
+        {
+            m1_state = +1;
+        }
+        // Reverse RUN threshold
+        else if (argVoltM1 < -(VOLT_MOTOR_MIN + VOLT_MOTOR_HYST))
+        {
+            m1_state = -1;
+        }
+        // STOP threshold (both directions)
+        else if (argVoltM1 <  (VOLT_MOTOR_MIN - VOLT_MOTOR_HYST) &&
+                 argVoltM1 > -(VOLT_MOTOR_MIN - VOLT_MOTOR_HYST))
+        {
+            m1_state = 0;
+        }
+
+        // --- Apply state ---
+        if (m1_state == +1)
+        {
+            pwm_uint_value_M1 = (uint16_t)(100.0f * argVoltM1 / gBatt_Volt_EMA);
+            SET_PWM_DUTY(PHASE_C, pwm_uint_value_M1);
+            SET_PWM_DUTY(PHASE_D, 0U);
+        }
+        else if (m1_state == -1)
+        {
+            pwm_uint_value_M1 = (uint16_t)(-100.0f * argVoltM1 / gBatt_Volt_EMA);
+            SET_PWM_DUTY(PHASE_C, 0U);
+            SET_PWM_DUTY(PHASE_D, pwm_uint_value_M1);
+        }
+        else
+        {
+            SET_PWM_DUTY(PHASE_C, 0U);
+            SET_PWM_DUTY(PHASE_D, 0U);
+        }
+    }
+    else
+    {
+        // --- Battery LOW - STOP ---
+        m1_state = 0;
+        SET_PWM_DUTY(PHASE_C, 0U);
+        SET_PWM_DUTY(PHASE_D, 0U);
     }
 }
 
@@ -1058,18 +1160,18 @@ uint16_t Send_integers_over_UART( uint8_t argCount )
 // 5 channel used: (0)VS1(Battery), (1)Current M0, (2)Current M1 , (3)Temp M0, (4)Temp M1     
 void ADC_check( void )
 {
-    for ( int i = 0 ; i < ADC_CHANNELS ; i++ )
+    for ( int i = 0 ; i < ADC_CNT ; i++ )
     {
-        if ( fADC[ i ] )
+        if ( flg_ADC[ i ] )
         {
-            fADC[ i ] = false;
+            flg_ADC[ i ] = false;
 
-            ADC_volt[ i ] = (float)ADC_LSB[ i ] * VOLT_ADC_REF / 4096.0f;   // LSB to volt 
+            ADC_Volt[ i ] = (float)ADC_LSB[ i ] * VOLT_ADC_REF / 4096.0f;   // LSB to volt 
 
             // >> BATTERY <<
             if ( i == 0 ) {
-                gBatt_volt       = VOLT_SCHTKY_DROP + ADC_volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
-                gBatt_volt_ema   = gBeta_ema_coef * gBatt_volt + (1.0f-gBeta_ema_coef) * gBatt_volt_ema;   // Exponential Moving Average
+                gBatt_Volt       = VOLT_SCHTKY_DROP + ADC_Volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
+                gBatt_Volt_EMA   = gBETA_EMA_Coef * gBatt_Volt + (1.0f-gBETA_EMA_Coef) * gBatt_Volt_EMA;   // Exponential Moving Average
             }
 
             // >> MOTOR 0 <<
@@ -1080,9 +1182,9 @@ void ADC_check( void )
                 ADC_LSB_M0_Y = ADC_LSB_M0_Z;
                 ADC_LSB_M0_Z = ADC_LSB[ 1 ];
                 ADC_LSB_M0_MED3 = median3( ADC_LSB_M0_X , ADC_LSB_M0_Y , ADC_LSB_M0_Z );
-                Motor0_curr_mA      = 1000.0f * ( ADC_volt[ 1 ] ) / ( 0.033f * 20.0f );
-                Motor0_curr_mA_med  = 1000.0f * ( (float)ADC_LSB_M0_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
-                Motor0_curr_mA_ema  = Zeta_ema_curr * Motor0_curr_mA_med + (1.0f-Zeta_ema_curr) * Motor0_curr_mA_ema;
+                gM0_RH_Curr_mA      = 1000.0f * ( ADC_Volt[ 1 ] ) / ( 0.033f * 20.0f );
+                gM0_RH_Curr_mA_Med  = 1000.0f * ( (float)ADC_LSB_M0_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
+                gM0_RH_Curr_mA_EMA  = gZETA_EMA_Coef * gM0_RH_Curr_mA_Med + (1.0f-gZETA_EMA_Coef) * gM0_RH_Curr_mA_EMA;
             }
             if ( i == 2 ) { // Motor 1
                 // MEDIAN of 3 - current spike elimination
@@ -1090,10 +1192,10 @@ void ADC_check( void )
                 ADC_LSB_M1_Y = ADC_LSB_M1_Z;
                 ADC_LSB_M1_Z = ADC_LSB[ 2 ];
                 ADC_LSB_M1_MED3 = median3( ADC_LSB_M1_X , ADC_LSB_M1_Y , ADC_LSB_M1_Z );
-                Motor1_curr_mA      = 1000.0f * ( ADC_volt[ 2 ] ) / ( 0.033f * 20.0f );
-                Motor1_curr_mA_med  = 1000.0f * ( (float)ADC_LSB_M1_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
-                Motor1_curr_mA_ema  = Zeta_ema_curr * Motor1_curr_mA_med + (1.0f-Zeta_ema_curr) * Motor1_curr_mA_ema;
-                // Motor1_curr_mA = 1000.0f * ADC_volt[ 2 ] / ( 0.033f * 20.0f );
+                gM1_LH_Curr_mA      = 1000.0f * ( ADC_Volt[ 2 ] ) / ( 0.033f * 20.0f );
+                gM1_LH_Curr_mA_Med  = 1000.0f * ( (float)ADC_LSB_M1_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
+                gM1_LH_Curr_mA_EMA  = gZETA_EMA_Coef * gM1_LH_Curr_mA_Med + (1.0f-gZETA_EMA_Coef) * gM1_LH_Curr_mA_EMA;
+                // gM1_LH_Curr_mA = 1000.0f * ADC_volt[ 2 ] / ( 0.033f * 20.0f );
             }
         }
     }
@@ -1114,20 +1216,20 @@ STORE_TIMER6(5);
 GET_DURATION(5);
     }
     // ----- SEND DATA OVER UART -----
-    if ( fSendData )
+    if ( flg_Send_UART )
     {
 STORE_TIMER6(6);
-        fSendData = false;
+        flg_Send_UART = false;
 
-        switch ( Robot_State )
+        switch ( gRobot_State )
         {
             // ----- OBSERVATION ------  
             case ROBO_STATE_INIT:                  
                 break;
             // ----- REGULATION ------    
             case ROBO_STATE_BALA:                    
-                UART0_signals[  0 ] = 100.0f * Angle_Pitch_Deg;         // raw Pitch FAST
-                UART0_signals[  1 ] = 100.0f * gAngle_PITCH_deg_CoFil;   // filtered Pitch
+                UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
+                UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
                 // UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
                 // UART0_signals[  3 ] = 100.0f * PID_P_term_volt;         // P volt
                 // UART0_signals[  4 ] = 100.0f * PID_I_term_volt;         // I volt
@@ -1135,10 +1237,10 @@ STORE_TIMER6(6);
                 // UART0_signals[  6 ] = 100.0f * PID_C_LHRH_volt;         // C volt
                 UART0_signals[  7 ] = 100.0f * gPID_AV_Rates_Volt ;         // G volt
 
-                UART0_signals[  8 ] = 1.000f * Motor0_curr_mA;          // raw Motor I
-                UART0_signals[  9 ] = 1.000f * Motor0_curr_mA_ema;      // filtered Motor I
-                UART0_signals[ 10 ] = 1.000f * Motor1_curr_mA;          // raw Motor I
-                UART0_signals[ 11 ] = 1.000f * Motor1_curr_mA_ema;      // filtered Motor I
+                UART0_signals[  8 ] = 1.000f * gM0_RH_Curr_mA;          // raw Motor I
+                UART0_signals[  9 ] = 1.000f * gM0_RH_Curr_mA_EMA;      // filtered Motor I
+                UART0_signals[ 10 ] = 1.000f * gM1_LH_Curr_mA;          // raw Motor I
+                UART0_signals[ 11 ] = 1.000f * gM1_LH_Curr_mA_EMA;      // filtered Motor I
                 // UART0_signals[ 12 ] = 100.0f * Motor0_theta_rad;        // motor shaft angle
                 // UART0_signals[ 13 ] = 100.0f * Motor1_theta_rad;        // motor shaft angle
                 // UART0_signals[ 14 ] = 100.0f * Motor0_omega_rads;       // motor speed
@@ -1149,18 +1251,18 @@ STORE_TIMER6(6);
                 // UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
                 // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
                 // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
-                UART0_signals[ 21 ] = 100.0f * gK_dynamicDamp;                  // G damping - gyro
-                UART0_signals[ 22 ] = 100.0f * Alpha_cf_MPU;            // Alpha coef. for complementary filter Acc+Gyro
-                UART0_signals[ 23 ] = 100.0f * Zeta_ema_curr;           // Zeta coef. for Exponencial
+                UART0_signals[ 21 ] = 100.0f * gK1_dynamicDamp;                  // G damping - gyro
+                UART0_signals[ 22 ] = 100.0f * gALPHA_CF_Coef;            // Alpha coef. for complementary filter Acc+Gyro
+                UART0_signals[ 23 ] = 100.0f * gZETA_EMA_Coef;           // Zeta coef. for Exponencial
 
-                UART0_signals[ 24 ] = 100.0f * gBatt_volt_ema;           // Filtered battery voltage
-                UART0_signals[ 25 ] = 100.0f * MPU_temp_C;              // temperature of MPU
+                UART0_signals[ 24 ] = 100.0f * gBatt_Volt_EMA;           // Filtered battery voltage
+                UART0_signals[ 25 ] = 100.0f * gMPU_Temp_C;              // temperature of MPU
                 UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
                 UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
 
                 Send_integers_over_UART ( SIGNAL_CNT );
 
-                // UART0_signals[  9 ] = 1.0f * Motor1_curr_mA;
+                // UART0_signals[  9 ] = 1.0f * gM1_LH_Curr_mA;
                 break;
             // ----- CALIBRATION ------
             case ROBO_STATE_CALIB:                  
@@ -1235,19 +1337,19 @@ bool checkForGainCommand( void )
                         case 'G':
                             G_Gain_received = value;
                             if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                gK_dynamicDamp = (float)G_Gain_received / 100.0f;
+                                gK1_dynamicDamp = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         case 'A':
                             A_Filt_received = value;
                             if ( 100 >= A_Filt_received && A_Filt_received >= 0 ) {    // A shall be 0-100 (0-1.0)
-                                Alpha_cf_MPU = (float)A_Filt_received / 100.0f;
+                                gALPHA_CF_Coef = (float)A_Filt_received / 100.0f;
                             }
                             break;
                         case 'Z':
                             Z_Filt_received = value;
                             if ( 100 >= Z_Filt_received && Z_Filt_received >= 0 ) {    // Z shall be 0-100 (0-1.0)
-                                Zeta_ema_curr = (float)Z_Filt_received / 100.0f;
+                                gZETA_EMA_Coef = (float)Z_Filt_received / 100.0f;
                             }
                             break; 
                         default: return false;
@@ -1307,15 +1409,15 @@ bool checkForCommand2( void )
                                   break;
                         case 'G': G_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      gK_dynamicDamp=(float)value/100.0f;
+                                      gK1_dynamicDamp=(float)value/100.0f;
                                   break;
                         case 'A': A_Filt_received=value;
                                   if(value>=0 && value<=100)
-                                      Alpha_cf_MPU=(float)value/100.0f;
+                                      gALPHA_CF_Coef=(float)value/100.0f;
                                   break;
                         case 'Z': Z_Filt_received=value;
                                   if(value>=0 && value<=100)
-                                      Zeta_ema_curr=(float)value/100.0f;
+                                      gZETA_EMA_Coef=(float)value/100.0f;
                                   break;
                         default: return false;
                     }
@@ -1467,7 +1569,7 @@ bool CSFR_Extract_Data( void )
         {
             CSFR_Header_match++;
             // run Fail Safe Timer
-            CounterFailSafe = TIME_FAIL_SAFE_MS;
+            cnt_Fail_Safe = TIME_FAIL_SAFE_MS;
             // Extract the 22 bytes following the header
             for ( int j = 0 ; j < CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ; j++ )
             {
@@ -1573,10 +1675,10 @@ void SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty )
 void MPU_check ( void )
 {
     // ----- READ MPU DATA -----        
-    if ( fMPUread && ( cMPUdelay==0 ) )
+    if ( flg_Read_MPU && ( cnt_Delay_MPU==0 ) )
     {
 STORE_TIMER6(2);
-        fMPUread = false;     
+        flg_Read_MPU = false;     
     
         switch ( MPU_switch )
         {
@@ -1584,12 +1686,12 @@ STORE_TIMER6(2);
                 MPU_ExitSleep_Return = MPU_ExitSleep();
                 if (  MPU_ExitSleep_Return == 0 ) {
                     MPU_switch = 1;
-                    LED_Sequence_Actual = LED_SEQUENCE_2;
+                    gLED_Seq_Now = LED_SEQUENCE_2;
                     MPU_switch_transition_cnt++;
                 } else {
                     MPU_switch = 0;
-                    fMotorEnable = false;
-                    LED_Sequence_Actual = LED_SEQUENCE_1;
+                    flg_Motor_EN = false;
+                    gLED_Seq_Now = LED_SEQUENCE_1;
                     er_ct[0]++;
                 }
                 break;
@@ -1599,19 +1701,19 @@ STORE_TIMER6(2);
                 if ( MPU_WhoAmI_Return == 0 ) {
                     if ( MPU_WhoAmI_data == 104 ) {
                         MPU_switch = 2;
-                        fMotorEnable = true;
-                        LED_Sequence_Actual = LED_SEQUENCE_3;
+                        flg_Motor_EN = true;
+                        gLED_Seq_Now = LED_SEQUENCE_3;
                         MPU_switch_transition_cnt++;
                     } else {
                         MPU_switch = 0;
-                        fMotorEnable = false;
-                        LED_Sequence_Actual = LED_SEQUENCE_1;
+                        flg_Motor_EN = false;
+                        gLED_Seq_Now = LED_SEQUENCE_1;
                         er_ct[1]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
                     }
                 } else {
                     MPU_switch = 0;
-                    fMotorEnable = false;
-                    LED_Sequence_Actual = LED_SEQUENCE_1;
+                    flg_Motor_EN = false;
+                    gLED_Seq_Now = LED_SEQUENCE_1;
                     er_ct[2]++;
                 }
                 break;
@@ -1619,15 +1721,15 @@ STORE_TIMER6(2);
                 MPU_GetAccTempGyro_Return = MPU_GetAccTempGyro();   // takes ~410us @400kHz
                 if ( MPU_GetAccTempGyro_Return != 0 ) { 
                     MPU_switch = 0;
-                    fMotorEnable = false;
-                    LED_Sequence_Actual = LED_SEQUENCE_1;
+                    flg_Motor_EN = false;
+                    gLED_Seq_Now = LED_SEQUENCE_1;
                     er_ct[3]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
                 }
 
                 break;
             default:
                 MPU_switch = 0;
-                LED_Sequence_Actual = LED_SEQUENCE_1;
+                gLED_Seq_Now = LED_SEQUENCE_1;
                 er_ct[4]++;
                 break;
         }
@@ -1849,43 +1951,43 @@ uint16_t MPU_GetAccTempGyro( void )
 
     MPU_accX_raw = (int16_t)gRxPacket[ 0 ] << 8;	// read High byte
     MPU_accX_raw += (int16_t)gRxPacket[ 1 ];
-    MPU_accX = MPU_accX_raw - MPU_accX_offset;
+    MPU_accX = MPU_accX_raw - gMPU_AccX_offset;
 
     MPU_accY_raw = (uint16_t)gRxPacket[ 2 ] << 8;	// read High byte
     MPU_accY_raw += gRxPacket[ 3 ];
-    MPU_accY = MPU_accY_raw - MPU_accY_offset;
+    MPU_accY = MPU_accY_raw - gMPU_AccY_offset;
 
     MPU_accZ_raw = (uint16_t)gRxPacket[ 4 ] << 8;	// read High byte
     MPU_accZ_raw += gRxPacket[ 5 ];
-    MPU_accZ = MPU_accZ_raw - MPU_accZ_offset;
+    MPU_accZ = MPU_accZ_raw - gMPU_AccZ_offset;
 
     MPU_temp = (uint16_t)gRxPacket[ 6 ] << 8;	// read High byte
     MPU_temp += gRxPacket[ 7 ];
 
-    MPU_accX_g = MPU_accX / 16384.0f; //
-    MPU_accY_g = MPU_accY / 16384.0f; //
-    MPU_accZ_g = MPU_accZ / 16384.0f; // this three lines takes 50us
+    gMPU_AccX_g = MPU_accX / 16384.0f; //
+    gMPU_AccY_g = MPU_accY / 16384.0f; //
+    gMPU_AccZ_g = MPU_accZ / 16384.0f; // this three lines takes 50us
 
 // TRIGINOMETRY USED TO DETERMINE ANGLES - theta, psi, phi
 // https://www.analog.com/en/resources/app-notes/an-1057.html
 
-    Angle_Pitch_Deg = RAD_TO_DEG * atan2( MPU_accX_g , ( sqrt( MPU_accY_g*MPU_accY_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
-    Angle_Roll_Deg  = RAD_TO_DEG * atan2( MPU_accY_g , ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accZ_g*MPU_accZ_g ) ) ); //
-    Angle_Yaw_Deg   = RAD_TO_DEG * atan2( ( sqrt( MPU_accX_g*MPU_accX_g + MPU_accY_g*MPU_accY_g ) ) , MPU_accZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
+    gAngle_PITCH_Deg = RAD_TO_DEG * atan2( gMPU_AccX_g , ( sqrt( gMPU_AccY_g*gMPU_AccY_g + gMPU_AccZ_g*gMPU_AccZ_g ) ) ); //
+    gAngle_ROLL_Deg  = RAD_TO_DEG * atan2( gMPU_AccY_g , ( sqrt( gMPU_AccX_g*gMPU_AccX_g + gMPU_AccZ_g*gMPU_AccZ_g ) ) ); //
+    gAngle_YAW_Deg   = RAD_TO_DEG * atan2( ( sqrt( gMPU_AccX_g*gMPU_AccX_g + gMPU_AccY_g*gMPU_AccY_g ) ) , gMPU_AccZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
 
-    MPU_temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
+    gMPU_Temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
 
     MPU_gyroX_raw = (uint16_t)gRxPacket[ 8 ] << 8;	// read High byte
     MPU_gyroX_raw += gRxPacket[ 9 ];
-    MPU_gyroX = MPU_gyroX_raw - MPU_gyroX_offset;
+    MPU_gyroX = MPU_gyroX_raw - gMPU_GyroX_offset;
 
     MPU_gyroY_raw = (uint16_t)gRxPacket[ 10 ] << 8;	// read High byte
     MPU_gyroY_raw += gRxPacket[ 11 ];
-    MPU_gyroY = MPU_gyroY_raw - MPU_gyroY_offset;
+    MPU_gyroY = MPU_gyroY_raw - gMPU_GyroY_offset;
 
     MPU_gyroZ_raw = (uint16_t)gRxPacket[ 12 ] << 8;	// read High byte
     MPU_gyroZ_raw += gRxPacket[ 13 ];
-    MPU_gyroZ = MPU_gyroZ_raw - MPU_gyroZ_offset;
+    MPU_gyroZ = MPU_gyroZ_raw - gMPU_GyroZ_offset;
 
 // ******************************************
 // ********** COMPLEMENTARY FILTER **********
@@ -1895,21 +1997,21 @@ uint16_t MPU_GetAccTempGyro( void )
 // pitch = 0.98 * (pitch + gyroscope_x * dt) + 0.02* accelerometer_x
 
     // T_sampling, sensitivity 131LSB / deg/s
-	Gyro_X_RateDegs = ( ( MPU_gyroX * TIME_MPU_READ_SEC ) / 131.0f );
-    gRate_Y_degs_f = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / -131.0f );       // it seems this axis is reversed
-    Gyro_Z_RateDegs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );       // 3 lines 125us	
+	gRate_X_Degs = ( ( MPU_gyroX * TIME_MPU_READ_SEC ) / 131.0f );
+    gRate_Y_Degs = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / -131.0f );       // it seems this axis is reversed
+    gRate_Z_Degs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );       // 3 lines 125us	
 	
-    gAngle_PITCH_deg_CoFil = ( 1 - Alpha_cf_MPU ) * ( Angle_Pitch_DegN_1 + gRate_Y_degs_f ) + Alpha_cf_MPU * Angle_Pitch_Deg;
-	Angle_Roll_Deg_CoFil  = ( 1 - Alpha_cf_MPU ) * ( Angle_Roll_DegN_1  + Gyro_X_RateDegs ) + Alpha_cf_MPU * Angle_Roll_Deg;
-    Angle_Yaw_Deg_CoFil   = ( 1 - Alpha_cf_MPU ) * ( Angle_Yaw_DegN_1   + Gyro_Z_RateDegs ) + Alpha_cf_MPU * Angle_Yaw_Deg;  // 3 lines 120us
+    gAngle_PITCH_Deg_CF = ( 1 - gALPHA_CF_Coef ) * ( gAngle_PITCH_Deg_0 + gRate_Y_Degs ) + gALPHA_CF_Coef * gAngle_PITCH_Deg;
+	gAngle_ROLL_Deg_CF  = ( 1 - gALPHA_CF_Coef ) * ( gAngle_ROLL_Deg_0  + gRate_X_Degs ) + gALPHA_CF_Coef * gAngle_ROLL_Deg;
+    gAngle_YAW_Deg_CF   = ( 1 - gALPHA_CF_Coef ) * ( gAngle_YAW_Deg_0   + gRate_Z_Degs ) + gALPHA_CF_Coef * gAngle_YAW_Deg;  // 3 lines 120us
 
     // re-shift
-    Angle_Pitch_DegN_1 = gAngle_PITCH_deg_CoFil;
-    Angle_Roll_DegN_1  = Angle_Roll_Deg_CoFil;
-    Angle_Yaw_DegN_1   = Angle_Yaw_Deg_CoFil;
+    gAngle_PITCH_Deg_0 = gAngle_PITCH_Deg_CF;
+    gAngle_ROLL_Deg_0  = gAngle_ROLL_Deg_CF;
+    gAngle_YAW_Deg_0   = gAngle_YAW_Deg_CF;
 
-    // RUN PID
-    flagInnerLoop = true;
+    // RUN Controller
+    flg_RUN_InnerLoop = true;
 
     return I2C_Flag_Block;
 
@@ -2016,7 +2118,7 @@ float Robot_GetYawRate_SG(void)
     gYaw_hist_rad[1] = gYaw_hist_rad[2];
     gYaw_hist_rad[2] = gYaw_hist_rad[3];
     gYaw_hist_rad[3] = gYaw_hist_rad[4];
-    gYaw_hist_rad[4] = gYAW_rad;
+    gYaw_hist_rad[4] = gTurn_rad;
 
     return (1.0f / (12.0f * TIME_MOTOR_OMEGA_S)) *
            ( gYaw_hist_rad[0]
@@ -2111,8 +2213,8 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
 
 void BatteryGauge_8LED(float voltage)
 {
-    const float Vmax = VOLT_BATTERY_DEF + 1.0f;
-    const float Vmin = VOLT_BATTERY_MIN + 0.1f;
+    const float Vmax = VOLT_BATTERY_DEF + 0.7f; // 12.0V
+    const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
     const uint8_t LEDcount = 8;
     const uint8_t LEDoffset = 0;
 
