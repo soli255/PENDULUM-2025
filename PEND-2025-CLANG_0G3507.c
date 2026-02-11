@@ -5,12 +5,13 @@
  *   - 2xPOLOLU 4753 (50:1 Metal Gearmotor 37Dx70Lmm/12V/64CPR)
  *   - MSPM0G3507@80MHz/12.5ns
  * COMPILER VERSION: Clang v4.0.0 -O2
- * PROGRAMMER: Tomas Solarski
- * LAST MODIFIED: 2026-02-10 19:31:28
+ * PROGRAMMER: Ing. Tomas Solarski
+ * LAST MODIFIED: 2026-02-11 08:13:24
  **********************************************************************/
 
 // ** LAST UPDATE **
-// - Turning by simple Voltage mixing added
+// - Feed Forward Control added (K0 gain)
+// 
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -145,7 +146,6 @@ volatile uint8_t crc8tab[256] = {
     0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
     0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
 
-
 volatile    uint16_t    gLED_Seq_Now    = LED_SEQUENCE_1;
 volatile    uint8_t     gRobot_State    = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_State_1  = ROBO_STATE_BALA;
@@ -199,7 +199,7 @@ volatile    float       gM1_LH_Curr_mA_Med  = 0.0f;
 volatile    float       gM0_RH_Curr_mA_EMA  = 0.0f;
 volatile    float       gM1_LH_Curr_mA_EMA  = 0.0f;
 
-// MEDIAN of 3
+// MEDIAN of 3 - motor current spike elimination
 volatile    uint32_t    ADC_LSB_M0_X = 0U , ADC_LSB_M0_Y = 0U , ADC_LSB_M0_Z = 0U , ADC_LSB_M0_MED3 = 0U;
 volatile    uint32_t    ADC_LSB_M1_X = 0U , ADC_LSB_M1_Y = 0U , ADC_LSB_M1_Z = 0U , ADC_LSB_M1_MED3 = 0U;
 volatile    float       Motor0_curr_mA_max  = 0.0f , Motor1_curr_mA_max = 0.0f;
@@ -207,27 +207,32 @@ volatile    uint8_t     Motors_buff_idx     = 0U;
 volatile    float       Drive0_temp_C       = 0.0f , Drive1_temp_C      = 0.0f;
 volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
 
+// -----------------------------------
 // ----- Controller 0 INNER LOOP -----
+// -----------------------------------
 // Attitude (Tilt) Stabilization
-#define     K1_DAMPIMG_DEF   (-15.0f)       // Negative because Dumping is counteracting the tilt
-#define     K2_BALANCE_DEF   (0.1f)         // Default K Gain for ANGLE
-volatile    float       gK1_dynamicDamp     = K1_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
-volatile    float       gK2_balanceAngle    = K2_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
-
-volatile    float       gPID_AV_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
-volatile    float       gPID_AV_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
-volatile    float       gPID_AV_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
-volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
-
-#define     K3_TURN_RH_DEF   (+0.025f)      // As one wheel is countered, the other is turned
-#define     K4_TURN_LH_DEF   (-0.025f)      // one wheel gain must be opposite (negative) of the other
+#define     K0_FEEDFOR_DEF      (-0.01f)    // K Gain  for FEED FORWARD
+#define     K1_DAMPIMG_DEF      (-15.0f)    // K Gain  for Dynamic DAMPING - Negative because Dumping is counteracting the tilt
+#define     K2_BALANCE_DEF      (0.1f)      // K Gain  for ANGLE - BALLANCING
+#define     K3_TURN_RH_DEF      (+0.020f)   // K Gains for TURNING - As one wheel is countered, the other is turned
+#define     K4_TURN_LH_DEF      (-0.020f)   // one wheel gain must be opposite (negative) of the other
+volatile    float       gK0_FeedForward     = K0_FEEDFOR_DEF;   // Feed Forward
+volatile    float       gK1_DynamicDamp     = K1_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
+volatile    float       gK2_BalanceAngle    = K2_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
 volatile    float       gK3_Turn_Gain_RH    = K3_TURN_RH_DEF;
 volatile    float       gK4_Turn_Gain_LH    = K4_TURN_LH_DEF;
-volatile    float       gTurn_SetPoint_Rad  = 0.0f;     // Angle in radians, -1 means rotate LEFT, +1 means rotate RIGHT
+
+volatile    float       gActVal_FeedF_Volt  = 0.0f;     // Inner loop - Motor voltage
+volatile    float       gActVal_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
+volatile    float       gActVal_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
+volatile    float       gActVal_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
+volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
+
+// volatile    float       gTurn_SetPoint_Rad  = 0.0f;     // Angle in radians, -1 means rotate LEFT, +1 means rotate RIGHT
 volatile    float       gTurn_Error_RH_Rad  = 0.0f;     // Outer loop - RIGHT WHEEL Angle error in radians
 volatile    float       gTurn_Error_LH_Rad  = 0.0f;     // Outer loop - LEFT WHEEL Angle error in radians
-volatile    float       gTurn_AV_RH_Volt    = 0.0f;     // Outer loop - RIGHT WHEEL Motor voltage compensation
-volatile    float       gTurn_AV_LH_Volt    = 0.0f;     // Outer loop - LEFT WHEEL Motor voltage compensation
+volatile    float       gActVal_TurnRH_Volt = 0.0f;     // Outer loop - RIGHT WHEEL Motor voltage compensation
+volatile    float       gActVal_TurnLH_Volt = 0.0f;     // Outer loop - LEFT WHEEL Motor voltage compensation
 
 volatile    float       gTurn_rad           = 0.0f;
 volatile    float       gTurnR_rads         = 0.0f;
@@ -243,6 +248,7 @@ volatile    uint8_t     UART0_RXbuffer[ UART0_RX_BUFFER_SIZE ];         // Buffe
 volatile    uint8_t     UART0_RXbytes = 0U;                              // Buffer counter
 volatile    bool        UART0_terminator_detected = false;
 volatile    bool        UART0_command_detected = false;
+
 volatile    int16_t     P_Gain_received = 0;    // P gain
 volatile    int16_t     I_Gain_received = 0;    // I gain
 volatile    int16_t     D_Gain_received = 0;    // D gain
@@ -278,15 +284,15 @@ volatile    uint8_t     CSFR_CRC_Received = 0;
 volatile    uint8_t     CSFR_CRC_Calculated = 0;
 volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
 
-volatile    int16_t     RC_roll     = 0;    // Received Ch. 1 - buffer idx 0
-volatile    int16_t     RC_pitch    = 0;    // Received Ch. 2 - buffer idx 1
+volatile    int16_t     gRC_CMD_Roll     = 0;    // Received Ch. 1 - buffer idx 0
+volatile    int16_t     gRC_CMD_Pitch    = 0;    // Received Ch. 2 - buffer idx 1
 volatile    uint16_t    RC_throttle = 0;    // Received Ch. 3 - buffer idx 2
 volatile    int16_t     RC_yaw      = 0;    // Received Ch. 4 - buffer idx 3
 
 volatile    int16_t     RC_latch_left = 0;  // Received Ch. 5 - buffer idx 4
-volatile    int16_t     RC_latch_right = 0; // Received Ch. 6 - buffer idx 5
-volatile    int16_t     RC_3state_left = 0; // Received Ch. 7 - buffer idx 6
-volatile    int16_t     RC_3state_right= 0; // Received Ch. 8 - buffer idx 7
+volatile    int16_t     RC_3state_left = 0; // Received Ch. 6 - buffer idx 5
+volatile    int16_t     RC_3state_right= 0; // Received Ch. 7 - buffer idx 6
+volatile    int16_t     RC_latch_right = 0; // Received Ch. 8 - buffer idx 7
 
 // ----- I2C1 -----
 #define     I2C_TX_MAX_PACKET_SIZE (16U)
@@ -754,16 +760,18 @@ STORE_TIMER6(4);
         // ------------------------------
         // ----- 40. (B) INNER LOOP -----
         // ------------------------------
+        // --- 40.5 Calculate Feed Forward (no error) ---
+        gActVal_FeedF_Volt   = gK0_FeedForward * gRC_CMD_Pitch;
         // --- 41. Calculate DUMPING (no error) ---
-        gPID_AV_Rates_Volt   = gK1_dynamicDamp * gRate_Y_Degs;         // Damping for preventing flip over
+        gActVal_Rates_Volt   = gK1_DynamicDamp * gRate_Y_Degs;         // Damping for preventing flip over
         // --- 43. Calculate Gain from Angle (error) ---
         gPID_Error_Angle_Deg = gAngle_setPoint_deg - gAngle_PITCH_Deg_CF;
-        gPID_AV_Angle_Volt   = gK2_balanceAngle * gPID_Error_Angle_Deg;  // Angle gain for upright position
-        // --- 44. Combine action values ---
-        gPID_AV_Robot_Volt = gPID_AV_Angle_Volt + gPID_AV_Rates_Volt;
+        gActVal_Angle_Volt   = gK2_BalanceAngle * gPID_Error_Angle_Deg;  // Angle gain for upright position
+        // --- 44. Combine ALL Motor Action Values ---
+        gActVal_Robot_Volt = gActVal_Angle_Volt + gActVal_Rates_Volt + gActVal_FeedF_Volt;
         // --- 45. Motor Voltage Limit ---
-        if ( gPID_AV_Robot_Volt > VOLT_MOTOR_LIM_HI ) gPID_AV_Robot_Volt = VOLT_MOTOR_LIM_HI;
-        if ( gPID_AV_Robot_Volt < -VOLT_MOTOR_LIM_HI ) gPID_AV_Robot_Volt = -VOLT_MOTOR_LIM_HI;
+        if ( gActVal_Robot_Volt > VOLT_MOTOR_LIM_HI ) gActVal_Robot_Volt = VOLT_MOTOR_LIM_HI;
+        if ( gActVal_Robot_Volt < -VOLT_MOTOR_LIM_HI ) gActVal_Robot_Volt = -VOLT_MOTOR_LIM_HI;
 
         // --------------------------
         // ---- 46. MOTOR CONTROL ---
@@ -790,64 +798,11 @@ STORE_TIMER6(4);
                         )            
                     {
                         // --- Standard mixing ---
-                        gMotor_RH_Volt = gPID_AV_Robot_Volt + gTurn_AV_RH_Volt;
-                        gMotor_LH_Volt = gPID_AV_Robot_Volt + gTurn_AV_LH_Volt;
+                        gMotor_RH_Volt = gActVal_Robot_Volt + gActVal_TurnRH_Volt;
+                        gMotor_LH_Volt = gActVal_Robot_Volt + gActVal_TurnLH_Volt;
                         // --- Output ---
                         Motor_M0_volt(gMotor_LH_Volt);
                         Motor_M1_volt(gMotor_RH_Volt);
-                        // // ------------------------------------
-                        // // ---- 47. MOTORS MIXING ALGORITHM ---
-                        // // ------------------------------------
-                        // // Default: no mixing yet
-                        // gMotor_LH_Volt = 0.0f;
-                        // gMotor_RH_Volt = 0.0f;
-                        // // --- Check if we are in UPRIGHT POSITION ---
-                        // if ( ( gAngle_PITCH_Deg_CF < +3.5f ) &&
-                        //      ( gAngle_PITCH_Deg_CF > -3.5f )
-                        //     )
-                        // {
-                        //     // --- Check if we have YAW command [rad/s] ---
-                        //     if ( ( gTurn_SetPoint_Rad > 0.02f ) || ( gTurn_SetPoint_Rad < -0.02f ) )
-                        //     {
-                        //         // --- UPRIGHT and YAW command detected ---
-                        //         gMotor_LH_Volt = +gTurn_AV_LH_Volt;
-                        //         gMotor_RH_Volt = -gTurn_AV_RH_Volt;
-                        //         // gMotor_LH_Volt = +gPID_AV_LH_RH_Volt;
-                        //         // gMotor_RH_Volt = -gPID_AV_LH_RH_Volt;
-                        //         // --- Check if we have Forward/Reverse command [deg] ---
-                        //     } else if ( ( gPID_AV_Robot_Volt > VOLT_MOTOR_MIN ) || 
-                        //                 ( gPID_AV_Robot_Volt < -VOLT_MOTOR_MIN )
-                        //               ) {
-                        //             // --- UPRIGHT, NO YAW but Forward/Reverse command detected ---
-                        //             gMotor_LH_Volt = gPID_AV_Robot_Volt;
-                        //             gMotor_RH_Volt = gPID_AV_Robot_Volt;
-                        //     } else {
-                        //         // --- NO command OR small voltage---
-                        //         gMotor_LH_Volt = 0.0f;
-                        //         gMotor_RH_Volt = 0.0f;
-                        //     }
-                        // // --- We are PROBABLY in Balancing ---
-                        // } else {
-                        //     // 1) Limit TURN to 50% of forward AV when AV is NOT significant, default is 4.0V
-                        //     gTURN_Limit_Volt = VOLT_MOTOR_LIM_LO;
-                        //     if ( ( gPID_AV_Robot_Volt   < +VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt   > 0.00f ) )
-                        //            gTURN_Limit_Volt      = VOLT_MOTOR_LIM_LO * 0.5f;
-                        //     if ( ( gPID_AV_Robot_Volt   > -VOLT_MOTOR_LIM_LO ) && ( gPID_AV_Robot_Volt   < 0.00f ) ) 
-                        //            gTURN_Limit_Volt      = VOLT_MOTOR_LIM_LO * 0.5f;
-                        //     // --- Limit ---
-                        //     if ( gTurn_AV_RH_Volt > gTURN_Limit_Volt ) gTurn_AV_RH_Volt = gTURN_Limit_Volt;
-                        //     if ( gTurn_AV_RH_Volt < -gTURN_Limit_Volt ) gTurn_AV_RH_Volt = -gTURN_Limit_Volt;
-                        //     if ( gTurn_AV_LH_Volt > gTURN_Limit_Volt ) gTurn_AV_LH_Volt = gTURN_Limit_Volt;
-                        //     if ( gTurn_AV_LH_Volt < -gTURN_Limit_Volt ) gTurn_AV_LH_Volt = -gTURN_Limit_Volt;
-                        //     // if ( gPID_AV_LH_RH_Volt >  gYAW_Limit_Volt) gPID_AV_LH_RH_Volt =  gYAW_Limit_Volt;
-                        //     // if ( gPID_AV_LH_RH_Volt < -gYAW_Limit_Volt) gPID_AV_LH_RH_Volt = -gYAW_Limit_Volt;
-
-                        //     // gMotor_LH_Volt = gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt;
-                        //     // gMotor_RH_Volt = gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt;                            
-                        // }
-
-                        // Motor_M0_volt( gPID_AV_Robot_Volt + gPID_AV_LH_RH_Volt );
-                        // Motor_M1_volt( gPID_AV_Robot_Volt - gPID_AV_LH_RH_Volt );
                     }
         } else {
             Motor_M0_volt( 0.0f );
@@ -925,8 +880,8 @@ void    CSFR_check ( void )
         {
             CSFR_Parse_Data();
             //run motors
-            RC_roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
-            RC_pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+            gRC_CMD_Roll  = (int16_t)( ( (float)RC_channels[ 0 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
+            gRC_CMD_Pitch = (int16_t)( ( (float)RC_channels[ 1 ] - 992.0f ) / 8.19f ); // scale to -100 0 +100
             // manipulate gains based on RC
             // Input range (from your RC receiver)
             const float x1 = 191.0f;    // min RC value
@@ -938,21 +893,22 @@ void    CSFR_check ( void )
             float a = (y2 - y1) / (x2 - x1);
             float b = y1 - (a * x1);
             // --- apply new gains ---
-            gK2_balanceAngle = K2_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
-            gK1_dynamicDamp  = K1_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
+            gK0_FeedForward  = K0_FEEDFOR_DEF * ( ( a * (float)RC_channels[ 4 ] ) + b ) * ( ( a * (float)RC_channels[ 7 ] ) + b );
+            gK2_BalanceAngle = K2_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
+            gK1_DynamicDamp  = K1_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
 
             // ROLL is actually used as YAW/TURN command
-            gTurn_AV_RH_Volt    = gK3_Turn_Gain_RH * RC_roll;
-            gTurn_AV_LH_Volt    = gK4_Turn_Gain_LH * RC_roll;
+            gActVal_TurnRH_Volt    = gK3_Turn_Gain_RH * gRC_CMD_Roll;
+            gActVal_TurnLH_Volt    = gK4_Turn_Gain_LH * gRC_CMD_Roll;
             
-            if ( gTurn_AV_RH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = VOLT_MOTOR_LIM_LO;
-            if ( gTurn_AV_RH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_RH_Volt = -VOLT_MOTOR_LIM_LO;
-            if ( gTurn_AV_LH_Volt > VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = VOLT_MOTOR_LIM_LO;
-            if ( gTurn_AV_LH_Volt < -VOLT_MOTOR_LIM_LO ) gTurn_AV_LH_Volt = -VOLT_MOTOR_LIM_LO;
+            if ( gActVal_TurnRH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = VOLT_MOTOR_LIM_LO;
+            if ( gActVal_TurnRH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = -VOLT_MOTOR_LIM_LO;
+            if ( gActVal_TurnLH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = VOLT_MOTOR_LIM_LO;
+            if ( gActVal_TurnLH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = -VOLT_MOTOR_LIM_LO;
             // gTurn_SetPoint_Rad += 0.015f*RC_roll; // integrate
 
             // PITCH
-            gAngle_setPoint_deg = -0.50f*RC_pitch;
+            gAngle_setPoint_deg = -0.50f*gRC_CMD_Pitch;
             #define PITCH_ANGLE_LIMIT (25.0f)
             if ( gAngle_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg =  PITCH_ANGLE_LIMIT; }
             if ( gAngle_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg = -PITCH_ANGLE_LIMIT; }
@@ -962,8 +918,8 @@ void    CSFR_check ( void )
         {
             // default
             gAngle_setPoint_deg = gAngle_setPoint_deg * 0.9f; // exp decay
-            RC_roll = 0;
-            RC_pitch = 0;
+            gRC_CMD_Roll = 0;
+            gRC_CMD_Pitch = 0;
         }
     }
 }
@@ -1235,7 +1191,7 @@ STORE_TIMER6(6);
                 // UART0_signals[  4 ] = 100.0f * PID_I_term_volt;         // I volt
                 // UART0_signals[  5 ] = 100.0f * PID_D_term_volt;         // D volt
                 // UART0_signals[  6 ] = 100.0f * PID_C_LHRH_volt;         // C volt
-                UART0_signals[  7 ] = 100.0f * gPID_AV_Rates_Volt ;         // G volt
+                UART0_signals[  7 ] = 100.0f * gActVal_Rates_Volt ;         // G volt
 
                 UART0_signals[  8 ] = 1.000f * gM0_RH_Curr_mA;          // raw Motor I
                 UART0_signals[  9 ] = 1.000f * gM0_RH_Curr_mA_EMA;      // filtered Motor I
@@ -1251,7 +1207,7 @@ STORE_TIMER6(6);
                 // UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
                 // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
                 // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
-                UART0_signals[ 21 ] = 100.0f * gK1_dynamicDamp;                  // G damping - gyro
+                UART0_signals[ 21 ] = 100.0f * gK1_DynamicDamp;                  // G damping - gyro
                 UART0_signals[ 22 ] = 100.0f * gALPHA_CF_Coef;            // Alpha coef. for complementary filter Acc+Gyro
                 UART0_signals[ 23 ] = 100.0f * gZETA_EMA_Coef;           // Zeta coef. for Exponencial
 
@@ -1337,7 +1293,7 @@ bool checkForGainCommand( void )
                         case 'G':
                             G_Gain_received = value;
                             if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                gK1_dynamicDamp = (float)G_Gain_received / 100.0f;
+                                gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         case 'A':
@@ -1409,7 +1365,7 @@ bool checkForCommand2( void )
                                   break;
                         case 'G': G_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      gK1_dynamicDamp=(float)value/100.0f;
+                                      gK1_DynamicDamp=(float)value/100.0f;
                                   break;
                         case 'A': A_Filt_received=value;
                                   if(value>=0 && value<=100)
