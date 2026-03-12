@@ -6,13 +6,14 @@
  *   - MSPM0G3507@80MHz/12.5ns
  * COMPILER VERSION: Clang v4.0.0 -O2
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-03-11 09:39:13
+ * LAST MODIFIED: 2026-03-12 14:08:13
  **********************************************************************/
 
 // ** LAST UPDATE **
-// - quadrature encoder implemented by ISR (no polling)
-// - structures used for motor and wheel data (single standed global variables coated to structures)
-// - Identification procedure by voltage step added
+// - MPU iq format used for trigonometry, IQMath version = MATHACL
+// - Degrees abandoned and correct radians are used
+// - MPU sample frequency increased from 500Hz (2ms) to 1.25kHz (0.8ms)
+// - in SysConfig.h in ADC 0 and 1 area BUG FIX in needed
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -40,8 +41,9 @@
 #define     TIME_MOTOR_OMEGA_MS     (10U)       // rate to calculate impulses to determine motor speed
 #define     TIME_MOTOR_OMEGA_S      (0.01f)     // in seconds
 #define     TIME_MPU_DELAY_MS       (250U)      // delay before MPU is initiated
-#define     TIME_MPU_READ_MS        (2U)        // reading rate of MPU
-#define     TIME_MPU_READ_SEC       (0.002f)    // in seconds
+#define     TIME_MPU_READ_SEC       (0.0008f)   // reading rate of MPU in seconds - Main Sample Period - Inner Loop
+#define     TIME_MPU_READ_S_IQ   _IQ(0.0008f)   // 800us in seconds
+// #define     TIME_MPU_READ_MS        (2U)        // reading rate of MPU - now by ISR
 #define     TIME_CRSF_MS            (50U)       // Cross Fire (Radio Control) protocol
 #define     TIME_FAIL_SAFE_MS       (1500U)     // No command received
 
@@ -89,15 +91,18 @@
 #define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
 
 #define     RAD_TO_DEG              (57.2958f)
+#define     RAD_TO_DEG_IQ        _IQ(57.295779513f)
+#define     DEG_TO_RAD              (0.0174533f)
+#define     DEG_TO_RAD_IQ        _IQ(0.01745329252f)
 
 #define     PWM_MAX_DUTY            (90U)       // [ % ] -> 0.90*12V => 10.8V
 #define     PWM_MIN_DUTY            (2U)        // [ % ] -> 0.02*12V => 0.24V
 
 // TIMER CHANNELS ASSIGNED TO OUTPUTS
-#define     PHASE_A                 (1U)
-#define     PHASE_B                 (0U)
-#define     PHASE_C                 (2U)
-#define     PHASE_D                 (3U)
+#define     PHASE_A                 (1U)    // Motor 0 - Positive/Negative terminal
+#define     PHASE_B                 (0U)    // Motor 0 - Positive/Negative terminal
+#define     PHASE_C                 (2U)    // Motor 1 - Positive/Negative terminal
+#define     PHASE_D                 (3U)    // Motor 1 - Positive/Negative terminal
 #define     PHASE_COUNT             (4U)
 
 // ----- WS2812B LED -----
@@ -159,40 +164,37 @@ volatile    uint8_t     gRobot_State_1  = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_Ident    = 0U;
 
 // ----- FLAGS -----
-#define     QUAD_CNT    (2U)
-volatile    bool    flg_Heart_LED     = false;
-volatile    bool    gFlg_Read_MPU      = false;
-volatile    bool    gFlg_ADC[ADC_CNT]  = { false };
-volatile    bool    gFlg_Log_Enable    = false;
-volatile    bool    gFlg_Send_UART     = false;
-volatile    bool    gFlg_RUN_OuterLoop = false;
-volatile    bool    flg_RUN_InnerLoop = false;
-volatile    bool    flg_Motor_EN      = false;
-volatile    bool    gFlg_Read_CRSF     = false;
-
+volatile    bool    gFlg_Read_MPU      = false;     // Flag signal to read MPU6050
+volatile    bool    gFlg_ADC[ADC_CNT]  = { false }; // Flag signal to read ADCs
+volatile    bool    gFlg_Log_Enable    = false;     // Flag signal to enable sending data via UART
+volatile    bool    gFlg_Send_UART     = false;     // Flag signal to send data via UART now
+volatile    bool    gFlg_RUN_OuterLoop = false;     // Flag signal to run outer loop
+volatile    bool    gFlg_RUN_InnerLoop = false;     // Flag signal to run inner loop
+volatile    bool    gFlg_Motor_EN      = false;     // Flag signal to enable motors
+volatile    bool    gFlg_Read_CRSF     = false;     // Flag signal to read RC commands
 // ----- COUNTERS -----
 volatile    uint32_t    gCnt_Heart_LED   = LED_HEART_ON_MS;
 volatile    uint8_t     gCnt_Heart_Tick  = 0U;
-volatile    uint32_t    gCnt_Read_MPU    = TIME_MPU_READ_MS;
-volatile    uint32_t    gCnt_Delay_MPU   = TIME_MPU_DELAY_MS;
-volatile    uint32_t    gCnt_Send_UART   = TIME_SEND_DATA_MS;
+// volatile    uint32_t    gCnt_MPU_Read    = TIME_MPU_READ_MS; - now handled by ISR
+volatile    uint32_t    gCnt_MPU_Delay   = TIME_MPU_DELAY_MS;
+volatile    uint32_t    gCnt_UART_Send   = TIME_SEND_DATA_MS;
 volatile    uint32_t    gCnt_OuterLoop   = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    gCnt_Fail_Safe   = 0U;
-volatile    uint32_t    gCnt_Read_CRSF   = TIME_CRSF_MS;
+volatile    uint32_t    gCnt_CRSF_Read   = TIME_CRSF_MS;
 volatile    uint32_t    gCnt_Identify    = 0U;
 volatile    uint32_t    gCnt_Sample      = 0U;
-
-volatile    uint32_t    gCnt_GPIO_IRQ_G[5] = {0U};
-
+// ----- ERROR COUNTERS -----
 volatile    uint32_t    er_ct[ 24 ];
 volatile    uint32_t    ab_ct[ 24 ]; 
+volatile    uint32_t    ab_wr_ct[ 4 ];  // I2C duration in CPU_tics only for MPU_Write_Rer();
+volatile    uint32_t    ab_rl_ct[ 9 ];  // I2C duration in CPU_tics only for MPU_Read_Len();
+// ----- DURATION TIMERS -----
 #define     MAX_TIMERS  (10U)
 volatile    uint16_t    dt_us[ MAX_TIMERS ];    // delta time in us
 volatile    uint16_t    dt_over_us[ MAX_TIMERS ];// delta time over some limit buffer in us
 volatile    uint16_t    t0_us[ MAX_TIMERS ];    // save timer value
 #define     STORE_TIMER6(i) ( t0_us[i] = (uint16_t)DL_TimerG_getTimerCount( TIMER_6_INST ) )
 #define     GET_DURATION(i) ( dt_us[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0_us[i]) )
-
 // ----- ANALOG - EMA COEF -----
 #define     BATT_VOLT_EMA_ALPHA     (0.01f)         // Exponential Moving Average coef - Battery voltage
 #define     MOTOR_CURR_EMA_ALPHA    (0.01f)         // Exponential Moving Average coef - Motor Current
@@ -201,44 +203,24 @@ volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
 // ----- ANALOG - All channels -----
 volatile    uint32_t    gADC_LSB[  ADC_CNT ];       // [ LSB ]
 volatile    float       gADC_Volt[ ADC_CNT ];       // [ V ]
-
-// volatile    float       gBatt_Volt       = VOLT_BATTERY_DEF;
-// volatile    float       gBatt_Volt_EMA   = VOLT_BATTERY_DEF;
-
-volatile    float       gM0_RH_Curr_mA      = 0.0f;
-volatile    float       gM1_LH_Curr_mA      = 0.0f;
-volatile    float       gM0_RH_Curr_mA_Med  = 0.0f;
-volatile    float       gM1_LH_Curr_mA_Med  = 0.0f;
-volatile    float       gM0_RH_Curr_mA_EMA  = 0.0f;
-volatile    float       gM1_LH_Curr_mA_EMA  = 0.0f;
-
-// MEDIAN of 3 - motor current spike elimination
-// volatile    uint32_t    ADC_LSB_M0_X = 0U , ADC_LSB_M0_Y = 0U , ADC_LSB_M0_Z = 0U , ADC_LSB_M0_MED3 = 0U;
-// volatile    uint32_t    ADC_LSB_M1_X = 0U , ADC_LSB_M1_Y = 0U , ADC_LSB_M1_Z = 0U , ADC_LSB_M1_MED3 = 0U;
-// volatile    float       Motor0_curr_mA_max  = 0.0f , Motor1_curr_mA_max = 0.0f;
-// volatile    uint8_t     Motors_buff_idx     = 0U;
-// volatile    float       Drive0_temp_C       = 0.0f , Drive1_temp_C      = 0.0f;
-// volatile    float       Drive0_temp_C_ema   = 0.0f , Drive1_temp_C_ema  = 0.0f;
-
 // -----------------------------------
 // ----- Controller 0 INNER LOOP -----
+// -- Attitude (Tilt) Stabilization --
 // -----------------------------------
-// Attitude (Tilt) Stabilization
-#define     K0_FEEDFOR_DEF      (-0.01f)    // K Gain  for FEED FORWARD
-#define     K1_DAMPIMG_DEF      (-15.0f)    // K Gain  for Dynamic DAMPING - Negative because Dumping is counteracting the tilt
-#define     K2_BALANCE_DEF      (0.1f)      // K Gain  for ANGLE - BALLANCING
-#define     K3_TURN_DEF         (0.002f)    // K Gain  for TURNING
-#define     K3_TURN_RH_DEF      (+0.020f)   // K Gains for TURNING - As one wheel is countered, the other is turned
-#define     K4_TURN_LH_DEF      (-0.020f)   // one wheel gain must be opposite (negative) of the other
+// #define     K0_FEEDFOR_DEF      (-0.01f)    // K Gain  for FEED FORWARD
+// #define     K1_DAMPIMG_DEF      (-15.0f)    // K Gain  for Dynamic DAMPING - Negative because Dumping is counteracting the tilt
+// #define     K2_BALANCE_DEF      (0.1f)      // K Gain  for ANGLE - BALLANCING
+// #define     K3_TURN_DEF         (0.002f)    // K Gain  for TURNING
+// #define     K3_TURN_RH_DEF      (+0.020f)   // K Gains for TURNING - As one wheel is countered, the other is turned
+// #define     K4_TURN_LH_DEF      (-0.020f)   // one wheel gain must be opposite (negative) of the other
 
-// Define what a "WHEEL" is
+// ----- Define what a "WHEEL" is -----
 typedef struct {
     float   pos_m;              // Wheel Linear position (m)
     float   pos_hist_m[5];      // Wheel Linear position history (m) - for SG derivative filter
     float   speed_ms;           // Wheel Linear speed (m/s)
 } wheel_t;
-
-// Define what a "MOTOR" is
+// ----- Define what a "MOTOR" is -----
 typedef struct {
     int32_t imp;                // Motor Encoder impulses (-)
     float   theta_rad;          // Motor Angle (rad)
@@ -248,12 +230,14 @@ typedef struct {
     float   curr_hist_A[3];     // Motor Current history (A) - for Median filter
     float   volt_V;             // Motor Voltage (V)
 } motor_t;
-
+// ----- Define what a "POWER" is -----
 typedef struct {
-    float batt_volt;       // Current filtered voltage (V)
+    float batt_volt;       // Battery filtered voltage (V)
     bool  is_low_power;    // Critical low voltage flag
 } power_t;
-
+// ------------------------------------
+// ----- Define what a "ROBOT" is -----
+// ------------------------------------
 typedef struct {
     // --- 10. GAINS (The "DNA") ---
     struct {
@@ -271,7 +255,7 @@ typedef struct {
     struct {
         wheel_t left;
         wheel_t right;
-        // float   width;      // Track width (distance between wheels)
+        // float   width;           // Track width (distance between wheels)
     } wheel;
     // --- 40. MOTORS (The "Engine") ---
     struct {
@@ -280,49 +264,74 @@ typedef struct {
     } motor;
     // --- 50. BODY (The "Robot") ---
     struct {
-        float   pitch_rad;        // Robot Body Tilt Angle (rad)  - IMU measured
-        float   pitch_rate_rads;  // Robot Body Tilt Rate (rad/s) - IMU measured
-        float   roll_rad;         // Robot Body Roll Angle (rad)  - IMU measured
-        float   roll_rate_rads;   // Robot Body Roll Rate (rad/s) - IMU measured
-        float   yaw_rad;          // Robot Body Turn Angle (rad)  - IMU measured
-        float   yaw_rate_rads;    // Robot Body Turn Rate (rad/s) - IMU measured
-        float   turn_rad;         // Robot Body Turn Angle (rad)  - calculated from wheels
-        float   turn_rate_rads;   // Robot Body Turn Rate (rad/s) - calculated from wheels
-        float   pos_m;            // Robot Body Position (m) - how far the robot has moved
-        float   pos_hist_m[5];    // Robot Body Position History (m)
-        float   speed_ms;         // Robot Body Speed (m/s) - how fast the robot is moving
+        float   accX_g;             // Robot Body Acceleration (g)  - IMU measured
+        float   accY_g;             // Robot Body Acceleration (g)  - IMU measured
+        float   accZ_g;             // Robot Body Acceleration (g)  - IMU measured
+        float   temp_C;             // Robot Body Temperature (C)   - IMU measured
+        float   pitch_rad;          // Robot Body Tilt Angle (rad)  - IMU measured
+        float   rateX_rads;         // Robot Body X Rate (rad/s)    - IMU measured
+        float   roll_rad;           // Robot Body Roll Angle (rad)  - IMU measured
+        float   rateY_rads;         // Robot Body Y Rate (rad/s)    - IMU measured
+        float   yaw_rad;            // Robot Body Turn Angle (rad)  - IMU measured
+        float   rateZ_rads;         // Robot Body Y Rate (rad/s)    - IMU measured
+        float   turn_rad;           // Robot Body Turn Angle (rad)  - calculated from wheels
+        float   turn_rate_rads;     // Robot Body Turn Rate (rad/s) - calculated from wheels
+        float   pos_m;              // Robot Body Position (m) - how far the robot has moved
+        float   pos_hist_m[5];      // Robot Body Position History (m)
+        float   speed_ms;           // Robot Body Speed (m/s) - how fast the robot is moving
     } body;
     // --- 60. CONTROLLER (The "Action") ---
     struct { 
-        float   voltFF;         // Feed Forward Term
-        float   voltBala;       // Proportional term
-        float   voltDamp;       // Derivative term - Damping from gyro
-        float   voltCommon;     // Combined term - all action terms
-        float   voltTurn;       // Combined turning term
-        float   voltMLeft;      // Motor Left
-        float   voltMRight;     // Motor Right
-        float   errBalDeg;      // Balancing Error
+        float   FFterm_V;       // Feed Forward Term [V]
+        float   KPterm_V;       // Proportional term [V]
+        float   KDterm_V;       // Derivative term - Damping from gyro [V]
+        float   CMterm_V;       // Combined term - common - all action terms [V]
+        float   TIterm_V;       // Turning term [V]
+        float   MotorLH_V;      // Motor Left [V]
+        float   MotorRH_V;      // Motor Right [V]
+        float   Err_Pitch_rad;  // Balancing/Tilt Error [rad]
+        float   SP_Pitch_rad;   // Balancing/Tilt Setpoint [rad]
     } control;
-
-} Stabilizer_t;
-
-volatile Stabilizer_t robot = {
+    // --- 70. RC (The "Remote Control") ---
+    struct {
+        uint16_t ch[16U]; // Raw 11-bit values
+        // --- Primary Sticks (Normalized -1.0 to 1.0 or 0.0 to 1.0) ---
+        float roll;             // [-1.0, 1.0] - Roll stick input
+        float pitch;            // [-1.0, 1.0] - Pitch stick input
+        float throttle;         // [0.0, 1.0] - Throttle stick input
+        float yaw;              // [-1.0, 1.0] - Yaw stick input
+        // --- Auxiliary Switches ---
+        int16_t latch_L;
+        int16_t state3_L;
+        int16_t state3_R;
+        int16_t latch_R;
+        bool is_connected;       // Failsafe flag
+    } rc_cmd;
+} Robot_t;
+// ----- Robot Defaults -----
+volatile Robot_t robot = {
     .gain = {
-        .FF = K0_FEEDFOR_DEF,
-        .P  = K2_BALANCE_DEF,
-        .D  = K1_DAMPIMG_DEF,
-        .Y  = K3_TURN_DEF
+        .FF = 0.01f,    // []
+        .P  = 8.50f,    // [V/rad]
+        .D  = 850.0f,   // [Vs/rad]
+        .Y  = 0.002f    // [fixed leading zero and added comma]
+    },
+    .power = {
+        .batt_volt = VOLT_BATTERY_DEF,
+        .is_low_power = false
+    },
+    .control = {
+        .SP_Pitch_rad = 0.0f    // upright angle
     }
 };
-
-// Define what a "ENCODER" is
+// ----- Define what a "ENCODER" is -----
 typedef struct {
     volatile bool A;
     volatile bool B;
     volatile bool C;
     volatile bool D;
 } QuadPrevState;
-
+// ----- Quad Encoder Defaults -----
 static QuadPrevState quad0 = {
     .A = false,
     .B = false,
@@ -330,28 +339,28 @@ static QuadPrevState quad0 = {
     .D = false
 };
 
-volatile    float       gK0_FeedForward     = K0_FEEDFOR_DEF;   // Feed Forward
-volatile    float       gK1_DynamicDamp     = K1_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
-volatile    float       gK2_BalanceAngle    = K2_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
-volatile    float       gK3_Turn_Gain_RH    = K3_TURN_RH_DEF;
-volatile    float       gK4_Turn_Gain_LH    = K4_TURN_LH_DEF;
+// volatile    float       gK0_FeedForward     = K0_FEEDFOR_DEF;   // Feed Forward
+// volatile    float       gK1_DynamicDamp     = K1_DAMPIMG_DEF;   // Angular velocity (from gyroscope) as a damping term
+// volatile    float       gK2_BalanceAngle    = K2_BALANCE_DEF;   // K Gain for ANGLE - Inner Loop
+// volatile    float       gK3_Turn_Gain_RH    = K3_TURN_RH_DEF;
+// volatile    float       gK4_Turn_Gain_LH    = K4_TURN_LH_DEF;
 
-volatile    float       gActVal_FeedF_Volt  = 0.0f;     // Inner loop - Motor voltage
-volatile    float       gActVal_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
-volatile    float       gActVal_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
-volatile    float       gActVal_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
-volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
+// volatile    float       gActVal_FeedF_Volt  = 0.0f;     // Inner loop - Motor voltage
+// volatile    float       gActVal_Angle_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt angle (deg)
+// volatile    float       gActVal_Rates_Volt  = 0.0f;     // Inner loop - Motor voltage - From tilt rates (deg/sec)
+// volatile    float       gActVal_Robot_Volt  = 0.0f;     // Total Inner Loop Motor Voltage
+// volatile    float       gPID_Error_Angle_Deg= 0.0f;     // Inner loop - Angle error in degrees
 
-volatile    float       gTurn_Error_RH_Rad  = 0.0f;     // Outer loop - RIGHT WHEEL Angle error in radians
-volatile    float       gTurn_Error_LH_Rad  = 0.0f;     // Outer loop - LEFT WHEEL Angle error in radians
-volatile    float       gActVal_TurnRH_Volt = 0.0f;     // Outer loop - RIGHT WHEEL Motor voltage compensation
-volatile    float       gActVal_TurnLH_Volt = 0.0f;     // Outer loop - LEFT WHEEL Motor voltage compensation
+// volatile    float       gTurn_Error_RH_Rad  = 0.0f;     // Outer loop - RIGHT WHEEL Angle error in radians
+// volatile    float       gTurn_Error_LH_Rad  = 0.0f;     // Outer loop - LEFT WHEEL Angle error in radians
+// volatile    float       gActVal_TurnRH_Volt = 0.0f;     // Outer loop - RIGHT WHEEL Motor voltage compensation
+// volatile    float       gActVal_TurnLH_Volt = 0.0f;     // Outer loop - LEFT WHEEL Motor voltage compensation
 
-volatile    float       gTurn_rad           = 0.0f;
-volatile    float       gTurnR_rads         = 0.0f;
+// volatile    float       gTurn_rad           = 0.0f;
+// volatile    float       gTurnR_rads         = 0.0f;
 
-volatile    float       gT1_sample = TIME_MPU_READ_SEC;     // sample time [sec] Inner loop
-volatile    float       gT2_sample = TIME_MOTOR_OMEGA_S;    // sample time [sec] Outer loop
+// volatile    float       gT1_sample = TIME_MPU_READ_SEC;     // sample time [sec] Inner loop
+// volatile    float       gT2_sample = TIME_MOTOR_OMEGA_S;    // sample time [sec] Outer loop
 
 // ***** UART0 - Communication to PC *****
 // RX
@@ -399,13 +408,13 @@ volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
 
 volatile    int16_t     gRC_CMD_Roll     = 0;    // Received Ch. 1 - buffer idx 0
 volatile    int16_t     gRC_CMD_Pitch    = 0;    // Received Ch. 2 - buffer idx 1
-volatile    uint16_t    RC_throttle = 0;    // Received Ch. 3 - buffer idx 2
-volatile    int16_t     RC_yaw      = 0;    // Received Ch. 4 - buffer idx 3
+volatile    uint16_t    gRC_CMD_throttle = 0;    // Received Ch. 3 - buffer idx 2
+volatile    int16_t     gRC_CMD_yaw      = 0;    // Received Ch. 4 - buffer idx 3
 
-volatile    int16_t     RC_latch_left = 0;  // Received Ch. 5 - buffer idx 4
-volatile    int16_t     RC_3state_left = 0; // Received Ch. 6 - buffer idx 5
-volatile    int16_t     RC_3state_right= 0; // Received Ch. 7 - buffer idx 6
-volatile    int16_t     RC_latch_right = 0; // Received Ch. 8 - buffer idx 7
+volatile    int16_t     gRC_latch_left = 0;  // Received Ch. 5 - buffer idx 4
+volatile    int16_t     gRC_3state_left = 0; // Received Ch. 6 - buffer idx 5
+volatile    int16_t     gRC_3state_right= 0; // Received Ch. 7 - buffer idx 6
+volatile    int16_t     gRC_latch_right = 0; // Received Ch. 8 - buffer idx 7
 
 // ***** I2C1 - GYRO ACCELEROMETER *****
 #define     I2C_TX_MAX_PACKET_SIZE (16U)
@@ -432,40 +441,74 @@ enum I2cControllerStatus
 // ----- MPU-6050 -----
 //MPU physical AD0 = 0
 #define     MPU_ADDRESS ( 0b1101000 )  // MPU slave address in 7bit format
-volatile	uint8_t		MPU_WhoAmI_data = 0U;
-volatile	uint8_t		MPU_switch = 0U;
-volatile    uint32_t    MPU_switch_transition_cnt = 0U;
-volatile    uint16_t    MPU_WhoAmI_Return = 0U;
-volatile    uint16_t    MPU_ExitSleep_Return = 0U;
-volatile    uint16_t    MPU_GetAccTempGyro_Return = 0U;
+volatile	uint8_t		gMPU_WhoAmI_data    = 0U;
+volatile	uint8_t		gMPU_WhoAmI_Return   = 0U;
+volatile	uint8_t		gMPU_ExitSleep_Return = 0U;
+volatile    uint8_t     gMPU_GetAccTempGyro_Return  = 0U;
+volatile	uint8_t		gMPU_Int_En_status  = 0U;
+volatile	uint8_t		gMPU_Irq_status     = 0U;
+volatile	uint8_t		gMPU_Sleep_status   = 0U;
+volatile    uint8_t     gMPU_Latch_status   = 0U;
+volatile    uint32_t    gMPU_Irq_not_set_cnt= 0U;
+volatile    uint32_t    gMPU_Irq_set_cnt    = 0U;
+volatile    uint32_t    gMPU_reset_cnt      = 0U;
+volatile	uint8_t		gMPU_switch         = 0U;
+volatile    uint8_t     gMPU_return[ 10 ];
 // raw data registers
-volatile	int16_t	    MPU_temp = 0;
-volatile	int16_t	    MPU_accX = 0, MPU_accY = 0, MPU_accZ = 0;
-volatile	int16_t	    MPU_accX_raw = 0, MPU_accY_raw = 0, MPU_accZ_raw = 0;
-volatile	int16_t	    MPU_gyroX = 0, MPU_gyroY = 0, MPU_gyroZ = 0;
-volatile	int16_t	    MPU_gyroX_raw = 0, MPU_gyroY_raw = 0, MPU_gyroZ_raw = 0;
+volatile	int16_t	    gMPU_temp      = 0;
+volatile	int16_t	    gMPU_accX      = 0, gMPU_accY      = 0, gMPU_accZ      = 0; // compensated by offset
+volatile	int16_t	    gMPU_accX_raw  = 0, gMPU_accY_raw  = 0, gMPU_accZ_raw  = 0; // without offset
+volatile	int16_t	    gMPU_gyroX     = 0, gMPU_gyroY     = 0, gMPU_gyroZ     = 0; // compensated by offset
+volatile	int16_t	    gMPU_gyroX_raw = 0, gMPU_gyroY_raw = 0, gMPU_gyroZ_raw = 0; // without offset
 // ----- OFFSET COMPENSATION -----
-volatile	 int16_t	gMPU_AccX_offset  =  400;
-volatile	 int16_t	gMPU_AccY_offset  = -250;
-volatile	 int16_t	gMPU_AccZ_offset  =  800; // 2025-09-13
-volatile	 int16_t	gMPU_GyroX_offset =  100;
-volatile	 int16_t	gMPU_GyroY_offset =  -50;
-volatile	 int16_t	gMPU_GyroZ_offset =  75; // 2025-09-13
+volatile    int16_t     gMPU_accX_offset  =  500 , gMPU_accY_offset  = -250 , gMPU_accZ_offset  = 0; // 2025-10-04
+volatile	int16_t	    gMPU_gyroX_offset = -250 , gMPU_gyroY_offset =  000 , gMPU_gyroZ_offset = 0; // 2025-10-04
+// calculated data
+// volatile    float       gMPU_temp_C = 0.0f , gMPU_accX_g = 0.0f , gMPU_accY_g = 0.0f , gMPU_accZ_g = 0.0f;
+// volatile	float		gMPU_gyroX_degs = 0.0f , gMPU_gyroY_degs = 0.0f , gMPU_gyroZ_degs = 0.0f;
 
-// ----- Calculated MPU data -----
-volatile    float       gMPU_Temp_C = 0.0f;     // Temperature in degrees Celcius
+// volatile	float		gRate_X_degs_f = 0.0f , gRate_Y_degs_f = 0.0f , gRate_Z_degs_f = 0.0f;
+// volatile	float		gRate_X_rads_f = 0.0f , gRate_Y_rads_f = 0.0f , gRate_Z_rads_f = 0.0f;
+// volatile	float		gAngle_PITCH_deg_f = 0.0f , gAngle_ROLL_deg_f = 0.0f , gAngle_YAW_deg_f = 0.0f;
 
-volatile    float       gMPU_AccX_g = 0.0f;     // X Axis Acceleration in Gs
-volatile    float       gMPU_AccY_g = 0.0f;     // Y Axis Acceleration in Gs
-volatile    float       gMPU_AccZ_g = 0.0f;     // Z Axis Acceleration in Gs
+// // ----- Calculated MPU data -----
+// volatile    float       gMPU_Temp_C = 0.0f;     // Temperature in degrees Celcius
 
-volatile	float		gRate_X_Degs = 0.0f;    // X Axis Rate in degrees per second
-volatile	float		gRate_Y_Degs = 0.0f;    // Y Axis Rate in degrees per second
-volatile	float		gRate_Z_Degs = 0.0f;    // Z Axis Rate in degrees per second
+// volatile    float       gMPU_AccX_g = 0.0f;     // X Axis Acceleration in Gs
+// volatile    float       gMPU_AccY_g = 0.0f;     // Y Axis Acceleration in Gs
+// volatile    float       gMPU_AccZ_g = 0.0f;     // Z Axis Acceleration in Gs
 
-volatile    float       gAngle_PITCH_Deg = 0.0f;// Pitch in degrees
-volatile    float       gAngle_ROLL_Deg = 0.0f; // Roll in degrees
-volatile    float       gAngle_YAW_Deg = 0.0f;  // Yaw in degrees
+// volatile	float		gRate_X_Degs = 0.0f;    // X Axis Rate in degrees per second
+// volatile	float		gRate_Y_Degs = 0.0f;    // Y Axis Rate in degrees per second
+// volatile	float		gRate_Z_Degs = 0.0f;    // Z Axis Rate in degrees per second
+
+// volatile    float       gAngle_PITCH_Deg = 0.0f;// Pitch in degrees
+// volatile    float       gAngle_ROLL_Deg = 0.0f; // Roll in degrees
+// volatile    float       gAngle_YAW_Deg = 0.0f;  // Yaw in degrees
+
+// // ----- COMPLEMENTARY FILTER -----
+// // volatile    float       Alpha = ALPHA_DEFAULT;
+// volatile    float       gAngle_PITCH_deg_CoFil = 0.0f , gAngle_PITCH_deg_N_1 = 0.0f;
+// volatile    float       gAngle_ROLL_deg_CoFil  = 0.0f , gAngle_ROLL_deg_N_1  = 0.0f;
+// volatile    float       gAngle_YAW_deg_CoFil   = 0.0f , gAngle_YAW_deg_N_1   = 0.0f;
+
+// ----- Calculation MPU data IQ -----
+// GLOBAL   IQ 24 - RANGE: -128 to 127.999 999 940 (resolution: 0.000 000 060)
+//          IQ 16 - RANGE: -32,768 to 32,767.999 984 741 (resolution: 0.000 015 259)
+//          IQ 8  - RANGE: -8,388,608 to 8,388,607.996 093 750 (resolution: 0.003 906 250) 
+// https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
+_iq         gMPU_accX_iq   , gMPU_accY_iq   , gMPU_accZ_iq  ;   // raw value in iq
+_iq         gMPU_accX_g_iq , gMPU_accY_g_iq , gMPU_accZ_g_iq;   // g value in iq
+_iq         gMPU_temp_C_iq; // C deg in iq
+_iq         gRate_X_degs_iq , gRate_Y_degs_iq , gRate_Z_degs_iq;
+_iq         gRate_X_rads_iq , gRate_Y_rads_iq , gRate_Z_rads_iq;
+
+_iq         gAngle_PITCH_deg_iq       , gAngle_ROLL_deg_iq       , gAngle_YAW_deg_iq;
+_iq         gAngle_PITCH_rad_iq       , gAngle_ROLL_rad_iq       , gAngle_YAW_rad_iq;
+_iq         gAngle_PITCH_deg_N_1_iq   , gAngle_ROLL_deg_N_1_iq   , gAngle_YAW_deg_N_1_iq;
+_iq         gAngle_PITCH_rad_N_1_iq   , gAngle_ROLL_rad_N_1_iq   , gAngle_YAW_rad_N_1_iq;
+_iq         gAngle_PITCH_deg_CoFil_iq , gAngle_ROLL_deg_CoFil_iq , gAngle_YAW_deg_CoFil_iq;
+_iq         gAngle_PITCH_rad_CoFil_iq , gAngle_ROLL_rad_CoFil_iq , gAngle_YAW_rad_CoFil_iq;
 
 // ----- COMPLEMENTARY FILTER -----
 volatile    float       gALPHA_CF_Coef = ALFA_CF_COEF;
@@ -478,85 +521,58 @@ volatile    float       gAngle_PITCH_Deg_0 = 0.0f;
 volatile    float       gAngle_ROLL_Deg_0  = 0.0f;
 volatile    float       gAngle_YAW_Deg_0    = 0.0f;
 
-// ----- MOTOR/ROBOT -----
-// volatile    float       gTURN_Limit_Volt;    // limit voltage for yaw control to not become bigger than Balancing Voltage
-// volatile    float       gMotor_LH_Volt;     // Left Hand motor voltage
-// volatile    float       gMotor_RH_Volt;     // Right Hand motor voltage
-// volatile    int32_t     gTheta_0_RH_pos , gTheta_1_LH_pos;      // encoder position in CPR
-// volatile    float       gTheta_0_RH_rad , gTheta_1_LH_rad;      // motor Angle [rad]
-// volatile    float       gWheel_LH_m     , gWheel_RH_m;          // wheel distance [m]
-// volatile    float       gWheel_LH_msec  , gWheel_RH_msec;       // wheel speed [m/sec]
-volatile    float       gWheel_LH_hist_m[5];    // history buffers: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
-volatile    float       gWheel_RH_hist_m[5];    // history buffers: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
-
-// volatile    float       gPosition_m;            // position in m
-volatile    float       gPosition_error_m;      // position error in m
-volatile    float       gPosition_setPoint_m;   // position set point in m
-volatile    float       gPosition_ActVal_deg;   // position ACTION value in deg
-volatile    float       gPosition_Gain;         // position GAIN [deg/m]
-volatile    float       gPosition_hist_m[5];    // x[k-2], x[k-1], x[k], x[k+1], x[k+2]
-
 // ****** Savitzky-Golay Derivative Filter ******
 // used to filter and calculate the speed
 #define     DT_S        TIME_MOTOR_OMEGA_S      // TIME_MOTOR_OMEGA_S
 #define     SG_K        (1.0f / (12.0f * DT_S)) // 1 / (12*dt)
 
-// volatile    float       gSpeed_msec;            // speed in m/sec
-volatile    float       gSpeed_error_msec;      // speed error in m/sec
-volatile    float       gSpeed_setPoint_msec;   // speed set point in m/sec
-volatile    float       gSpeed_ActVal_deg;      // speed ACTION value in deg
-volatile    float       gSpeed_Gain;            // speed GAIN [deg/msec]
-
 volatile    float       gAngle_error_deg;       // angle error in deg
-volatile    float       gAngle_setPoint_deg;    // angle set point in deg
+volatile    float       gPitch_setPoint_deg;    // angle set point in deg
 volatile    float       gYaw_hist_rad[5];       // x[k-2], x[k-1], x[k], x[k+1], x[k+2]
 
 // ----- FUNCTIONS -----
 void    MCU_Init( void );
+void    MPU_Init( void );
 void    PID_Outer_Loop( void );
 void    PID_Inner_Loop( void );
 void    CSFR_check ( void );
 void    ADC_check( void );
 void    UART_check( void );
-// void    QUAD_check( void );
-
 void    MPU_check ( void );
 void    HWL_SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty );
-void    Motor_M0_volt( float argVoltM0 );
-void    Motor_M1_volt( float argVoltM1 );
+void    Motor0_RH_volt( float argVoltM0 );
+void    Motor1_LH_volt( float argVoltM1 );
 bool    checkForGainCommand( void );
 bool    checkForCommand2( void );
 void    clearUART0_RXbuffer_Zero(void);
-uint16_t MPU_ExitSleep( void );
-uint16_t MPU_WhoAmI( void );
-uint16_t MPU_GetAccTempGyro( void );
 uint16_t Send_integers_over_UART( uint8_t argCount );
 int32_t Filter_Median3(int32_t a, int32_t b, int32_t c);
 uint8_t table_crc8( void );
 uint8_t compute_crc8( void );
-
 bool     CSFR_Extract_Data( void );
 void     CSFR_Parse_Data( void );
 uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev );
-
 void    WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B);
 void    WS2812B_All_LED(uint8_t ArgColor, uint8_t ArgBrightness);
 void    WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2, uint8_t argBrg1, uint8_t argBrg2);
 
 void    Wheel_GetSpeed_SG(void);
+
+void    Robot_Ident( void );
 float   Robot_GetSpeed_SG(void);
 float   Robot_GetTurnRate_SG(void);
 
 void    WS2812B_BattGauge_8LED(float voltage);
-void    WS2812B_TiltGauge_8LED(float tilt_deg);
+void    WS2812B_TiltGauge_8LED(float tilt_rad);
 
-// void    UpdateWheelPhysics( volatile wheel_t *argWheel );
 void    Robot_GetWheelPhysics(volatile motor_t *argMotor , volatile wheel_t *argWheel);
-
 void    Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LSB );
 void    Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB );
-
 static inline float Filter_Median3_f(float a, float b, float c);
+
+uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA );
+uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen );
+bool        MPU_UAV_Calculation ( void );
 
 // *****************************************  *****************************************  *****************************************
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
@@ -565,116 +581,18 @@ static inline float Filter_Median3_f(float a, float b, float c);
 int main( void ) {
     
     MCU_Init();
+    MPU_Init();
 
 // *****************************************  *****************************************  *****************************************
 // *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****
 // *****************************************  *****************************************  *****************************************
     while ( 1 ) {
 
-        if ( gRobot_State == ROBO_STATE_IDENT )
-        {
-            switch ( gRobot_Ident ) {
-            
-                // --- MOTOR OFF (0.0V) ---
-                case 0U:
-                    robot.control.voltCommon = 0.0f;
-                    Motor_M0_volt( robot.control.voltCommon );
-                    Motor_M1_volt( robot.control.voltCommon );
-                    // clear timer counter and go to next state
-                    gCnt_Identify = 0U;
-                    gRobot_Ident++;
-                break;
-
-                // --- WAIT 0.5s ---
-                case 1U:
-                if ( gCnt_Identify >= 500U )
-                    gRobot_Ident++;
-                break;
-
-                // --- SET LOW LEVEL (2.0V) ---
-                case 2U:
-                    robot.control.voltCommon = 2.0f;
-                    Motor_M0_volt( robot.control.voltCommon );
-                    Motor_M1_volt( robot.control.voltCommon );                    
-                    // clear timer counter and go to next state
-                    gCnt_Identify = 0U;
-                    gRobot_Ident++;
-                break;
-
-                // --- WAIT 0.5s ---
-                case 3U:
-                if ( gCnt_Identify >= 500U )
-                    gRobot_Ident++;
-                break;
-
-                // --- Start logging ---
-                case 4U:
-                    gCnt_Sample = 0U;
-                    gFlg_Log_Enable = true;
-                    // clear timer counter and go to next state
-                    gCnt_Identify = 0U;
-                    gRobot_Ident++;
-                break;
-
-                // --- WAIT 0.5s ---
-                case 5U:
-                if ( gCnt_Identify >= 500U )
-                    gRobot_Ident++;
-                break;
-
-                // --- SET HI LEVEL (4.0V) ---
-                case 6U:
-                    robot.control.voltCommon = 4.0f;
-                    Motor_M0_volt( robot.control.voltCommon );
-                    Motor_M1_volt( robot.control.voltCommon );
-                    // clear timer counter and go to next state
-                    gCnt_Identify = 0U;
-                    gRobot_Ident++;
-                break;
-                
-                // --- WAIT 0.5s ---
-                case 7U:
-                if ( gCnt_Identify >= 500U )
-                    gRobot_Ident++;
-                break;
-
-                // --- SET LOW LEVEL (2.0V) ---
-                case 8U:
-                    robot.control.voltCommon = 2.0f;
-                    Motor_M0_volt( robot.control.voltCommon );
-                    Motor_M1_volt( robot.control.voltCommon );
-                    // clear timer counter and go to next state
-                    gCnt_Identify = 0U;
-                    gRobot_Ident++;
-                break;
-
-                // --- WAIT 0.5s ---
-                case 9U:
-                    if ( gCnt_Identify >= 500U )
-                        gRobot_Ident++;
-                break;
-
-                // --- MOTOR OFF (0.0V) ---
-                case 10U:
-                    // stop logging
-                    gFlg_Log_Enable = false;
-                    // motors OFF
-                    robot.control.voltCommon = 0.0f;
-                    Motor_M0_volt( robot.control.voltCommon );
-                    Motor_M1_volt( robot.control.voltCommon );
-                // --- END ---
-                    // reinitialization
-                    gRobot_State = ROBO_STATE_BALA;
-                    gRobot_Ident = 0U;
-                break;                
-            }                    
-        }
-
+        // ----- 00. IDENT -----
+        Robot_Ident();
+        
         // ----- 10. QUAD -----
-    // GET_DURATION(0);
-        // Update_Quad_0_RH();
-        // Update_Quad_1_LH();
-    // STORE_TIMER6(0);
+        // now in ISR
 
         // ----- 20. READ MPU -----        
         MPU_check();
@@ -691,7 +609,7 @@ int main( void ) {
         // ----- 60. FREE -----
         WS2812B_BattGauge_8LED( robot.power.batt_volt );
         // ----- 70. FREE -----
-        WS2812B_TiltGauge_8LED( gAngle_PITCH_Deg_CF);
+        WS2812B_TiltGauge_8LED( robot.body.pitch_rad );
         // ----- 80. FREE -----
         
         // ----- 90. ANALOG MEASUREMENT -----
@@ -733,40 +651,46 @@ void TIMER_0_INST_IRQHandler()
         gCnt_OuterLoop = TIME_MOTOR_OMEGA_MS;
         gFlg_RUN_OuterLoop = true;
     }
-    // ----- MPU DELAY -----
-    if ( gCnt_Delay_MPU > 0 )
-        --gCnt_Delay_MPU;
-    // ----- READ DATA FROM MPU -----
-    if ( --gCnt_Read_MPU == 0 )
+    // ----- MPU - DELAY -----
+    if ( gCnt_MPU_Delay > 0 )
+        --gCnt_MPU_Delay;
+    // ----- MPU - READ DATA -----
+    // now in ISR
+    // if ( --gCnt_MPU_Read == 0 )
+    // {
+    //     gCnt_MPU_Read = TIME_MPU_READ_MS;
+    //     gFlg_Read_MPU = true;
+    // }
+    // ----- UART - SEND DATA -----
+    if ( --gCnt_UART_Send == 0 )
     {
-        gCnt_Read_MPU = TIME_MPU_READ_MS;
-        gFlg_Read_MPU = true;
-    }
-    // ----- SEND DATA OVER UART -----
-    if ( --gCnt_Send_UART == 0 )
-    {
-        gCnt_Send_UART = TIME_SEND_DATA_MS;
+        gCnt_UART_Send = TIME_SEND_DATA_MS;
         gFlg_Send_UART = true;
     }
-    if ( --gCnt_Read_CRSF == 0 )
+    // ----- RC - READ DATA -----
+    if ( --gCnt_CRSF_Read == 0 )
     {
-        gCnt_Read_CRSF = TIME_CRSF_MS;
+        gCnt_CRSF_Read = TIME_CRSF_MS;
         gFlg_Read_CRSF = true;
     }
-    // COMMUNICATION TIME OUT - motors STOP
+    // ----- COMMUNICATION TIME OUT - motors STOP
     if ( gCnt_Fail_Safe > 0 )
         --gCnt_Fail_Safe;
 }
 
-// Chan 0: VS1(Battery)
-// Chan 1: Current M0
-// Chan 2: Current M1
-// Chan 3: Temp M0
-// Chan 4: Temp M1   
+/****************************************
+*****   TIMER 8 for 0.8ms timing    *****
+****************************************/
+void TIMER_8_INST_IRQHandler(void)
+{
+    gFlg_Read_MPU = true;    // READ DATA FROM MPU
+}
 
 /****************************************
 *****   ADC 0 - MOTOR 1 - TEMP+CURR *****
 ****************************************/
+// Chan 2: Current M1
+// Chan 4: Temp M1   
 void ADC12_0_INST_IRQHandler( void )
 {
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_0_INST ) )
@@ -783,10 +707,12 @@ void ADC12_0_INST_IRQHandler( void )
             break;
     }
 }
-
 /****************************************
 ***** ADC 1 - MOTOR 0 - TEMP+CURR+VS ****
 ****************************************/
+// Chan 0: VS1(Battery)
+// Chan 1: Current M0
+// Chan 3: Temp M0
 void ADC12_1_INST_IRQHandler( void )
 {
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_1_INST ) )
@@ -807,7 +733,6 @@ void ADC12_1_INST_IRQHandler( void )
             break;
     }
 }
-
 /****************************************
 *****   UART 0 TRANSCEIVER          *****
 ****************************************/
@@ -839,7 +764,6 @@ void UART_0_INST_IRQHandler( void )
             break;
     }
 }
-
 /****************************************
 *****   UART 1 TRANSCEIVER          *****
 ****************************************/
@@ -861,7 +785,6 @@ void UART_1_INST_IRQHandler( void )
             break;
     }
 }
-
 /****************************************
 *****   I2C 1 TRANSMITTER          *****
 ****************************************/
@@ -924,25 +847,16 @@ void I2C1_INST_IRQHandler ( void )
             break;
     }
 }
-
-
 /******************************
 *****   GPIO QUAD ABCD    *****
 *******************************/
-// notes:
-    // QUAD_M0_A_IIDX
-    // QUAD_M0_B_IIDX
-    // QUAD_M1_C_IIDX
-    // QUAD_M1_D_IIDX
-
 void GROUP1_IRQHandler(void)
 {
-STORE_TIMER6(0);
+    STORE_TIMER6( 0 );
     // used to select correct ports and pins
     static uint32_t PortIndex;
     static uint32_t PinIndex_M0;
     static uint32_t PinIndex_M1;
-
     // Read all quadrature pins once
     bool A = DL_GPIO_readPins(QUAD_M0_PORT, QUAD_M0_A_PIN);
     bool B = DL_GPIO_readPins(QUAD_M0_PORT, QUAD_M0_B_PIN);
@@ -963,7 +877,6 @@ STORE_TIMER6(0);
             if (A != quad0.A)
             {
                 quad0.A = A;
-                // robot.wheel.right.imp += (A ^ B) ? -1 : +1;
                 robot.motor.right.imp += (A ^ B) ? -1 : +1;
             }
             break;
@@ -972,7 +885,6 @@ STORE_TIMER6(0);
             if (B != quad0.B)
             {
                 quad0.B = B;
-                // robot.wheel.right.imp += (B ^ A) ? +1 : -1;
                 robot.motor.right.imp += (B ^ A) ? +1 : -1;
             }
             break;
@@ -986,7 +898,6 @@ STORE_TIMER6(0);
             if (C != quad0.C)
             {
                 quad0.C = C;
-                //robot.wheel.left.imp += (C ^ D) ? +1 : -1;
                 robot.motor.left.imp += (C ^ D) ? +1 : -1;
             }
             break;
@@ -995,20 +906,19 @@ STORE_TIMER6(0);
             if (D != quad0.D)
             {
                 quad0.D = D;
-                // robot.wheel.left.imp += (D ^ C) ? -1 : +1;
                 robot.motor.left.imp += (D ^ C) ? -1 : +1;
             }
             break;
         }
     }
-GET_DURATION(0);
-uint32_t dt = dt_us[0];
-if (dt==0U) dt_over_us[0]++;
-if (dt==1U) dt_over_us[1]++;
-if (dt==2U) dt_over_us[2]++;
-if (dt==3U) dt_over_us[3]++;
-if (dt==4U) dt_over_us[4]++;
-if (dt>=5U) dt_over_us[5]++;
+    GET_DURATION( 0 );
+    uint32_t dt = dt_us[0];
+    if (dt==0U) dt_over_us[0]++;
+    if (dt==1U) dt_over_us[1]++;
+    if (dt==2U) dt_over_us[2]++;
+    if (dt==3U) dt_over_us[3]++;
+    if (dt==4U) dt_over_us[4]++;
+    if (dt>=5U) dt_over_us[5]++;
 
 }
 
@@ -1022,8 +932,9 @@ if (dt>=5U) dt_over_us[5]++;
 void MCU_Init( void )
 {
     SYSCFG_DL_init();
-    // ***** TIMER 0 - enable interrupt *****
+    // ***** TIMER 0 and 8 - enable interrupt *****
     NVIC_EnableIRQ( TIMER_0_INST_INT_IRQN) ;  // 1ms
+    NVIC_EnableIRQ( TIMER_8_INST_INT_IRQN) ;  // 800us
     // ***** ADC - enable interrupt *****
     NVIC_EnableIRQ( ADC12_0_INST_INT_IRQN );
     NVIC_EnableIRQ( ADC12_1_INST_INT_IRQN );
@@ -1051,89 +962,115 @@ void MCU_Init( void )
     HWL_SET_PWM_DUTY( PHASE_D , 0U );       // MOTOR 1 REVERSING  ( QUAD COUNTER DECREMENT ) - BLUE LED ACTIVE
 }
 
+void    MPU_Init( void )
+{
+    // ----- MPU INIT -----
+    gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
+    while ( gCnt_MPU_Delay > 0U )
+        ;
+
+    if ( MPU_Write_Reg( 0x37 , 0x20 ) != 0 )    // Reg: INT_PIN_CFG , Bit: LATCH_INT_EN = 0
+        gMPU_return[ 0 ]++; 
+    if ( MPU_Write_Reg( 0x38 , 0x01 ) != 0 )    // Reg: INT_ENABLE  , Bit: DATA_RDY_EN = 1
+        gMPU_return[ 1 ]++;   
+    if ( MPU_Write_Reg( 0x6B , 0x00 ) != 0 )    // Reg: PWR_MGMT_1  , Bit: SLEEP = 0
+        gMPU_return[ 2 ]++;
+        
+    gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
+    while ( gCnt_MPU_Delay > 0U )
+        ;
+
+    if ( MPU_Read_Len( 0x37 , 1 ) != 0 ) {      // Reg: INT_PIN_CFG
+        gMPU_return[ 3 ]++;
+        gMPU_Latch_status = 0U;
+    } else {
+        gMPU_Latch_status = gRxPacket[ 0 ];
+    }
+
+    if ( MPU_Read_Len( 0x38 , 1 ) != 0 ) {      // Reg: INT_ENABLE
+        gMPU_return[ 4 ]++;
+        gMPU_Int_En_status = 0U;
+    } else {
+        gMPU_Int_En_status = gRxPacket[ 0 ];
+    }
+
+    if ( MPU_Read_Len( 0x6B , 1 ) != 0 ) {      // Reg: PWR_MGMT_1
+        gMPU_return[ 5 ]++;
+        gMPU_Sleep_status = 0U;
+    } else {
+        gMPU_Sleep_status = gRxPacket[ 0 ];
+    }
+    
+    if ( MPU_Read_Len( 0x75 , 1 ) != 0 ) {      // Reg: WHO_AM_I
+        gMPU_return[ 6 ]++;
+        gMPU_WhoAmI_data = 0U;
+    } else {
+        gMPU_WhoAmI_data = gRxPacket[ 0 ];
+    }
+}
+
 // --------------------------
 // ----- (A) INNER LOOP -----
 // --------------------------
 void PID_Inner_Loop( void )
 {
-    if ( (flg_RUN_InnerLoop) && (gRobot_State == ROBO_STATE_BALA) )
+    if ( (gFlg_RUN_InnerLoop) && (gRobot_State == ROBO_STATE_BALA) )
     {
-STORE_TIMER6(4);
-        flg_RUN_InnerLoop = false;
+// STORE_TIMER6( 4 );
+        gFlg_RUN_InnerLoop = false;
 
         // --- 40.5 Calculate Feed Forward "Direct Drive" ---
-        robot.control.voltFF  = robot.gain.FF * gRC_CMD_Pitch;
-        // gActVal_FeedF_Volt  = gK0_FeedForward * gRC_CMD_Pitch;
-                
+        robot.control.FFterm_V  = robot.gain.FF * gRC_CMD_Pitch;
         // --- 41. Calculate DUMPING "Counter-Force" ---
-        robot.control.voltDamp  = -(robot.gain.D * gRate_Y_Degs);    // If Rate is (+), Result is (-). If Rate is (-), Result is (+).
-        // gActVal_Rates_Volt  = gK1_DynamicDamp * gRate_Y_Degs; 
-        
-        
+        robot.control.KDterm_V  = -(robot.gain.D * robot.body.rateY_rads);    // If Rate is (+), Result is (-). If Rate is (-), Result is (+).
         // --- 43. Calculate Gain from Angle "Spring" ---
-        robot.control.errBalDeg = gAngle_setPoint_deg - gAngle_PITCH_Deg_CF;
-        robot.control.voltBala  = robot.gain.P * gPID_Error_Angle_Deg;
-        // gPID_Error_Angle_Deg= gAngle_setPoint_deg - gAngle_PITCH_Deg_CF;
-        // gActVal_Angle_Volt  = gK2_BalanceAngle * gPID_Error_Angle_Deg;
-                
+        robot.control.Err_Pitch_rad = gPitch_setPoint_deg - robot.body.pitch_rad;
+        robot.control.KPterm_V  = robot.gain.P * robot.control.Err_Pitch_rad;
         // --- 44. Combine ALL Motor terms "Summing Junction" ---
-        robot.control.voltCommon = robot.control.voltFF + 
-                                 robot.control.voltBala + 
-                                 robot.control.voltDamp;
-        // gActVal_Robot_Volt = gActVal_Angle_Volt + gActVal_Rates_Volt + gActVal_FeedF_Volt;
-                
+        robot.control.CMterm_V = robot.control.FFterm_V + 
+                                 robot.control.KDterm_V + 
+                                 robot.control.KPterm_V;
         // --- 45. Motor Voltage Limit ---
-        if ( robot.control.voltCommon > VOLT_MOTOR_LIM_HI ) robot.control.voltCommon = VOLT_MOTOR_LIM_HI;
-        if ( robot.control.voltCommon < -VOLT_MOTOR_LIM_HI ) robot.control.voltCommon = -VOLT_MOTOR_LIM_HI;
-        
-        // if ( gActVal_Robot_Volt > VOLT_MOTOR_LIM_HI ) gActVal_Robot_Volt = VOLT_MOTOR_LIM_HI;
-        // if ( gActVal_Robot_Volt < -VOLT_MOTOR_LIM_HI ) gActVal_Robot_Volt = -VOLT_MOTOR_LIM_HI;
-
+        if ( robot.control.CMterm_V > VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = VOLT_MOTOR_LIM_HI;
+        if ( robot.control.CMterm_V < -VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = -VOLT_MOTOR_LIM_HI;
         // --- 46. Motor mixing ---
-        robot.control.voltMLeft  = robot.control.voltCommon - robot.control.voltTurn;
-        robot.control.voltMRight = robot.control.voltCommon + robot.control.voltTurn;
-
-        robot.motor.left.volt_V  = robot.control.voltMLeft;
-        robot.motor.right.volt_V = robot.control.voltMRight;
-
+        robot.control.MotorLH_V  = robot.control.CMterm_V - robot.control.TIterm_V;
+        robot.control.MotorRH_V  = robot.control.CMterm_V + robot.control.TIterm_V;
+        robot.motor.left.volt_V  = robot.control.MotorLH_V;
+        robot.motor.right.volt_V = robot.control.MotorRH_V;
         // --------------------------
         // ---- 46. MOTOR CONTROL ---
         // --------------------------
-        if ( flg_Motor_EN && !(robot.power.is_low_power) )
-        // if ( flg_Motor_EN && ( gBatt_Volt_EMA > VOLT_BATTERY_MIN ) )
+        if ( gFlg_Motor_EN && !(robot.power.is_low_power) )
         {
             // --- Positive Angle with Hysteresis ---
             if ( robot.body.pitch_rad > +ANGLE_LIM_BODY_DEG + ANGLE_LIM_HYST_DEG )
-            // if ( gAngle_PITCH_Deg_CF > +ANGLE_LIM_BODY_DEG + ANGLE_LIM_HYST_DEG )
             {
                 // Motors OFF - Robot falling
-                Motor_M0_volt( 0.0f );
-                Motor_M1_volt( 0.0f );
+                Motor0_RH_volt( 0.0f );
+                Motor1_LH_volt( 0.0f );
             } else
                 // --- Negative Angle with Hysteresis ---
                 if ( gAngle_PITCH_Deg_CF < -ANGLE_LIM_BODY_DEG - ANGLE_LIM_HYST_DEG )
                 {
                     // Motors OFF - Robot falling
-                    Motor_M0_volt( 0.0f );
-                    Motor_M1_volt( 0.0f );
+                    Motor0_RH_volt( 0.0f );
+                    Motor1_LH_volt( 0.0f );
                 } else
                     // --- Angle in Range ---
                     if ( ( gAngle_PITCH_Deg_CF < +ANGLE_LIM_BODY_DEG ) &&
                          ( gAngle_PITCH_Deg_CF > -ANGLE_LIM_BODY_DEG )
                         )            
                     {
-                        // --- Standard mixing ---
-                        // gMotor_RH_Volt = gActVal_Robot_Volt + gActVal_TurnRH_Volt;
-                        // gMotor_LH_Volt = gActVal_Robot_Volt + gActVal_TurnLH_Volt;
                         // --- Output ---
-                        // Motor_M0_volt(gMotor_LH_Volt);
-                        // Motor_M1_volt(gMotor_RH_Volt);
+                        Motor0_RH_volt( robot.control.MotorRH_V );
+                        Motor1_LH_volt( robot.control.MotorLH_V );
                     }
         } else {
-            Motor_M0_volt( 0.0f );
-            Motor_M1_volt( 0.0f );
+            Motor0_RH_volt( 0.0f );
+            Motor1_LH_volt( 0.0f );
         }
-GET_DURATION(4);    
+// GET_DURATION( 4 );    
     }
 }
 
@@ -1144,7 +1081,7 @@ void PID_Outer_Loop( void )
 {
     if ( gFlg_RUN_OuterLoop )
     {
-STORE_TIMER6(3);
+// STORE_TIMER6( 3 );
         gFlg_RUN_OuterLoop = false;
 
         // --- 310. Calculate Motor: Angle [rad], Rate [rad/s] and Wheel: Position [m] and Speed [m/s] ---
@@ -1174,7 +1111,7 @@ STORE_TIMER6(3);
         // gSpeed_error_msec    = gSpeed_setPoint_msec - gSpeed_msec;
         // gSpeed_ActVal_deg    = gSpeed_error_msec * gSpeed_Gain;     // [deg] = [m/sec] * [deg/m/sec]
         
-GET_DURATION(3);    
+// GET_DURATION( 3 );    
     }
 }
 
@@ -1200,31 +1137,31 @@ void    CSFR_check ( void )
             float a = (y2 - y1) / (x2 - x1);
             float b = y1 - (a * x1);
             // --- apply new gains ---
-            gK0_FeedForward  = K0_FEEDFOR_DEF * ( ( a * (float)RC_channels[ 4 ] ) + b ) * ( ( a * (float)RC_channels[ 7 ] ) + b );
-            gK2_BalanceAngle = K2_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
-            gK1_DynamicDamp  = K1_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
+            // gK0_FeedForward  = K0_FEEDFOR_DEF * ( ( a * (float)RC_channels[ 4 ] ) + b ) * ( ( a * (float)RC_channels[ 7 ] ) + b );
+            // gK2_BalanceAngle = K2_BALANCE_DEF * ( ( a * (float)RC_channels[ 5 ] ) + b );
+            // gK1_DynamicDamp  = K1_DAMPIMG_DEF * ( ( a * (float)RC_channels[ 6 ] ) + b );
 
             // ROLL is actually used as YAW/TURN command
-            gActVal_TurnRH_Volt    = gK3_Turn_Gain_RH * gRC_CMD_Roll;
-            gActVal_TurnLH_Volt    = gK4_Turn_Gain_LH * gRC_CMD_Roll;
+            // gActVal_TurnRH_Volt    = gK3_Turn_Gain_RH * gRC_CMD_Roll;
+            // gActVal_TurnLH_Volt    = gK4_Turn_Gain_LH * gRC_CMD_Roll;
             
-            if ( gActVal_TurnRH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = VOLT_MOTOR_LIM_LO;
-            if ( gActVal_TurnRH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = -VOLT_MOTOR_LIM_LO;
-            if ( gActVal_TurnLH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = VOLT_MOTOR_LIM_LO;
-            if ( gActVal_TurnLH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = -VOLT_MOTOR_LIM_LO;
+            // if ( gActVal_TurnRH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = VOLT_MOTOR_LIM_LO;
+            // if ( gActVal_TurnRH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnRH_Volt = -VOLT_MOTOR_LIM_LO;
+            // if ( gActVal_TurnLH_Volt > VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = VOLT_MOTOR_LIM_LO;
+            // if ( gActVal_TurnLH_Volt < -VOLT_MOTOR_LIM_LO ) gActVal_TurnLH_Volt = -VOLT_MOTOR_LIM_LO;
             // gTurn_SetPoint_Rad += 0.015f*RC_roll; // integrate
 
             // PITCH
-            gAngle_setPoint_deg = -0.50f*gRC_CMD_Pitch;
+            gPitch_setPoint_deg = -0.50f*gRC_CMD_Pitch;
             #define PITCH_ANGLE_LIMIT (25.0f)
-            if ( gAngle_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg =  PITCH_ANGLE_LIMIT; }
-            if ( gAngle_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gAngle_setPoint_deg = -PITCH_ANGLE_LIMIT; }
+            if ( gPitch_setPoint_deg >  PITCH_ANGLE_LIMIT ) { gPitch_setPoint_deg =  PITCH_ANGLE_LIMIT; }
+            if ( gPitch_setPoint_deg < -PITCH_ANGLE_LIMIT ) { gPitch_setPoint_deg = -PITCH_ANGLE_LIMIT; }
             
         }
         else
         {
             // default
-            gAngle_setPoint_deg = gAngle_setPoint_deg * 0.9f; // exp decay
+            gPitch_setPoint_deg = gPitch_setPoint_deg * 0.9f; // exp decay
             gRC_CMD_Roll = 0;
             gRC_CMD_Pitch = 0;
         }
@@ -1235,7 +1172,7 @@ void    CSFR_check ( void )
 *****   MOTOR VOLTAGE   *****
 *****************************/
 
-void Motor_M0_volt( float argVoltM0 )
+void Motor0_RH_volt( float argVoltM0 )
 {
     static int8_t m0_state = 0;   // -1 = reverse, 0 = stop, +1 = forward
     uint16_t pwm_uint_value_M0 = 0U;
@@ -1290,7 +1227,7 @@ void Motor_M0_volt( float argVoltM0 )
     }
 }
 
-void Motor_M1_volt( float argVoltM1 )
+void Motor1_LH_volt( float argVoltM1 )
 {
     static int8_t m1_state = 0;   // -1 = reverse, 0 = stop, +1 = forward
     uint16_t pwm_uint_value_M1 = 0U;
@@ -1435,44 +1372,16 @@ void ADC_check( void )
             // >> BATTERY <<
             if ( i == 0 ) {
                 Robot_GetBatteryVoltage( (power_t *)&robot.power , gADC_LSB[0] );
-                // gBatt_Volt       = VOLT_SCHTKY_DROP + ADC_Volt[ 0 ] * 11.0f;      // 11 => divider ( 4k7 + 47k ) / 4k7
-                // gBatt_Volt_EMA   = gBETA_EMA_Coef * gBatt_Volt + (1.0f-gBETA_EMA_Coef) * gBatt_Volt_EMA;   // Exponential Moving Average
-                // // Filtered Battery voltage store to main Robot structure
-                // robot.power.batt_volt = gBatt_Volt_EMA;
-                // // Battery low power detection
-                // if ( robot.power.batt_volt > VOLT_BATTERY_MIN + 0.15f ) 
-                //     robot.power.is_low_power = false;
-                // else if ( robot.power.batt_volt < VOLT_BATTERY_MIN )
-                //     robot.power.is_low_power = true;
             }
 
             // >> MOTORS  <<            
             // Motor 0
             if ( i == 1 ) {
                 Robot_GetMotorCurrent( &robot.motor.right , gADC_LSB[1] );
-                // // MEDIAN of 3 - current spike elimination
-                // ADC_LSB_M0_X = ADC_LSB_M0_Y;
-                // ADC_LSB_M0_Y = ADC_LSB_M0_Z;
-                // ADC_LSB_M0_Z = gADC_LSB[ 1 ];
-                // ADC_LSB_M0_MED3 = Filter_Median3( ADC_LSB_M0_X , ADC_LSB_M0_Y , ADC_LSB_M0_Z );
-                // gM0_RH_Curr_mA      = 1000.0f * ( ADC_Volt[ 1 ] ) / ( 0.033f * 20.0f );
-                // gM0_RH_Curr_mA_Med  = 1000.0f * ( (float)ADC_LSB_M0_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
-                // gM0_RH_Curr_mA_EMA  = gZETA_EMA_Coef * gM0_RH_Curr_mA_Med + (1.0f-gZETA_EMA_Coef) * gM0_RH_Curr_mA_EMA;
-                
-                // robot.motor.right.curr_A = gM0_RH_Curr_mA_EMA / 1000.0f;
             }
             // Motor 1
             if ( i == 2 ) { 
                 Robot_GetMotorCurrent( &robot.motor.left , gADC_LSB[2] );
-                // // MEDIAN of 3 - current spike elimination
-                // ADC_LSB_M1_X = ADC_LSB_M1_Y;
-                // ADC_LSB_M1_Y = ADC_LSB_M1_Z;
-                // ADC_LSB_M1_Z = gADC_LSB[ 2 ];
-                // ADC_LSB_M1_MED3 = Filter_Median3( ADC_LSB_M1_X , ADC_LSB_M1_Y , ADC_LSB_M1_Z );
-                // gM1_LH_Curr_mA      = 1000.0f * ( ADC_Volt[ 2 ] ) / ( 0.033f * 20.0f );
-                // gM1_LH_Curr_mA_Med  = 1000.0f * ( (float)ADC_LSB_M1_MED3 * VOLT_ADC_REF / 4096.0f ) / ( 0.033f * 20.0f );
-                // gM1_LH_Curr_mA_EMA  = gZETA_EMA_Coef * gM1_LH_Curr_mA_Med + (1.0f-gZETA_EMA_Coef) * gM1_LH_Curr_mA_EMA;
-                // robot.motor.left.curr_A = gM1_LH_Curr_mA_EMA / 1000.0f;
             }
         }
     }
@@ -1482,7 +1391,6 @@ void UART_check( void )
 {
     // ----- COMMAND RECEIVED CHECK -----
     if ( gFlg_UART0_terminator_detected ) {
-STORE_TIMER6(5);
             
         gFlg_UART0_terminator_detected = false;
 
@@ -1490,12 +1398,12 @@ STORE_TIMER6(5);
         checkForCommand2();
 
         clearUART0_RXbuffer_Zero();   
-GET_DURATION(5);
+
     }
     // ----- SEND DATA OVER UART -----
     if ( gFlg_Send_UART && gFlg_Log_Enable )
     {
-STORE_TIMER6(6);
+STORE_TIMER6( 6 );
         gFlg_Send_UART = false;
 
         switch ( gRobot_State )
@@ -1505,19 +1413,19 @@ STORE_TIMER6(6);
                 break;
             // ----- REGULATION ------    
             case ROBO_STATE_BALA:                    
-                UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
-                UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
+                // UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
+                // UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
                 // UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
                 // UART0_signals[  3 ] = 100.0f * PID_P_term_volt;         // P volt
                 // UART0_signals[  4 ] = 100.0f * PID_I_term_volt;         // I volt
                 // UART0_signals[  5 ] = 100.0f * PID_D_term_volt;         // D volt
                 // UART0_signals[  6 ] = 100.0f * PID_C_LHRH_volt;         // C volt
-                UART0_signals[  7 ] = 100.0f * gActVal_Rates_Volt ;         // G volt
+                // UART0_signals[  7 ] = 100.0f * gActVal_Rates_Volt ;         // G volt
 
-                UART0_signals[  8 ] = 1.000f * gM0_RH_Curr_mA;          // raw Motor I
-                UART0_signals[  9 ] = 1.000f * gM0_RH_Curr_mA_EMA;      // filtered Motor I
-                UART0_signals[ 10 ] = 1.000f * gM1_LH_Curr_mA;          // raw Motor I
-                UART0_signals[ 11 ] = 1.000f * gM1_LH_Curr_mA_EMA;      // filtered Motor I
+                // UART0_signals[  8 ] = 1.000f * gM0_RH_Curr_mA;          // raw Motor I
+                // UART0_signals[  9 ] = 1.000f * gM0_RH_Curr_mA_EMA;      // filtered Motor I
+                // UART0_signals[ 10 ] = 1.000f * gM1_LH_Curr_mA;          // raw Motor I
+                // UART0_signals[ 11 ] = 1.000f * gM1_LH_Curr_mA_EMA;      // filtered Motor I
                 // UART0_signals[ 12 ] = 100.0f * Motor0_theta_rad;        // motor shaft angle
                 // UART0_signals[ 13 ] = 100.0f * Motor1_theta_rad;        // motor shaft angle
                 // UART0_signals[ 14 ] = 100.0f * Motor0_omega_rads;       // motor speed
@@ -1528,12 +1436,12 @@ STORE_TIMER6(6);
                 // UART0_signals[ 18 ] = 100.0f * D_0_gain;                  // D gain
                 // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
                 // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
-                UART0_signals[ 21 ] = 100.0f * gK1_DynamicDamp;                  // G damping - gyro
+                // UART0_signals[ 21 ] = 100.0f * gK1_DynamicDamp;                  // G damping - gyro
                 UART0_signals[ 22 ] = 100.0f * gALPHA_CF_Coef;            // Alpha coef. for complementary filter Acc+Gyro
                 UART0_signals[ 23 ] = 100.0f * gCURR_EMA_Coef;           // Zeta coef. for Exponencial
 
-                UART0_signals[ 24 ] = 100.0f * robot.power.batt_volt;           // Filtered battery voltage
-                UART0_signals[ 25 ] = 100.0f * gMPU_Temp_C;              // temperature of MPU
+                UART0_signals[ 24 ] = 100.0f * robot.power.batt_volt;   // Filtered battery voltage
+                UART0_signals[ 25 ] = 100.0f * robot.body.temp_C;       // temperature of MPU
                 UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
                 UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
 
@@ -1548,7 +1456,7 @@ STORE_TIMER6(6);
             // ----- IDENTIFICATION ------
             case ROBO_STATE_IDENT:
                 UART0_signals[ 0 ] = gCnt_Sample++;
-                UART0_signals[ 1 ] = robot.control.voltCommon;
+                UART0_signals[ 1 ] = robot.control.CMterm_V;
                 UART0_signals[ 2 ] = robot.motor.left.imp;
                 UART0_signals[ 3 ] = robot.motor.right.imp;
                 UART0_signals[ 4 ] = 1000.0f * robot.motor.left.curr_A;
@@ -1559,7 +1467,7 @@ STORE_TIMER6(6);
             case ROBO_STATE_NOK:
                 break;
         } 
-GET_DURATION(6);
+GET_DURATION( 6 );
     }
 }
 
@@ -1628,7 +1536,7 @@ bool checkForGainCommand( void )
                         case 'G':
                             G_Gain_received = value;
                             if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
+                                // gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
                             }
                             break;    
                         case 'A':
@@ -1700,7 +1608,7 @@ bool checkForCommand2( void )
                                   break;
                         case 'G': G_Gain_received=value;
                                   if(value>=0 && value<=2000)
-                                      gK1_DynamicDamp=(float)value/100.0f;
+                                    //   gK1_DynamicDamp=(float)value/100.0f;
                                   break;
                         case 'A': A_Filt_received=value;
                                   if(value>=0 && value<=100)
@@ -1963,77 +1871,15 @@ void HWL_SET_PWM_DUTY( uint8_t argPhase , uint16_t argDuty )
 // *****     MPU GYRO ACCELEROMETER    *****  *****     MPU GYRO ACCELEROMETER    *****  *****     MPU GYRO ACCELEROMETER    *****
 // *****************************************  *****************************************  *****************************************
 
-void MPU_check ( void )
-{
-    // ----- READ MPU DATA -----        
-    if ( gFlg_Read_MPU && ( gCnt_Delay_MPU==0 ) )
-    {
-STORE_TIMER6(2);
-        gFlg_Read_MPU = false;     
-    
-        switch ( MPU_switch )
-        {
-            case 0:
-                MPU_ExitSleep_Return = MPU_ExitSleep();
-                if (  MPU_ExitSleep_Return == 0 ) {
-                    MPU_switch = 1;
-                    gLED_Seq_Now = LED_SEQUENCE_2;
-                    MPU_switch_transition_cnt++;
-                } else {
-                    MPU_switch = 0;
-                    flg_Motor_EN = false;
-                    gLED_Seq_Now = LED_SEQUENCE_1;
-                    er_ct[0]++;
-                }
-                break;
-            case 1:
-                MPU_WhoAmI_data = 0x00;
-                MPU_WhoAmI_Return = MPU_WhoAmI();   // takes ~105us @400kHz
-                if ( MPU_WhoAmI_Return == 0 ) {
-                    if ( MPU_WhoAmI_data == 104 ) {
-                        MPU_switch = 2;
-                        flg_Motor_EN = true;
-                        gLED_Seq_Now = LED_SEQUENCE_3;
-                        MPU_switch_transition_cnt++;
-                    } else {
-                        MPU_switch = 0;
-                        flg_Motor_EN = false;
-                        gLED_Seq_Now = LED_SEQUENCE_1;
-                        er_ct[1]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
-                    }
-                } else {
-                    MPU_switch = 0;
-                    flg_Motor_EN = false;
-                    gLED_Seq_Now = LED_SEQUENCE_1;
-                    er_ct[2]++;
-                }
-                break;
-            case 2:      
-                MPU_GetAccTempGyro_Return = MPU_GetAccTempGyro();   // takes ~410us @400kHz
-                if ( MPU_GetAccTempGyro_Return != 0 ) { 
-                    MPU_switch = 0;
-                    flg_Motor_EN = false;
-                    gLED_Seq_Now = LED_SEQUENCE_1;
-                    er_ct[3]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
-                }
-
-                break;
-            default:
-                MPU_switch = 0;
-                gLED_Seq_Now = LED_SEQUENCE_1;
-                er_ct[4]++;
-                break;
-        }
-GET_DURATION(2);
-    }
-}
-
-uint16_t MPU_ExitSleep( void )
+            // ************************************
+            // *****   MPU WRITE REGISTER     *****
+            // ************************************
+uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA )
 {
     gI2cControllerStatus = I2C_STATUS_IDLE;
     gTxLen = 2;
-    gTxPacket[ 0 ] = 0x6B;  // PWM_MGMT1 register
-    gTxPacket[ 1 ] = 0x00;  // Exit Sleep    
+    gTxPacket[ 0 ] = argREG;
+    gTxPacket[ 1 ] = argDATA;
 
     I2C_Flag_Block = 0;
 
@@ -2041,44 +1887,55 @@ uint16_t MPU_ExitSleep( void )
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
 
     // Enable TXFIFO trigger interrupt if there are more bytes to send
-    if ( gTxCount < gTxLen )
-    {
-        DL_I2C_enableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    } else {
-        DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    }
-
-    // Send the packet to the controller. This function will send Start + Stop automatically.
+    if ( gTxCount < gTxLen ) DL_I2C_enableInterrupt ( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
+        else                 DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
+    
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
 
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - observation: stays at 1004U - CONTROLLER IDLE
+    for ( I2C_Anti_Block = 1004U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_ct[ 5 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[5]++;
-    }
-    // Send data to Slave - Write (0)
+    ab_wr_ct[ 0 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+    
+    // SEND DATA TO SLAVE - WRITE (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
- 
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    
+    // CODE FROM MSPM0 ACADEMY - updated for Anti Block system
+    // ANTIBLOCK - observation: stays at 1003U - STATUS TX COMPLETED
+    for ( I2C_Anti_Block = 1003U ; ( gI2cControllerStatus==I2C_STATUS_TX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_ct[ 6 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[6]++;
-    }
+    ab_wr_ct[ 1 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // CODE FROM MSPM0 ACADEMY - updated for Anti Block system
+    // ANTIBLOCK - observation: stays 1002U - BUS NOT BUSY
+    for ( I2C_Anti_Block = 1002U ; ( ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_wr_ct[ 2 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // ANTIBLOCK - observation: drop to ~666-674U - CONTROLLER IS BUSSY
+    for ( I2C_Anti_Block = 1001U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_wr_ct[ 3 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     return I2C_Flag_Block;
 }
 
-uint16_t MPU_WhoAmI( void )
+            // ********************************
+            // ***** MPU READ DATA LENGTH *****
+            // ********************************
+uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
 {
     gI2cControllerStatus = I2C_STATUS_IDLE;
     gTxLen = 1;
-    gTxPacket[ 0 ] = 0x75;  // WHO_AM_I register 
+    gTxPacket[ 0 ] = argREG;
 
     I2C_Flag_Block = 0;
 
@@ -2086,242 +1943,312 @@ uint16_t MPU_WhoAmI( void )
     gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
  
     // Enable TXFIFO trigger interrupt if there are more bytes to send
-    if ( gTxCount < gTxLen )
-    {
-        DL_I2C_enableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    } else {
-        DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    }
+    if ( gTxCount < gTxLen ) DL_I2C_enableInterrupt ( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
+        else                 DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
 
-    // Send the packet to the controller. This function will send Start + Stop automatically.
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
  
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - observation: stays at 1009U - CONTROLLER NOT BUSSY
+    // ANTIBLOCK - observation: time-to-time drops to ~804U-810U - CONTROLLER IS BUSSY? - 2026-01-24 12:30
+    for ( I2C_Anti_Block = 1009U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_ct[ 7 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[7]++;
-    }
+    ab_rl_ct[ 0 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
   
-    // Send data to Slave - Write (0)
+    // SEND DATA TO SLAVE - WRITE (0)
     DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
-    
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 8 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[8]++;
-    }
 
-    // ANTIBLOCK - count down to 994
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // CODE FROM MSPM0 ACADEMY - updated for Anti Block system
+    // ANTIBLOCK - observation: stays at 1008U - STATUS TX COMPLETED
+    for ( I2C_Anti_Block = 1008U ; ( gI2cControllerStatus==I2C_STATUS_TX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_ct[ 9 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[9]++;
-    }
+    ab_rl_ct[ 1 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // CODE FROM MSPM0 ACADEMY - updated for Anti Block system
+    // ANTIBLOCK - observation: stays 1007U - BUS NOT BUSY
+    for ( I2C_Anti_Block = 1007U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 2 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
     
-    // ANTIBLOCK - countdown to 768
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+    // ANTIBLOCK - observation: drops to ~768-784U - CONTROLLER IS BUSSY
+    for ( I2C_Anti_Block = 1006U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_ct[ 10 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[10]++;
-    }
+    ab_rl_ct[ 3 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // ANTIBLOCK - count down to 1005U - I2C BUS NOT OCCUPIED - !!! 2024-01-24 09:40 ERRORS OCCOURS HERE - SOLVED - Condition wrongly Negated
+    for ( I2C_Anti_Block = 1005U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 4 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+    
+    // ANTIBLOCK - countdown to 1004U - CONTROLLER IDLE
+    for ( I2C_Anti_Block = 1004U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 5 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     //----- REPEAT START -----
 
     // Send a read request to Target
-    gRxLen               = 1;
+    gRxLen               = argDataLen;
     gRxCount             = 0;
     gI2cControllerStatus = I2C_STATUS_RX_STARTED;
-    // Send data to Slave - Request to read (1)
-    DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
 
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 11 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[11]++;
-    }
+    // SEND DATA TO SLAVE - REQUEST TO READ (1)
+    DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
     
-    MPU_WhoAmI_data = gRxPacket[ 0 ];	// read one byte
+    // ANTIBLOCK - observation: stays at 1003U - I2C BUS NOT OCCUPIED
+    for ( I2C_Anti_Block = 1003U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 6 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // ANTIBLOCK - observation: stays at 1002U - STATUS RX COMPLETED
+    for ( I2C_Anti_Block = 1002U ; ( gI2cControllerStatus==I2C_STATUS_RX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 7 ] = I2C_Anti_Block;
+
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
+
+    // ANTIBLOCK - countdown from 1001U to ~778U-784U for 2 bytes - CONTROLLER IDLE
+    // ANTIBLOCK - countdown from 1001U to ~307U-312U for 6 bytes - CONTROLLER IDLE
+    // ANTIBLOCK - countdown from 2001U to ~602U-606U for 14 bytes - CONTROLLER IDLE
+    for ( I2C_Anti_Block = 2001U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
+	    ;
+    ab_rl_ct[ 8 ] = I2C_Anti_Block;
+    
+    if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     return I2C_Flag_Block;
 }
 
-uint16_t MPU_GetAccTempGyro( void )
+bool MPU_UAV_Calculation ( void )
 {
-// ACCEL_XOUT_H
-    gI2cControllerStatus = I2C_STATUS_IDLE;
-    gTxLen = 1;
-    gTxPacket[ 0 ] = 0x3B;  // ACCEL_XOUT_H
+    uint8_t argOffset = 1U; // 0 there is status byte
 
-    I2C_Flag_Block = 0;
+    gMPU_accX_raw =  (uint16_t)gRxPacket[ 0U + argOffset ] << 8;	// read High byte
+    gMPU_accX_raw += (uint16_t)gRxPacket[ 1U + argOffset ];
+    gMPU_accX = gMPU_accX_raw - gMPU_accX_offset;
 
-    // Fill the FIFO. The FIFO is 8-bytes deep, and this function will return number of bytes written to FIFO
-    gTxCount = DL_I2C_fillControllerTXFIFO( I2C1_INST , &gTxPacket[ 0 ] , gTxLen );
- 
-    // Enable TXFIFO trigger interrupt if there are more bytes to send
-    if ( gTxCount < gTxLen )
-    {
-        DL_I2C_enableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    } else {
-        DL_I2C_disableInterrupt( I2C1_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER );
-    }
+    gMPU_accY_raw =  (uint16_t)gRxPacket[ 2U + argOffset ] << 8;	// read High byte
+    gMPU_accY_raw += (uint16_t)gRxPacket[ 3U + argOffset ];
+    gMPU_accY = gMPU_accY_raw - gMPU_accY_offset;
+
+    gMPU_accZ_raw =  (uint16_t)gRxPacket[ 4U + argOffset ] << 8;	// read High byte
+    gMPU_accZ_raw += (uint16_t)gRxPacket[ 5U + argOffset ];
+    gMPU_accZ = gMPU_accZ_raw - gMPU_accZ_offset;
+
+    gMPU_temp =  (uint16_t)gRxPacket[ 6U + argOffset ] << 8;	// read High byte
+    gMPU_temp += (uint16_t)gRxPacket[ 7U + argOffset ];
+
+    gMPU_gyroX_raw =  (uint16_t)gRxPacket[ 8U + argOffset ] << 8;	// read High byte
+    gMPU_gyroX_raw += (uint16_t)gRxPacket[ 9U + argOffset ];
+    gMPU_gyroX = gMPU_gyroX_raw - gMPU_gyroX_offset;
+
+    gMPU_gyroY_raw =  (uint16_t)gRxPacket[ 10U + argOffset ] << 8;	// read High byte
+    gMPU_gyroY_raw += (uint16_t)gRxPacket[ 11U + argOffset ];
+    gMPU_gyroY = gMPU_gyroY_raw - gMPU_gyroY_offset;
+
+    gMPU_gyroZ_raw =  (uint16_t)gRxPacket[ 12U + argOffset ] << 8;	// read High byte
+    gMPU_gyroZ_raw += (uint16_t)gRxPacket[ 13U + argOffset ];
+    gMPU_gyroZ = gMPU_gyroZ_raw - gMPU_gyroZ_offset;
+
+STORE_TIMER6( 2 );
+    gMPU_accX_g_iq = _IQdiv( _IQ( gMPU_accX ) , _IQ( 16384.0f ) );
+    gMPU_accY_g_iq = _IQdiv( _IQ( gMPU_accY ) , _IQ( 16384.0f ) );
+    gMPU_accZ_g_iq = _IQdiv( _IQ( gMPU_accZ ) , _IQ( 16384.0f ) );
+    gMPU_temp_C_iq = _IQdiv( _IQ( gMPU_temp ) , _IQ( 340.000f ) ) + _IQ(36.53f); // this 4 lines approx. ~3-4 us
     
-    // Send the packet to the controller. This function will send Start + Stop automatically.
-    gI2cControllerStatus = I2C_STATUS_TX_STARTED;
+    robot.body.accX_g = _IQtoF( gMPU_accX_g_iq );
+    robot.body.accY_g = _IQtoF( gMPU_accY_g_iq );
+    robot.body.accZ_g = _IQtoF( gMPU_accZ_g_iq );
+    robot.body.temp_C = _IQtoF( gMPU_temp_C_iq );// all 8 lines approx. ~9-10 us
+GET_DURATION( 2 );
 
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 13 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[13]++;
-    }
-
-    // Send data to Slave - Write (0)
-    DL_I2C_startControllerTransfer( I2C1_INST , MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen );
+STORE_TIMER6( 3 );
+    gRate_X_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroX ) , TIME_MPU_READ_S_IQ ) , _IQ( 131.0f ) ) );
+    gRate_Y_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroY ) , TIME_MPU_READ_S_IQ ) , _IQ(-131.0f ) ) );// it seems this axis is reversed
+    gRate_Z_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroZ ) , TIME_MPU_READ_S_IQ ) , _IQ( 131.0f ) ) );
     
-    // ANTIBLOCK - stays at 1000
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 14 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[14]++;
-    }
+    robot.body.rateX_rads = _IQtoF( gRate_X_rads_iq );
+    robot.body.rateY_rads  = _IQtoF( gRate_Y_rads_iq );
+    robot.body.rateZ_rads   = _IQtoF( gRate_Z_rads_iq );    // all 6 lines approx. ~10-11 us
+GET_DURATION( 3 );
+    // ********** TRIGINOMETRY **********
+    // https://www.analog.com/en/resources/app-notes/an-1057.html
+STORE_TIMER6( 4 );
+    gAngle_PITCH_rad_iq = _IQatan2( gMPU_accX_g_iq , 
+                                    _IQsqrt( _IQmpy( gMPU_accY_g_iq , gMPU_accY_g_iq ) + _IQmpy( gMPU_accZ_g_iq , gMPU_accZ_g_iq ) ) );
+    gAngle_ROLL_rad_iq  = _IQatan2( gMPU_accY_g_iq , 
+                                    _IQsqrt( _IQmpy( gMPU_accX_g_iq , gMPU_accX_g_iq ) + _IQmpy( gMPU_accZ_g_iq , gMPU_accZ_g_iq ) ) );
+    gAngle_YAW_rad_iq   = _IQatan2( _IQsqrt( _IQ8mpy( gMPU_accX_g_iq , gMPU_accX_g_iq ) + _IQmpy( gMPU_accY_g_iq , gMPU_accY_g_iq ) ) ,
+                                    gMPU_accZ_g_iq ); // this three atan2s approx. 17-18us
+GET_DURATION( 4 );
+    // ********** COMPLEMENTARY FILTER **********
+    // https://www.hackster.io/hibit/complementary-filter-and-relative-orientation-with-mpu9250-d4f79d
+    // pitch = (1 - α) * (pitch + gyroscope_x * dt) + α * accelerometer_x
+STORE_TIMER6( 5 );	
+    gAngle_PITCH_rad_CoFil_iq = _IQmpy( ONE_ALPHA_IQ ,( gAngle_PITCH_rad_N_1_iq + gRate_Y_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_PITCH_rad_iq );
+    gAngle_ROLL_rad_CoFil_iq  = _IQmpy( ONE_ALPHA_IQ , ( gAngle_ROLL_rad_N_1_iq  + gRate_X_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_ROLL_rad_iq );
+    gAngle_YAW_rad_CoFil_iq   = _IQmpy( ONE_ALPHA_IQ , ( gAngle_YAW_rad_N_1_iq   + gRate_Z_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_YAW_rad_iq );
 
-    // ANTIBLOCK - count down to 994
-    for ( I2C_Anti_Block = 8000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 15 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[15]++;// ----- >>>>> ERROR OFTEN HERE <<<<< ----- 2025-11-25 17:22
-    }
+    gAngle_PITCH_rad_N_1_iq = gAngle_PITCH_rad_CoFil_iq;
+    gAngle_ROLL_rad_N_1_iq  = gAngle_ROLL_rad_CoFil_iq;
+    gAngle_YAW_rad_N_1_iq   = gAngle_YAW_rad_CoFil_iq;
 
-    // ANTIBLOCK - count down to 768
-    for ( I2C_Anti_Block = 1000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 16 ] = I2C_Anti_Block;
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[16]++;
-    }
-
-    //----- REPEAT START -----
-    // Send a read request to Target
-    gRxLen               = 14;
-    gRxCount             = 0;
-    gI2cControllerStatus = I2C_STATUS_RX_STARTED;
-    // Send data to Slave - Request to read (14 bytes - 2*(ACCx+ACCy+ACCz+GYROx+GYROy+GYROz+TEMP))
-    DL_I2C_startControllerTransfer( I2C1_INST, MPU_ADDRESS , DL_I2C_CONTROLLER_DIRECTION_RX , gRxLen );
-
-// t0_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST);
-    // ANTIBLOCK - count down to 8549 -> this takes 366us
-    for ( I2C_Anti_Block = 10000U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
-	    ;
-    ab_ct[ 17 ] = I2C_Anti_Block;
-// dt_us[0] = (uint16_t)DL_TimerG_getTimerCount(TIMER_6_INST) - t0_us[0];
-
-    if ( I2C_Anti_Block == 0 ) {
-        I2C_Flag_Block++;
-        er_ct[17]++;
-    }
-
-    MPU_accX_raw = (int16_t)gRxPacket[ 0 ] << 8;	// read High byte
-    MPU_accX_raw += (int16_t)gRxPacket[ 1 ];
-    MPU_accX = MPU_accX_raw - gMPU_AccX_offset;
-
-    MPU_accY_raw = (uint16_t)gRxPacket[ 2 ] << 8;	// read High byte
-    MPU_accY_raw += gRxPacket[ 3 ];
-    MPU_accY = MPU_accY_raw - gMPU_AccY_offset;
-
-    MPU_accZ_raw = (uint16_t)gRxPacket[ 4 ] << 8;	// read High byte
-    MPU_accZ_raw += gRxPacket[ 5 ];
-    MPU_accZ = MPU_accZ_raw - gMPU_AccZ_offset;
-
-    MPU_temp = (uint16_t)gRxPacket[ 6 ] << 8;	// read High byte
-    MPU_temp += gRxPacket[ 7 ];
-
-    gMPU_AccX_g = MPU_accX / 16384.0f; //
-    gMPU_AccY_g = MPU_accY / 16384.0f; //
-    gMPU_AccZ_g = MPU_accZ / 16384.0f; // this three lines takes 50us
-
-// TRIGINOMETRY USED TO DETERMINE ANGLES - theta, psi, phi
-// https://www.analog.com/en/resources/app-notes/an-1057.html
-
-    gAngle_PITCH_Deg = RAD_TO_DEG * atan2( gMPU_AccX_g , ( sqrt( gMPU_AccY_g*gMPU_AccY_g + gMPU_AccZ_g*gMPU_AccZ_g ) ) ); //
-    gAngle_ROLL_Deg  = RAD_TO_DEG * atan2( gMPU_AccY_g , ( sqrt( gMPU_AccX_g*gMPU_AccX_g + gMPU_AccZ_g*gMPU_AccZ_g ) ) ); //
-    gAngle_YAW_Deg   = RAD_TO_DEG * atan2( ( sqrt( gMPU_AccX_g*gMPU_AccX_g + gMPU_AccY_g*gMPU_AccY_g ) ) , gMPU_AccZ_g ); //  this three lines takes 1.1ms@32MHz !!! 450us@80MHz
-
-    gMPU_Temp_C = MPU_temp / 340.0f + 36.53f;  // 40us
-
-    MPU_gyroX_raw = (uint16_t)gRxPacket[ 8 ] << 8;	// read High byte
-    MPU_gyroX_raw += gRxPacket[ 9 ];
-    MPU_gyroX = MPU_gyroX_raw - gMPU_GyroX_offset;
-
-    MPU_gyroY_raw = (uint16_t)gRxPacket[ 10 ] << 8;	// read High byte
-    MPU_gyroY_raw += gRxPacket[ 11 ];
-    MPU_gyroY = MPU_gyroY_raw - gMPU_GyroY_offset;
-
-    MPU_gyroZ_raw = (uint16_t)gRxPacket[ 12 ] << 8;	// read High byte
-    MPU_gyroZ_raw += gRxPacket[ 13 ];
-    MPU_gyroZ = MPU_gyroZ_raw - gMPU_GyroZ_offset;
-
-// ******************************************
-// ********** COMPLEMENTARY FILTER **********
-// ******************************************    
-// https://www.hackster.io/hibit/complementary-filter-and-relative-orientation-with-mpu9250-d4f79d
-// angle = (1 - α) * (angle + gyroscope * dt) + α * accelerometer
-// pitch = 0.98 * (pitch + gyroscope_x * dt) + 0.02* accelerometer_x
-
-    // T_sampling, sensitivity 131LSB / deg/s
-	gRate_X_Degs = ( ( MPU_gyroX * TIME_MPU_READ_SEC ) / 131.0f );
-    gRate_Y_Degs = ( ( MPU_gyroY * TIME_MPU_READ_SEC ) / -131.0f );       // it seems this axis is reversed
-    gRate_Z_Degs = ( ( MPU_gyroZ * TIME_MPU_READ_SEC ) / 131.0f );       // 3 lines 125us	
-	
-    gAngle_PITCH_Deg_CF = ( 1 - gALPHA_CF_Coef ) * ( gAngle_PITCH_Deg_0 + gRate_Y_Degs ) + gALPHA_CF_Coef * gAngle_PITCH_Deg;
-	gAngle_ROLL_Deg_CF  = ( 1 - gALPHA_CF_Coef ) * ( gAngle_ROLL_Deg_0  + gRate_X_Degs ) + gALPHA_CF_Coef * gAngle_ROLL_Deg;
-    gAngle_YAW_Deg_CF   = ( 1 - gALPHA_CF_Coef ) * ( gAngle_YAW_Deg_0   + gRate_Z_Degs ) + gALPHA_CF_Coef * gAngle_YAW_Deg;  // 3 lines 120us
-
-    // re-shift
-    gAngle_PITCH_Deg_0 = gAngle_PITCH_Deg_CF;
-    gAngle_ROLL_Deg_0  = gAngle_ROLL_Deg_CF;
-    gAngle_YAW_Deg_0   = gAngle_YAW_Deg_CF;
-
-    robot.body.pitch_rad = (3.14159f/180.0f) * gAngle_PITCH_Deg_CF;
-    robot.body.roll_rad  = (3.14159f/180.0f) * gAngle_ROLL_Deg_CF;
-    robot.body.yaw_rad   = (3.14159f/180.0f) * gAngle_YAW_Deg_CF;
-
-    // RUN Controller
-    flg_RUN_InnerLoop = true;
-
-    return I2C_Flag_Block;
-
+    robot.body.pitch_rad = _IQtoF( gAngle_PITCH_rad_CoFil_iq );
+    robot.body.roll_rad  = _IQtoF( gAngle_ROLL_rad_CoFil_iq  );
+    robot.body.yaw_rad   = _IQtoF( gAngle_YAW_rad_CoFil_iq   ); // all 9 lines approx. 9-10us
+GET_DURATION( 5 );
+    // NOW RUN PID
+    return true;
 }
 
-// void    UpdateWheelPhysics(volatile wheel_t *argWheel)
-// {
-//     // 1. Snapshot: Dereference the pointer (*) to copy the DATA into the stack
-//     wheel_t temp = *argWheel; 
-//     // 2. Process: High-speed math on the local 'temp' copy
-//     temp.theta_rad = (float)temp.imp * RAD_PER_TICK;
-//     temp.pos_m   = temp.theta_rad * WHEEL_RADIUS_M;
-//     // 3. Commit: Copy the 'temp' result back to the volatile RAM location
-//     *argWheel = temp;
-// }
+
+void MPU_check ( void )
+{
+    // ----- READ MPU DATA -----        
+    if ( gFlg_Read_MPU && ( gCnt_MPU_Delay==0 ) )
+    {
+        gFlg_Read_MPU = false;     
+STORE_TIMER6( 1 );
+            // ----- 21. MPU Read (Status, AccX, AccY, AccZ, Temp, GyroX, GyroY, GyroZ) -----
+            if ( MPU_Read_Len( 0x3A , 15 ) != 0 ) {      
+                gMPU_return[ 7 ]++;
+                gMPU_Irq_status = 0U;
+            } else {
+                // ----- 22. Check MPU status -----
+                gMPU_Irq_status = gRxPacket[ 0 ];
+                // ----- 23. Check MPU Interrupt (Data Available) -----
+                if ( ( gMPU_Irq_status & 0x01 ) == 0x01 ) {
+                    gMPU_Irq_set_cnt++;    
+                    // --- 24. Calculate angles ---
+                    if ( MPU_UAV_Calculation() == true ) {
+                        gFlg_RUN_InnerLoop  = true;
+                        gFlg_Motor_EN       = true;
+                    } else {
+                        gFlg_RUN_InnerLoop  = false;
+                        gFlg_Motor_EN       = false;
+                    }
+                } else {
+                    gMPU_Irq_not_set_cnt++;                
+                }
+            }
+GET_DURATION( 1 );
+    }
+}
+
+void Robot_Ident( void )
+{
+    if ( gRobot_State == ROBO_STATE_IDENT )
+    {
+        switch ( gRobot_Ident ) {
+        
+            // --- MOTOR OFF (0.0V) ---
+            case 0U:
+                robot.control.CMterm_V = 0.0f;
+                Motor0_RH_volt( robot.control.CMterm_V );
+                Motor1_LH_volt( robot.control.CMterm_V );
+                // clear timer counter and go to next state
+                gCnt_Identify = 0U;
+                gRobot_Ident++;
+            break;
+
+            // --- WAIT 0.5s ---
+            case 1U:
+            if ( gCnt_Identify >= 500U )
+                gRobot_Ident++;
+            break;
+
+            // --- SET LOW LEVEL (2.0V) ---
+            case 2U:
+                robot.control.CMterm_V = 2.0f;
+                Motor0_RH_volt( robot.control.CMterm_V );
+                Motor1_LH_volt( robot.control.CMterm_V );                    
+                // clear timer counter and go to next state
+                gCnt_Identify = 0U;
+                gRobot_Ident++;
+            break;
+
+            // --- WAIT 0.5s ---
+            case 3U:
+            if ( gCnt_Identify >= 500U )
+                gRobot_Ident++;
+            break;
+
+            // --- Start logging ---
+            case 4U:
+                gCnt_Sample = 0U;
+                gFlg_Log_Enable = true;
+                // clear timer counter and go to next state
+                gCnt_Identify = 0U;
+                gRobot_Ident++;
+            break;
+
+            // --- WAIT 0.5s ---
+            case 5U:
+            if ( gCnt_Identify >= 500U )
+                gRobot_Ident++;
+            break;
+
+            // --- SET HI LEVEL (4.0V) ---
+            case 6U:
+                robot.control.CMterm_V = 4.0f;
+                Motor0_RH_volt( robot.control.CMterm_V );
+                Motor1_LH_volt( robot.control.CMterm_V );
+                // clear timer counter and go to next state
+                gCnt_Identify = 0U;
+                gRobot_Ident++;
+            break;
+            
+            // --- WAIT 0.5s ---
+            case 7U:
+            if ( gCnt_Identify >= 500U )
+                gRobot_Ident++;
+            break;
+
+            // --- SET LOW LEVEL (2.0V) ---
+            case 8U:
+                robot.control.CMterm_V = 2.0f;
+                Motor0_RH_volt( robot.control.CMterm_V );
+                Motor1_LH_volt( robot.control.CMterm_V );
+                // clear timer counter and go to next state
+                gCnt_Identify = 0U;
+                gRobot_Ident++;
+            break;
+
+            // --- WAIT 0.5s ---
+            case 9U:
+                if ( gCnt_Identify >= 500U )
+                    gRobot_Ident++;
+            break;
+
+            // --- MOTOR OFF (0.0V) ---
+            case 10U:
+                // stop logging
+                gFlg_Log_Enable = false;
+                // motors OFF
+                robot.control.CMterm_V = 0.0f;
+                Motor0_RH_volt( robot.control.CMterm_V );
+                Motor1_LH_volt( robot.control.CMterm_V );
+            // --- END ---
+                // reinitialization
+                gRobot_State = ROBO_STATE_BALA;
+                gRobot_Ident = 0U;
+            break;                
+        }                    
+    }
+}
 
 // Snapshot-Process-Commit
 void Robot_GetWheelPhysics(volatile motor_t *argMotor, volatile wheel_t *argWheel)
@@ -2364,41 +2291,6 @@ void Robot_GetWheelPhysics(volatile motor_t *argMotor, volatile wheel_t *argWhee
     *argWheel = W_temp;
 }
 
-// void Wheel_GetSpeed_SG(void)
-// {
-//     // ----- SHIFT LEFT WHEEL HISTORY -----
-//     gWheel_LH_hist_m[0] = gWheel_LH_hist_m[1];
-//     gWheel_LH_hist_m[1] = gWheel_LH_hist_m[2];
-//     gWheel_LH_hist_m[2] = gWheel_LH_hist_m[3];
-//     gWheel_LH_hist_m[3] = gWheel_LH_hist_m[4];
-//     gWheel_LH_hist_m[4] = robot.wheel.left.pos_m;      // newest sample
-
-//     // ----- SHIFT RIGHT WHEEL HISTORY -----
-//     gWheel_RH_hist_m[0] = gWheel_RH_hist_m[1];
-//     gWheel_RH_hist_m[1] = gWheel_RH_hist_m[2];
-//     gWheel_RH_hist_m[2] = gWheel_RH_hist_m[3];
-//     gWheel_RH_hist_m[3] = gWheel_RH_hist_m[4];
-//     gWheel_RH_hist_m[4] = robot.wheel.right.pos_m;      // newest sample
-
-//     // ----- SG5 DERIVATIVE FOR LEFT WHEEL -----
-//     robot.wheel.left.speed_ms =
-//         SG_K * ( gWheel_LH_hist_m[0]
-//                 - 8.0f * gWheel_LH_hist_m[1]
-//                 + 8.0f * gWheel_LH_hist_m[3]
-//                 - gWheel_LH_hist_m[4] );
-    
-//     robot.wheel.left.omega_rads = robot.wheel.left.speed_ms / WHEEL_RADIUS_M;
-
-//     // ----- SG5 DERIVATIVE FOR RIGHT WHEEL -----    
-//     robot.wheel.right.speed_ms =
-//         SG_K * ( gWheel_RH_hist_m[0]
-//                 - 8.0f * gWheel_RH_hist_m[1]
-//                 + 8.0f * gWheel_RH_hist_m[3]
-//                 - gWheel_RH_hist_m[4] );
-    
-//     robot.wheel.right.omega_rads = robot.wheel.right.speed_ms / WHEEL_RADIUS_M;
-// }
-
 // Robot Get Speed calculates robot speed using derivative SG filter
 float   Robot_GetSpeed_SG(void)
 {
@@ -2417,24 +2309,7 @@ float   Robot_GetSpeed_SG(void)
 
     return v;   // [m/s]
 }
-// float   Robot_GetSpeed_SG(void)
-// {
-//     // Shift history: [0]=k-2, [1]=k-1, [2]=k, [3]=k+1, [4]=k+2
-//     gPosition_hist_m[0] = gPosition_hist_m[1];
-//     gPosition_hist_m[1] = gPosition_hist_m[2];
-//     gPosition_hist_m[2] = gPosition_hist_m[3];
-//     gPosition_hist_m[3] = gPosition_hist_m[4];
-//     // gPosition_hist_m[4] = gPosition_m;   // newest sample
-//     gPosition_hist_m[4] = robot.body.pos_m;   // newest sample
 
-//     // Only valid after initial fill; you can gate this if needed
-//     float v = SG_K * ( gPosition_hist_m[0]
-//                      - 8.0f * gPosition_hist_m[1]
-//                      + 8.0f * gPosition_hist_m[3]
-//                      - gPosition_hist_m[4] );
-
-//     return v;   // [m/s]
-// }
 float   Robot_GetTurnRate_SG(void)
 {
     gYaw_hist_rad[0] = gYaw_hist_rad[1];
@@ -2514,11 +2389,6 @@ void    Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB
     *argPower = temp;
 }
 
-// Median of 3 values
-// int32_t Filter_Median3(int32_t a, int32_t b, int32_t c)
-// {
-//     return (a > b) ? ((b > c) ? b : (a > c) ? a : c) : ((c > b) ? c : (a > b) ? a : b);
-// }
 // Calculate the median of 3 floats
 static inline float Filter_Median3_f(float a, float b, float c)
 {
@@ -2526,30 +2396,6 @@ static inline float Filter_Median3_f(float a, float b, float c)
     if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
     return c;
 }
-// int32_t median3(int32_t a, int32_t b, int32_t c)
-// {
-//     int32_t tmp = 0;
-
-//     if ( a > b ) {
-//         tmp = a;
-//         a = b;
-//         b = tmp;
-//     } 
-
-//     if ( b > c ) {
-//         tmp = b;
-//         b = c;
-//         c = tmp;
-//     } 
-
-//     if ( a > b ) {
-//         tmp = a;
-//         a = b;
-//         b = tmp;
-//     } 
-
-//     return b; // middle value
-// }
 
 // Converts 8-bit RGB color into WS2812 PWM pattern (0x1C = 0, 0x38 = 1)
 void WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B)
@@ -2648,40 +2494,38 @@ void WS2812B_BattGauge_8LED(float voltage)
     }
 }
 
-void WS2812B_TiltGauge_8LED(float tilt_deg)
+void WS2812B_TiltGauge_8LED(float tilt_rad)
 {
-    const float TILT_MIN = -10.0f;
-    const float TILT_MAX =  10.0f;
-    const uint8_t LEDcount  = 8;
-    const uint8_t LEDoffset = 8;   // tilt LEDs start at index 8
+    // 10 degrees is approx 0.1745 radians
+    const float TILT_LIMIT_RAD = 0.1745f; 
+    const uint8_t LED_COUNT    = 8;
+    const uint8_t LED_OFFSET   = 8; 
 
-    // Clamp tilt
-    if (tilt_deg < TILT_MIN) tilt_deg = TILT_MIN;
-    if (tilt_deg > TILT_MAX) tilt_deg = TILT_MAX;
+    // 1. Clamp tilt using the symmetric limit
+    if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
+    if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
 
-    // Normalize tilt into 0..1
-    float norm = (tilt_deg - TILT_MIN) / (TILT_MAX - TILT_MIN);
+    // 2. Normalize tilt into 0.0 .. 1.0 range
+    // (tilt + limit) / (2 * limit)
+    float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
 
-    // Map to LED index 0..6 (left LED of the pair)
-    float pos = norm * 6.0f;
+    // 3. Map to "Left LED" index of the pair (0 to 6)
+    // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
+    uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
+    uint8_t idxB = idxA + 1;
 
-    // Apply offset correctly
-    uint8_t idxA = (uint8_t)pos + LEDoffset;  // left LED
-    uint8_t idxB = idxA + 1;                  // right LED (adjacent!)
-
-    // Draw LEDs
-    for (uint8_t i = LEDoffset; i < (LEDoffset + LEDcount); i++)
+    // 4. Update the LED strip
+    for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
     {
         if (i == idxA || i == idxB)
         {
-            // Active pair = RED
-            WS2812B_LED_Col(i, 0x0F, 0, 0);   // R,G,B
+            // Active Tilt "Needle" - Red
+            WS2812B_LED_Col(i, 0x0F, 0x00, 0x00); 
         }
         else
         {
-            // Off
-            WS2812B_LED_Col(i, 0, 0, 0);
+            // Background / Off
+            WS2812B_LED_Col(i, 0x00, 0x00, 0x00);
         }
     }
 }
-
