@@ -64,6 +64,7 @@ ADC121.sampleTime1                = "10 ms";
 ADC121.adcPin1Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric9";
 ADC121.peripheral.$assign         = "ADC0";
 ADC121.peripheral.adcPin1.$assign = "PA26";
+ADC121.peripheral.adcPin3.$assign = "PA24";
 ADC121.adcPin3Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric8";
 
 ADC122.$name                      = "ADC12_1";
@@ -83,6 +84,8 @@ ADC122.sampleTime1                = "10 ms";
 ADC122.adcPin0Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric10";
 ADC122.peripheral.$assign         = "ADC1";
 ADC122.peripheral.adcPin0.$assign = "PA15";
+ADC122.peripheral.adcPin1.$assign = "PA16";
+ADC122.peripheral.adcPin2.$assign = "PA17";
 ADC122.adcPin1Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric11";
 ADC122.adcPin2Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric12";
 
@@ -277,9 +280,6 @@ ProjectConfig.genLibIQVersion = "MATHACL";
  * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
  * re-solve from scratch.
  */
-ADC121.peripheral.adcPin3.$suggestSolution = "PA24";
-ADC122.peripheral.adcPin1.$suggestSolution = "PA16";
-ADC122.peripheral.adcPin2.$suggestSolution = "PA17";
 Board.peripheral.$suggestSolution          = "DEBUGSS";
 Board.peripheral.swclkPin.$suggestSolution = "PA20";
 Board.peripheral.swdioPin.$suggestSolution = "PA19";
