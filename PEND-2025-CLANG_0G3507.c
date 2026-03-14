@@ -6,7 +6,7 @@
  *   - MSPM0G3507@80MHz/12.5ns
  * COMPILER VERSION: Clang v4.0.0 -O2
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-03-13 23:00:13
+ * LAST MODIFIED: 2026-03-14 11:09:13
  **********************************************************************/
 
 /* MSPM0G3507 MCU PIN MAPPING: PORT A & B COMPACT VIEW
@@ -48,7 +48,8 @@
 
 // ** LAST UPDATE **
 // - variables of MPU used in structure
-// - Complementary filter need BUG FIX
+// - Uart0 baud rate se to 2,000,000 bps
+// - Complementary filter in IQ format also
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -57,6 +58,13 @@
 #include    "ti/driverlib/dl_gpio.h"
 #include    "ti_msp_dl_config.h"
 
+/* IQ TYPE  | INT BITS | FRAC BITS | MIN RANGE         | MAX RANGE         | RESOLUTION    */
+/* _iq30    | 2        | 30        | -2                | 1.999999999       | 0.000000001   */
+/* _iq24    | 8        | 24        | -128              | 127.999999940     | 0.000000060   */
+/* _iq16    | 16       | 16        | -32768            | 32767.999984741   | 0.000015259   */
+/* _iq8     | 24       | 8         | -8388608          | 8388607.996093750 | 0.003906250   */
+/* _iq1     | 31       | 1         | -1073741824       | 1073741823.500000 | 0.500000000   */
+// https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
 #define     GLOBAL_IQ 16
 #include    <ti/iqmath/include/IQmathLib.h>
 
@@ -77,8 +85,7 @@
 #define     TIME_MOTOR_OMEGA_S      (0.01f)     // in seconds
 #define     TIME_MPU_DELAY_MS       (250U)      // delay before MPU is initiated
 #define     TIME_MPU_READ_SEC       (0.0008f)   // reading rate of MPU in seconds - Main Sample Period - Inner Loop
-#define     TIME_MPU_READ_S_IQ   _IQ(0.0008f)   // 800us in seconds
-// #define     TIME_MPU_READ_MS        (2U)        // reading rate of MPU - now by ISR
+#define     iqTIME_MPU_READ_S    _IQ(0.0008f)   // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
 #define     TIME_CRSF_MS            (50U)       // Cross Fire (Radio Control) protocol
 #define     TIME_FAIL_SAFE_MS       (1500U)     // No command received
 
@@ -121,9 +128,9 @@
 #define     ROBO_STATE_IDENT        (3U)        //
 #define     ROBO_STATE_NOK          (4U)        //
 
-#define     ALFA_CF_COEF            (0.03f)     // Complementary filter coefficient - Acc Gyro
-#define     ALPHA_IQ             _IQ(0.02f)     // Alpha
-#define     ONE_ALPHA_IQ         _IQ(0.98f)     // 1-Alpha
+#define     ALFA_CF_COEF            (0.03f)             // Complementary filter coefficient - Acc Gyro
+#define     iqALPHA              _IQ(ALFA_CF_COEF)      // Alpha
+#define     iqONE_NEG_ALPHA      _IQ(1.0f-ALFA_CF_COEF) // 1-Alpha
 
 #define     RAD_TO_DEG              (57.2958f)
 #define     RAD_TO_DEG_IQ        _IQ(57.295779513f)
@@ -337,8 +344,8 @@ volatile Robot_t robot = {
     .gain = {
         .FF = 0.01f,    // []
         .P  = 8.50f,    // [V/rad]
-        .D  = 850.0f,   // [Vs/rad]
-        .Y  = 0.002f    // [fixed leading zero and added comma]
+        .D  = 8.50f,    // [Vs/rad]
+        .Y  = 0.002f    // 
     },
     .power = {
         .batt_volt = VOLT_BATTERY_DEF,
@@ -488,19 +495,28 @@ typedef struct {
     } raw;
     // --- 5. Processed (Compensated) Data ---
     struct {
-        int16_t accX_lsb;   // Compensated Bits
-        int16_t accY_lsb;
-        int16_t accZ_lsb;
-        int16_t gyroX_lsb;
-        int16_t gyroY_lsb;
-        int16_t gyroZ_lsb;
-        // _iq     accX_g_iq;     // 'g' units
-        // _iq     accY_g_iq;
-        // _iq     accZ_g_iq;
-        // _iq     gyroX_rads_iq; // Rad/s
-        // _iq     gyroY_rads_iq; // Rad/s
-        // _iq     gyroZ_rads_iq; // Rad/s
-        // _iq     temp_C_iq;     // Celsius
+        int16_t accX_lsb;       // Accelerometer X Compensated Values in LSB
+        int16_t accY_lsb;       // Accelerometer Y Compensated Values in LSB
+        int16_t accZ_lsb;       // Accelerometer Z Compensated Values in LSB
+        int16_t gyroX_lsb;      // Gyroscope X Compensated Values in LSB
+        int16_t gyroY_lsb;      // Gyroscope Y Compensated Values in LSB
+        int16_t gyroZ_lsb;      // Gyroscope Z Compensated Values in LSB
+        _iq     iqAccX_g;       // Fixed Point IQ Gravity X in 'g' units
+        _iq     iqAccY_g;       // Fixed Point IQ Gravity Y in 'g' units
+        _iq     iqAccZ_g;       // Fixed Point IQ Gravity Z in 'g' units
+        _iq     iqGyroX_rads;   // Fixed Point IQ Angular Rate X in 'rad/s'
+        _iq     iqGyroY_rads;   // Fixed Point IQ Angular Rate Y in 'rad/s'
+        _iq     iqGyroZ_rads;   // Fixed Point IQ Angular Rate Z in 'rad/s'
+        _iq     iqTemp_C;       // Fixed Point IQ Temperature in 'C'
+        _iq     iqPitch_rad;    // Fixed Point IQ Pitch in 'rad'
+        _iq     iqRoll_rad;     // Fixed Point IQ Roll in 'rad'
+        _iq     iqYaw_rad;      // Fixed Point IQ Heading in 'rad'
+        _iq     iqPitch_fil_rad;    // Fixed Point IQ Filtered Pitch in 'rad'
+        _iq     iqRoll_fil_rad;     // Fixed Point IQ Filtered Roll in 'rad'
+        _iq     iqYaw_fil_rad;      // Fixed Point IQ Filtered Heading in 'rad'
+        _iq     iqPitch_N_1;    // Fixed Point IQ Pitch previous sample in 'rad'
+        _iq     iqRoll_N_1;     // Fixed Point IQ Roll previous sample in 'rad'
+        _iq     iqYaw_N_1;      // Fixed Point IQ Heading previous sample in 'rad'
     } val;
 } mpu_t;
 
@@ -549,10 +565,6 @@ volatile    int16_t     gMPU_accX_offset  =  500 , gMPU_accY_offset  = -250 , gM
 volatile	int16_t	    gMPU_gyroX_offset = -250 , gMPU_gyroY_offset =  000 , gMPU_gyroZ_offset = 0; // 2025-10-04
 
 // ----- Calculation MPU data IQ -----
-// GLOBAL   IQ 24 - RANGE: -128 to 127.999 999 940 (resolution: 0.000 000 060)
-//          IQ 16 - RANGE: -32,768 to 32,767.999 984 741 (resolution: 0.000 015 259)
-//          IQ 8  - RANGE: -8,388,608 to 8,388,607.996 093 750 (resolution: 0.003 906 250) 
-// https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
 // _iq         gMPU_accX_iq   , gMPU_accY_iq   , gMPU_accZ_iq  ;   // raw value in iq
 // _iq         gMPU_accX_g_iq , gMPU_accY_g_iq , gMPU_accZ_g_iq;   // g value in iq
 // _iq         gMPU_temp_C_iq; // C deg in iq
@@ -1084,52 +1096,6 @@ void MPU_Init(void)
         // Optional: Put code here to signal a hardware failure (e.g., Red LED)
     }
 }
-// void    MPU_Init( void )
-// {
-//     // ----- MPU INIT -----
-//     gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-//     while ( gCnt_MPU_Delay > 0U )
-//         ;
-
-//     if ( MPU_Write_Reg( 0x37 , 0x20 ) != 0 )    // Reg: INT_PIN_CFG , Bit: LATCH_INT_EN = 0
-//         gMPU_return[ 0 ]++; 
-//     if ( MPU_Write_Reg( 0x38 , 0x01 ) != 0 )    // Reg: INT_ENABLE  , Bit: DATA_RDY_EN = 1
-//         gMPU_return[ 1 ]++;   
-//     if ( MPU_Write_Reg( 0x6B , 0x00 ) != 0 )    // Reg: PWR_MGMT_1  , Bit: SLEEP = 0
-//         gMPU_return[ 2 ]++;
-        
-//     gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-//     while ( gCnt_MPU_Delay > 0U )
-//         ;
-
-//     if ( MPU_Read_Len( 0x37 , 1 ) != 0 ) {      // Reg: INT_PIN_CFG
-//         gMPU_return[ 3 ]++;
-//         gMPU_Latch_status = 0U;
-//     } else {
-//         gMPU_Latch_status = gRxPacket[ 0 ];
-//     }
-
-//     if ( MPU_Read_Len( 0x38 , 1 ) != 0 ) {      // Reg: INT_ENABLE
-//         gMPU_return[ 4 ]++;
-//         gMPU_Int_En_status = 0U;
-//     } else {
-//         gMPU_Int_En_status = gRxPacket[ 0 ];
-//     }
-
-//     if ( MPU_Read_Len( 0x6B , 1 ) != 0 ) {      // Reg: PWR_MGMT_1
-//         gMPU_return[ 5 ]++;
-//         gMPU_Sleep_status = 0U;
-//     } else {
-//         gMPU_Sleep_status = gRxPacket[ 0 ];
-//     }
-    
-//     if ( MPU_Read_Len( 0x75 , 1 ) != 0 ) {      // Reg: WHO_AM_I
-//         gMPU_return[ 6 ]++;
-//         gMPU_WhoAmI_data = 0U;
-//     } else {
-//         gMPU_WhoAmI_data = gRxPacket[ 0 ];
-//     }
-// }
 
 // --------------------------
 // ----- (A) INNER LOOP -----
@@ -1536,7 +1502,14 @@ STORE_TIMER6( 6 );
             case ROBO_STATE_INIT:                  
                 break;
             // ----- REGULATION ------    
-            case ROBO_STATE_BALA:                    
+            case ROBO_STATE_BALA:      
+                UART0_signals[ 0 ] = mpu.val.iqPitch_rad;
+                UART0_signals[ 1 ] = mpu.val.iqPitch_fil_rad;
+                UART0_signals[ 2 ] = 0U;
+                UART0_signals[ 3 ] = 0U;
+                UART0_signals[ 4 ] = 0U;
+                UART0_signals[ 5 ] = 0U;
+                Send_integers_over_UART ( 6U );              
                 // UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
                 // UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
                 // UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
@@ -1561,15 +1534,15 @@ STORE_TIMER6( 6 );
                 // UART0_signals[ 19 ] = 100.0f * C_gain_LH_RH;            // LH to RH compensation
                 // UART0_signals[ 20 ] = 100.0f * N_0_coef;                  // N filter for D component
                 // UART0_signals[ 21 ] = 100.0f * gK1_DynamicDamp;                  // G damping - gyro
-                UART0_signals[ 22 ] = 100.0f * gALPHA_CF_Coef;            // Alpha coef. for complementary filter Acc+Gyro
-                UART0_signals[ 23 ] = 100.0f * gCURR_EMA_Coef;           // Zeta coef. for Exponencial
+                // UART0_signals[ 22 ] = 100.0f * gALPHA_CF_Coef;            // Alpha coef. for complementary filter Acc+Gyro
+                // UART0_signals[ 23 ] = 100.0f * gCURR_EMA_Coef;           // Zeta coef. for Exponencial
 
-                UART0_signals[ 24 ] = 100.0f * robot.power.batt_volt;   // Filtered battery voltage
-                UART0_signals[ 25 ] = 100.0f * robot.body.temp_C;       // temperature of MPU
-                UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
-                UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
+                // UART0_signals[ 24 ] = 100.0f * robot.power.batt_volt;   // Filtered battery voltage
+                // UART0_signals[ 25 ] = 100.0f * robot.body.temp_C;       // temperature of MPU
+                // UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
+                // UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
 
-                Send_integers_over_UART ( SIGNAL_CNT );
+                // Send_integers_over_UART ( SIGNAL_CNT );
 
                 // UART0_signals[  9 ] = 1.0f * gM1_LH_Curr_mA;
                 break;
@@ -1591,7 +1564,7 @@ STORE_TIMER6( 6 );
             case ROBO_STATE_NOK:
                 break;
         } 
-GET_DURATION( 6 );
+GET_DURATION( 6 );  // duration of the loop 31-32us
     }
 }
 
@@ -2161,6 +2134,7 @@ void MPU_UpdatePhysics( volatile mpu_t *argMPU , uint8_t *argBuffer )
     // 1. Snapshot: Local copy for register-based math
     mpu_t temp = *argMPU;
 
+STORE_TIMER6( 2 );
     // 2. Combine Big-Endian bytes into Raw int16_t
     temp.raw.accX_lsb  = (int16_t)((argBuffer[1]  << 8) | argBuffer[2]);
     temp.raw.accY_lsb  = (int16_t)((argBuffer[3]  << 8) | argBuffer[4]);
@@ -2169,14 +2143,37 @@ void MPU_UpdatePhysics( volatile mpu_t *argMPU , uint8_t *argBuffer )
     temp.raw.gyroX_lsb = (int16_t)((argBuffer[9]  << 8) | argBuffer[10]);
     temp.raw.gyroY_lsb = (int16_t)((argBuffer[11] << 8) | argBuffer[12]);
     temp.raw.gyroZ_lsb = (int16_t)((argBuffer[13] << 8) | argBuffer[14]);
-
-    // 3. Apply Calibration Offsets (Logic domain)
+    // 3. Apply Calibration Offsets
     temp.val.accX_lsb  = temp.raw.accX_lsb  - temp.offset.accX_lsb;
     temp.val.accY_lsb  = temp.raw.accY_lsb  - temp.offset.accY_lsb;
     temp.val.accZ_lsb  = temp.raw.accZ_lsb  - temp.offset.accZ_lsb;
     temp.val.gyroX_lsb = temp.raw.gyroX_lsb - temp.offset.gyroX_lsb;
     temp.val.gyroY_lsb = temp.raw.gyroY_lsb - temp.offset.gyroY_lsb;
     temp.val.gyroZ_lsb = temp.raw.gyroZ_lsb - temp.offset.gyroZ_lsb;
+GET_DURATION( 2 );  // duration 1-2us
+
+STORE_TIMER6( 3 );
+    // 4. Convert to Physical Units but in Fixed Point IQ format
+    // *** Acceleration [g] and temperature [C] ***
+    temp.val.iqAccX_g = _IQdiv(_IQ(temp.val.accX_lsb), _IQ(16384.0f));
+    temp.val.iqAccY_g = _IQdiv(_IQ(temp.val.accY_lsb), _IQ(16384.0f));
+    temp.val.iqAccZ_g = _IQdiv(_IQ(temp.val.accZ_lsb), _IQ(16384.0f));
+    temp.val.iqTemp_C = _IQdiv(_IQ(temp.raw.temp_lsb), _IQ(340.0f)) + _IQ(36.53f);
+    // convert to float and comit to main Robot struct
+    robot.body.accX_g = _IQtoF( temp.val.iqAccX_g );
+    robot.body.accY_g = _IQtoF( temp.val.iqAccY_g );
+    robot.body.accZ_g = _IQtoF( temp.val.iqAccZ_g );
+    robot.body.temp_C = _IQtoF( temp.val.iqTemp_C );
+
+    // *** Gyroscope [rad/s] ***
+    temp.val.iqGyroX_rads = _IQdiv(_IQdiv(_IQ(temp.val.gyroX_lsb), _IQ(131.0f)), _IQ(57.2958f));
+    temp.val.iqGyroY_rads = _IQdiv(_IQdiv(_IQ(temp.val.gyroY_lsb), _IQ(-131.0f)), _IQ(57.2958f));
+    temp.val.iqGyroZ_rads = _IQdiv(_IQdiv(_IQ(temp.val.gyroZ_lsb), _IQ(131.0f)), _IQ(57.2958f));
+    // convert to float and comit to main Robot struct
+    robot.body.rateX_rads = _IQtoF( temp.val.iqGyroX_rads );
+    robot.body.rateY_rads = _IQtoF( temp.val.iqGyroY_rads );
+    robot.body.rateZ_rads = _IQtoF( temp.val.iqGyroZ_rads );
+GET_DURATION( 3 );  // duration 18-19us
 
     // 6. Commit: Write back to RAM
     *argMPU = temp;
@@ -2187,133 +2184,42 @@ bool MPU_UAV_Calculation ( volatile mpu_t *argMPU )
     // 1. Snapshot: Local copy for register-based math
     mpu_t temp = *argMPU;
 
-    // uint8_t argOffset = 1U; // 0 there is status byte
-
-    // gMPU_accX_raw =  (uint16_t)gRxPacket[ 0U + argOffset ] << 8;	// read High byte
-    // gMPU_accX_raw += (uint16_t)gRxPacket[ 1U + argOffset ];
-    // gMPU_accX = gMPU_accX_raw - gMPU_accX_offset;
-
-    // gMPU_accY_raw =  (uint16_t)gRxPacket[ 2U + argOffset ] << 8;	// read High byte
-    // gMPU_accY_raw += (uint16_t)gRxPacket[ 3U + argOffset ];
-    // gMPU_accY = gMPU_accY_raw - gMPU_accY_offset;
-
-    // gMPU_accZ_raw =  (uint16_t)gRxPacket[ 4U + argOffset ] << 8;	// read High byte
-    // gMPU_accZ_raw += (uint16_t)gRxPacket[ 5U + argOffset ];
-    // gMPU_accZ = gMPU_accZ_raw - gMPU_accZ_offset;
-
-    // gMPU_temp =  (uint16_t)gRxPacket[ 6U + argOffset ] << 8;	// read High byte
-    // gMPU_temp += (uint16_t)gRxPacket[ 7U + argOffset ];
-
-    // gMPU_gyroX_raw =  (uint16_t)gRxPacket[ 8U + argOffset ] << 8;	// read High byte
-    // gMPU_gyroX_raw += (uint16_t)gRxPacket[ 9U + argOffset ];
-    // gMPU_gyroX = gMPU_gyroX_raw - gMPU_gyroX_offset;
-
-    // gMPU_gyroY_raw =  (uint16_t)gRxPacket[ 10U + argOffset ] << 8;	// read High byte
-    // gMPU_gyroY_raw += (uint16_t)gRxPacket[ 11U + argOffset ];
-    // gMPU_gyroY = gMPU_gyroY_raw - gMPU_gyroY_offset;
-
-    // gMPU_gyroZ_raw =  (uint16_t)gRxPacket[ 12U + argOffset ] << 8;	// read High byte
-    // gMPU_gyroZ_raw += (uint16_t)gRxPacket[ 13U + argOffset ];
-    // gMPU_gyroZ = gMPU_gyroZ_raw - gMPU_gyroZ_offset;
-
-STORE_TIMER6( 2 );
-    // *** Acceleration [g] and temperature [C] ***
-    _iq iqMPU_accX_g , iqMPU_accY_g , iqMPU_accZ_g;   // g value in iq
-    _iq iqMPU_temp_C; // C deg in iq
-    iqMPU_accX_g = _IQdiv(_IQ(temp.val.accX_lsb), _IQ(16384.0f));
-    iqMPU_accY_g = _IQdiv(_IQ(temp.val.accY_lsb), _IQ(16384.0f));
-    iqMPU_accZ_g = _IQdiv(_IQ(temp.val.accZ_lsb), _IQ(16384.0f));
-    // Using multiplication by reciprocal: 1/16384 = 0.000061035f
-    // iqMPU_accX_g = _IQmpy(_IQ(temp.val.accX_lsb), _IQ(0.000061035f));
-    // iqMPU_accY_g = _IQmpy(_IQ(temp.val.accY_lsb), _IQ(0.000061035f));
-    // iqMPU_accZ_g = _IQmpy(_IQ(temp.val.accZ_lsb), _IQ(0.000061035f));
-    // Temperature conversion by reciprocal: 1/340 = 0.0029411
-    iqMPU_temp_C = _IQmpy(_IQ(temp.raw.temp_lsb), _IQ(0.0029411f)) + _IQ(36.53f);
-
-    // gMPU_accX_g_iq = _IQdiv( _IQ( gMPU_accX ) , _IQ( 16384.0f ) );
-    // gMPU_accY_g_iq = _IQdiv( _IQ( gMPU_accY ) , _IQ( 16384.0f ) );
-    // gMPU_accZ_g_iq = _IQdiv( _IQ( gMPU_accZ ) , _IQ( 16384.0f ) );
-    // gMPU_temp_C_iq = _IQdiv( _IQ( gMPU_temp ) , _IQ( 340.000f ) ) + _IQ(36.53f); // this 4 lines approx. ~3-4 us
-    
-    robot.body.accX_g = _IQtoF( iqMPU_accX_g );
-    robot.body.accY_g = _IQtoF( iqMPU_accY_g );
-    robot.body.accZ_g = _IQtoF( iqMPU_accZ_g );
-    robot.body.temp_C = _IQtoF( iqMPU_temp_C );// all 8 lines approx. xx-xx us
-GET_DURATION( 2 );
-
-STORE_TIMER6( 3 );
-    // *** Gyroscope [rad/s] ***
-    _iq iqMPU_gyroX_rads , iqMPU_gyroY_rads , iqMPU_gyroZ_rads;
-    // Formula: (Raw / LSB) * (PI / 180)
-    // We combine (1/131.0) * (PI/180) into one constant for ultimate speed
-    const _iq GYRO_LSB_TO_RADS_IQ = _IQ(0.00013323f); 
-    iqMPU_gyroX_rads = _IQmpy(_IQ(temp.val.gyroX_lsb),  GYRO_LSB_TO_RADS_IQ);
-    // Y Axis is reversed
-    iqMPU_gyroY_rads = _IQmpy(_IQ(temp.val.gyroY_lsb), -GYRO_LSB_TO_RADS_IQ);
-    iqMPU_gyroZ_rads = _IQmpy(_IQ(temp.val.gyroZ_lsb),  GYRO_LSB_TO_RADS_IQ);
-    // gRate_X_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroX ) , TIME_MPU_READ_S_IQ ) , _IQ( 131.0f ) ) );
-    // gRate_Y_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroY ) , TIME_MPU_READ_S_IQ ) , _IQ(-131.0f ) ) );// it seems this axis is reversed
-    // gRate_Z_rads_iq = _IQmpy( DEG_TO_RAD_IQ , _IQdiv( _IQmpy( _IQ( gMPU_gyroZ ) , TIME_MPU_READ_S_IQ ) , _IQ( 131.0f ) ) );
-    
-    robot.body.rateX_rads = temp.val.gyroX_lsb * 0.00013323f;
-    robot.body.rateY_rads = temp.val.gyroY_lsb * -0.00013323f;
-    robot.body.rateZ_rads = temp.val.gyroZ_lsb * 0.00013323f;
-
-    // robot.body.rateX_rads = _IQtoF( iqMPU_gyroX_rads );
-    // robot.body.rateY_rads = _IQtoF( iqMPU_gyroY_rads );
-    // robot.body.rateZ_rads = _IQtoF( iqMPU_gyroZ_rads );    // all 6 lines approx. xx-xx us
-GET_DURATION( 3 );
-
 STORE_TIMER6( 4 );
     // ********** TRIGINOMETRY **********
     // https://www.analog.com/en/resources/app-notes/an-1057.html
-    _iq iqPITCH_rad , iqROLL_rad , iqYAW_rad;
-    _iq ax_sq = _IQmpy(iqMPU_accX_g, iqMPU_accX_g);
-    _iq ay_sq = _IQmpy(iqMPU_accY_g, iqMPU_accY_g);
-    _iq az_sq = _IQmpy(iqMPU_accZ_g, iqMPU_accZ_g);
+    _iq iq_accX_sq = _IQmpy(temp.val.iqAccX_g, temp.val.iqAccX_g);
+    _iq iq_accY_sq = _IQmpy(temp.val.iqAccY_g, temp.val.iqAccY_g);
+    _iq iq_accZ_sq = _IQmpy(temp.val.iqAccZ_g, temp.val.iqAccZ_g);
 
-    iqPITCH_rad = _IQatan2( iqMPU_accX_g , _IQsqrt( ay_sq + az_sq ) );
-    iqROLL_rad  = _IQatan2( iqMPU_accY_g , _IQsqrt( ax_sq + az_sq ) );
-    iqYAW_rad  += _IQmpy  ( iqMPU_gyroZ_rads , TIME_MPU_READ_S_IQ ); // this three atan2s approx. xx-xxus
-    // gAngle_PITCH_rad_iq = _IQatan2( gMPU_accX_g_iq , 
-    //                                 _IQsqrt( _IQmpy( gMPU_accY_g_iq , gMPU_accY_g_iq ) + _IQmpy( gMPU_accZ_g_iq , gMPU_accZ_g_iq ) ) );
-    // gAngle_ROLL_rad_iq  = _IQatan2( gMPU_accY_g_iq , 
-    //                                 _IQsqrt( _IQmpy( gMPU_accX_g_iq , gMPU_accX_g_iq ) + _IQmpy( gMPU_accZ_g_iq , gMPU_accZ_g_iq ) ) );
-    // gAngle_YAW_rad_iq   = _IQatan2( _IQsqrt( _IQ8mpy( gMPU_accX_g_iq , gMPU_accX_g_iq ) + _IQmpy( gMPU_accY_g_iq , gMPU_accY_g_iq ) ) ,
-    //                                 gMPU_accZ_g_iq ); // this three atan2s approx. 17-18us
-GET_DURATION( 4 );
+    temp.val.iqPitch_rad = _IQatan2( temp.val.iqAccX_g , _IQsqrt( iq_accY_sq + iq_accZ_sq ) );
+    temp.val.iqRoll_rad  = _IQatan2( temp.val.iqAccY_g , _IQsqrt( iq_accX_sq + iq_accZ_sq ) );
+    // Heading is integral of Yaw
+    temp.val.iqYaw_rad  += _IQmpy  ( temp.val.iqGyroZ_rads , iqTIME_MPU_READ_S );
+GET_DURATION( 4 );  // duration 11-12us
 
 STORE_TIMER6( 5 );	
     // ********** COMPLEMENTARY FILTER **********
-    // https://www.hackster.io/hibit/complementary-filter-and-relative-orientation-with-mpu9250-d4f79d
-    // pitch = (1 - α) * (pitch + gyroscope_x * dt) + α * accelerometer_x
-    _iq iqPITCH_fil_rad , iqROLL_fil_rad , iqYAW_fil_rad;
-    _iq iqPITCH_N_1_rad , iqROLL_N_1_rad , iqYAW_N_1_rad;
+    // Trust the Gyro 98%, Trust the Accel 2%
+    const _iq iq_alpha = _IQ(0.98f);
+    const _iq iq_one_minus_alpha = _IQ(0.02f);
 
-    iqPITCH_fil_rad = _IQmpy( ONE_ALPHA_IQ , ( iqPITCH_N_1_rad + iqMPU_gyroY_rads ) ) + _IQmpy( ALPHA_IQ , iqPITCH_rad );
-    iqROLL_fil_rad  = _IQmpy( ONE_ALPHA_IQ , ( iqROLL_N_1_rad  + iqMPU_gyroX_rads ) ) + _IQmpy( ALPHA_IQ , iqROLL_rad );
-    iqYAW_fil_rad   = _IQmpy( ONE_ALPHA_IQ , ( iqYAW_N_1_rad   + iqMPU_gyroZ_rads ) ) + _IQmpy( ALPHA_IQ , iqYAW_rad );
-
-    iqPITCH_N_1_rad = iqPITCH_fil_rad;
-    iqROLL_N_1_rad  = iqROLL_fil_rad;
-    iqYAW_N_1_rad   = iqYAW_fil_rad;
-
-    // gAngle_PITCH_rad_CoFil_iq = _IQmpy( ONE_ALPHA_IQ ,( gAngle_PITCH_rad_N_1_iq + gRate_Y_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_PITCH_rad_iq );
-    // gAngle_ROLL_rad_CoFil_iq  = _IQmpy( ONE_ALPHA_IQ , ( gAngle_ROLL_rad_N_1_iq  + gRate_X_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_ROLL_rad_iq );
-    // gAngle_YAW_rad_CoFil_iq   = _IQmpy( ONE_ALPHA_IQ , ( gAngle_YAW_rad_N_1_iq   + gRate_Z_rads_iq ) ) + _IQmpy( ALPHA_IQ , gAngle_YAW_rad_iq );
-
-    // gAngle_PITCH_rad_N_1_iq = gAngle_PITCH_rad_CoFil_iq;
-    // gAngle_ROLL_rad_N_1_iq  = gAngle_ROLL_rad_CoFil_iq;
-    // gAngle_YAW_rad_N_1_iq   = gAngle_YAW_rad_CoFil_iq;
-
-    // robot.body.pitch_rad = _IQtoF( iqPITCH_fil_rad );
-    // robot.body.roll_rad  = _IQtoF( iqROLL_fil_rad );
-    // robot.body.yaw_rad   = _IQtoF( iqYAW_fil_rad ); 
-
-    robot.body.pitch_rad = _IQtoF( iqPITCH_rad );
-    robot.body.roll_rad  = _IQtoF( iqROLL_rad );
-    robot.body.yaw_rad   = _IQtoF( iqYAW_rad ); 
-GET_DURATION( 5 );
+    // 1. Calculate the 'Short Term' change using Gyro (Rate * Time)
+    _iq iq_delta_X_angle = _IQmpy(temp.val.iqGyroX_rads, iqTIME_MPU_READ_S);
+    _iq iq_delta_Y_angle = _IQmpy(temp.val.iqGyroY_rads, iqTIME_MPU_READ_S);
+    
+    // 2. Combine with 'Long Term' stability from Accel
+    // Formula: Angle = Alpha * (Angle + Gyro_Delta) + (1 - Alpha) * Accel_Angle
+    temp.val.iqPitch_fil_rad = _IQmpy(iq_alpha, temp.val.iqPitch_N_1 + iq_delta_Y_angle) + _IQmpy(iq_one_minus_alpha, temp.val.iqPitch_rad);
+    temp.val.iqRoll_fil_rad  = _IQmpy(iq_alpha, temp.val.iqRoll_N_1  + iq_delta_X_angle) + _IQmpy(iq_one_minus_alpha, temp.val.iqRoll_rad);
+    
+    // 3. Update the 'Long Term' angles
+    temp.val.iqPitch_N_1 = temp.val.iqPitch_fil_rad;
+    temp.val.iqRoll_N_1  = temp.val.iqRoll_fil_rad;
+    
+    // 4. Convert to float
+    robot.body.pitch_rad = _IQtoF( temp.val.iqPitch_fil_rad );
+    robot.body.roll_rad  = _IQtoF( temp.val.iqRoll_fil_rad  );
+GET_DURATION( 5 );  // duration 6-7us
     
     // 6. Commit: Write back to RAM
     *argMPU = temp;
@@ -2364,39 +2270,6 @@ STORE_TIMER6(1);
 GET_DURATION(1);
     }
 }
-
-// void MPU_check ( void )
-// {
-//     // ----- READ MPU DATA -----        
-//     if ( gFlg_Read_MPU && ( gCnt_MPU_Delay==0 ) )
-//     {
-//         gFlg_Read_MPU = false;     
-// STORE_TIMER6( 1 );
-//             // ----- 21. MPU Read (Status, AccX, AccY, AccZ, Temp, GyroX, GyroY, GyroZ) -----
-//             if ( MPU_Read_Len( 0x3A , 15 ) != 0 ) {      
-//                 gMPU_return[ 7 ]++;
-//                 gMPU_Irq_status = 0U;
-//             } else {
-//                 // ----- 22. Check MPU status -----
-//                 gMPU_Irq_status = gRxPacket[ 0 ];
-//                 // ----- 23. Check MPU Interrupt (Data Available) -----
-//                 if ( ( gMPU_Irq_status & 0x01 ) == 0x01 ) {
-//                     gMPU_Irq_set_cnt++;    
-//                     // --- 24. Calculate angles ---
-//                     if ( MPU_UAV_Calculation() == true ) {
-//                         gFlg_RUN_InnerLoop  = true;
-//                         gFlg_Motor_EN       = true;
-//                     } else {
-//                         gFlg_RUN_InnerLoop  = false;
-//                         gFlg_Motor_EN       = false;
-//                     }
-//                 } else {
-//                     gMPU_Irq_not_set_cnt++;                
-//                 }
-//             }
-// GET_DURATION( 1 );
-//     }
-// }
 
 void Robot_Ident( void )
 {
