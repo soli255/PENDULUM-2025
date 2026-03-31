@@ -26,15 +26,28 @@ Welcome to **PENDULUM ROBOT 2025** — an Inverted Pendulum two wheeled robot as
 ## 🔧 Body Diagram
 <img width="966" height="1021" alt="IMG Pend-2025-4" src="IMG BODIA PEND-2025.png" />
 
-### System Dynamics
+### System Dynamics (N-E Coupled Model)
 
-The robot's behavior is defined by three coupled differential equations set to zero (D'Alembert form):
+The robot's behavior is defined by three coupled differential equations (D'Alembert form):
 
-1.  **Linear Force ($x$):**
-    $$0 = M_A \ddot{x} - M_B \ddot{\theta} + B_{eff} \dot{x} - \frac{N K_t}{R_w} I_a$$
-2.  **Rotational Torque ($\theta$):**
-    $$0 = J_{tot} \ddot{\theta} - M_B \ddot{x} - K_g \theta + N K_t I_a + (N B_{rot}) \dot{\theta}$$
-3.  **Electrical Current ($I_a$):**
-    $$0 = L_a \dot{I}_a + R_a I_a + K_b N \left( \dot{\theta} - \frac{\dot{x}}{R_w} \right) - V_{in}$$
+**1. Linear Force Equation ($x$):**
 
-> **Note:** $M_B$ represents the "Drunken Sailor" coupling, and $N B_{rot}$ accounts for significant gearbox damping.
+$$0 = M_A \ddot{x} - M_B \ddot{\theta} + B_{eff} \dot{x} - \frac{N K_t}{R_w} I_a$$
+
+**2. Rotational Torque Equation ($\theta$):**
+
+$$0 = J_{tot} \ddot{\theta} - M_B \ddot{x} - K_g \theta + N K_t I_a + (N B_{rot}) \dot{\theta}$$
+
+**3. Electrical Row (Current $I_a$):**
+
+$$0 = L_{a} \dot{I}_{a} + R_{a} I_{a} + K_{b} \left( N \dot{\theta} - \frac{N}{R_{w}} \dot{x} \right) - V_{a}$$
+
+> **Model Parameters:**
+> 
+> $M_{A}$: &nbsp;&nbsp;&nbsp;&nbsp; **Total Effective Mass [kg]** ($M_{total} + \frac{N \cdot J_{m}}{R_{w}^2}$)  
+> $M_{B}$: &nbsp;&nbsp;&nbsp;&nbsp; **Drunken Sailor Coupling [kg.m]** ($m_{p} \cdot L_{tot}$)  
+> $J_{tot}$: &nbsp;&nbsp; **Total Pendulum Inertia [kg.m^2]** ($J_{p} + m_{p} \cdot L_{tot}^2$)  
+> $K_{g}$: &nbsp;&nbsp;&nbsp;&nbsp; **Gravity Stiffness [N.m/rad]** ($m_{p} \cdot g \cdot L_{tot}$)  
+> $B_{eff}$: &nbsp;&nbsp; **Chassis Damping [N.s/m]** (Linear/Rolling Friction)  
+> $N B_{rot}$: &nbsp;&nbsp; **Rotary Damping [N.m.s/rad]** (Gearbox/Viscous Friction)  
+> $N$: &nbsp;&nbsp;&nbsp;&nbsp; **Number of Motors** (2)  
