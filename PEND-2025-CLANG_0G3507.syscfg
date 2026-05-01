@@ -197,12 +197,12 @@ PWM1.ccp2Pin_cmplConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric6";
 PWM1.ccp3Pin_cmplConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric7";
 
 PWM2.$name                              = "PWM_7";
-PWM2.timerCount                         = 100;
 PWM2.timerStartTimer                    = true;
 PWM2.event1PublisherChannel             = 1;
 PWM2.pwmMode                            = "EDGE_ALIGN_UP";
 PWM2.event1ControllerInterruptEn        = ["LOAD_EVENT"];
 PWM2.subscriberChannel                  = 2;
+PWM2.timerCount                         = 100;
 PWM2.peripheral.$assign                 = "TIMG7";
 PWM2.peripheral.ccp0Pin.$assign         = "PA28";
 PWM2.peripheral.ccp1Pin.$assign         = "PA31";
