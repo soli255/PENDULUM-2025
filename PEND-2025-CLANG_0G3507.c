@@ -1,12 +1,12 @@
 /**********************************************************************
- * PROGRAM NAME: PEND-2025-CLANG_0G3507.c
- * PROGRAM FUNCTION: Balancing Robot
+ * PROGRAM  NAME: PEND-2025-CLANG_0G3507.c
+ * PROGRAM  FUNCTION: Balancing Robot
  * HARDWARE SPECIFICATIONS:
  *   - 2xPOLOLU 4753 (50:1 Metal Gearmotor 37Dx70Lmm/12V/64CPR)
  *   - MSPM0G3507@80MHz/12.5ns
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-05-01 12:59:13
+ * LAST MODIFIED: 2026-05-03 12:12:17
  **********************************************************************/
 
 /* MSPM0G3507 MCU PIN MAPPING: PORT A & B COMPACT VIEW
@@ -47,13 +47,8 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - Pgain bosster added
-// - I terms added - not used
-// - compilation: was Clang v4.0.0 -O2 sdk: was 2.5.1.00 sysconfig: was 1.24
-// - two more Dummy patterns added (from 2 to 4) for WS2812B (new version 4-pin), original  WS2812 - old ver - 6pins)
-// - identification update, Ts = 4ms (was 10ms), and 3.0V to 6.0V step (was 2.0 and 4.0V)
-// - radio commands updated - KP and KD manipulated by RC
-// - general update, variable and function names chaged
+// - Pgain bosster filter added
+// - Position control added (Itegral part removed) - PD-PD controller implemented
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -85,8 +80,8 @@
 #define     LED_SEQUENCE_5          (0b101010101)   // five blink
 #define     LED_SEQUENCE_6          (0b10101010101) // six blink
 
-// #define     TIME_SEND_DATA_MS       (10U)       // 100Hz send data rate
-#define     TIME_SEND_DATA_MS       (4U)        // 250Hz updated send rate for identification
+#define     TIME_SEND_DATA_MS       (100U)       // 10Hz send data rate
+// #define     TIME_SEND_DATA_MS       (4U)        // 250Hz updated send rate for identification
 #define     TIME_MOTOR_OMEGA_MS     (10U)       // rate to calculate impulses to determine motor speed
 #define     TIME_MOTOR_OMEGA_S      (0.01f)     // in seconds
 #define     TIME_MPU_DELAY_MS       (250U)      // delay before MPU is initiated
@@ -95,6 +90,9 @@
 #define     TIME_CRSF_MS            (50U)       // Cross Fire (Radio Control) protocol
 #define     TIME_FAIL_SAFE_MS       (1500U)     // No command received
 
+#define     TIME_BATT_GAU_MS        (250U)      // 4Hz update data rate for battery gauge WS2812B display
+#define     TIME_TILT_GAU_MS        (100U)      // 10Hz update data rate for tilt gauge WS2812B display
+
 #define     CRSF_MSG_HEAD_SIZE      (3U)        // 0xC8 SYNC (Start-of-frame), 0x18 LEN (Length of TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
 #define     CRSF_MSG_DATA_SIZE      (22U)       // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
 #define     CRSF_MSG_CRC_SIZE       (1U)        // CRC-8 0xD5
@@ -102,19 +100,15 @@
 #define     CRSF_CHANNEL_COUNT      (16U)
 #define     CRSF_CRC_POLY           (0xD5)      // 0xD5 gives better burst‑error detection for short frames
 
-#define     ANGLE_LIM_BODY_DEG      (45.0f)     // Angle limit - beyond Controller controll is OFF    
-#define     ANGLE_LIM_HYST_DEG      (22.5f)     // Angle hysteresis - preventing oscilations
-
 #define     ANGLE_LIM_BODY_RAD      (0.80f)     // Angle limit - beyond Controller controll is OFF - 0.8rad = 45deg
-#define     ANGLE_LIM_HYST_RAD      (0.40f)     // Angle hysteresis - preventing oscilations - 0.4rad = 22.5deg
-#define     ANGLE_P_ZONE_RAD        (0.15f)     // Region to boost P terms
-#define     ANGLE_I_ZONE_RAD        (0.10f)     // "Narrow Region" for I terms
+#define     ANGLE_LIM_HYST_RAD      (0.40f)     // Angle hysteresis - preventing oscilations - 0.3rad = 18deg
+#define     ANGLE_P_ZONE_RAD        (0.20f)     // Region to boost P terms - 0.2rad = 12deg
+#define     ANGLE_SP_PITCH_RAD      (0.05f)     // Set Point limit for position controller
 
 #define     VOLT_MOTOR_LIM_HI       (8.00f)     // Action value limit for Inner Loop
 #define     VOLT_MOTOR_LIM_LO       (4.00f)     // Action value limit for Side Loop
-#define     VOLT_MOTOR_LIM_I        (2.00f)     // Action value limit for Integrator
 
-#define     VOLT_MOTOR_MIN          (0.25f)     // Motor voltage minimum value - positive
+#define     VOLT_MOTOR_MIN          (0.25f)     // Motor voltage minimum value
 #define     VOLT_MOTOR_HYST         (0.10f)     // Small hysteresis to prevent oscillations
 #define     VOLT_BATTERY_MIN        (10.2f)     // Li-Pol low voltage - 3.4V per cell
 #define     VOLT_BATTERY_DEF        (11.3f)     // Li-Pol default voltage - 3.75V per cell
@@ -141,11 +135,6 @@
 #define     iqALPHA              _IQ(ALFA_CF_COEF)      // Alpha
 #define     iqONE_NEG_ALPHA      _IQ(1.0f-ALFA_CF_COEF) // 1-Alpha
 
-#define     RAD_TO_DEG              (57.2958f)
-#define     RAD_TO_DEG_IQ        _IQ(57.295779513f)
-#define     DEG_TO_RAD              (0.0174533f)
-#define     DEG_TO_RAD_IQ        _IQ(0.01745329252f)
-
 #define     PWM_MAX_DUTY            (90U)       // [ % ] -> 0.90*12V => 10.8V
 #define     PWM_MIN_DUTY            (2U)        // [ % ] -> 0.02*12V => 0.24V
 
@@ -165,7 +154,7 @@
 #define     WS2812B_COLOR_CNT       (3U)    // RGB - 3 colors BUT on WS2812B GREEN is first, RED, last BLUE
 #define     WS2812B_PWM_PATTR       (8U)    // 8 bits of PWM CC to map one bit of WS2818
 #define     WS2812B_LED_COUNT       (16U)   // number of physical LED (8+8) to control 
-#define     WS2812B_DUMY_BYTE       (4U)    // +3 dummy patterns for latch
+#define     WS2812B_DUMY_BYTE       (4U)    // +4 dummy patterns for latch
 #define     WS2812B_BIT_COUNT       (WS2812B_COLOR_CNT*WS2812B_PWM_PATTR*(WS2812B_LED_COUNT+WS2812B_DUMY_BYTE))
 
 // ----- RGB Digi LED WS WS2812B -----
@@ -219,27 +208,31 @@ volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_1;
 volatile    uint8_t     gRobot_State        = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_State_1      = ROBO_STATE_BALA;
 
-volatile    uint8_t     gRobot_Ident        = 0U;
+volatile    uint8_t     gRobot_Ident_State = 0U;
 
 // ----- FLAGS -----
 volatile    bool        gFlg_Read_MPU       = false;     // Flag signal to read MPU6050
 volatile    bool        gFlg_ADC[ADC_CNT]   = { false }; // Flag signal to read ADCs
-volatile    bool        gFlg_Log_Enable     = false;     // Flag signal to enable sending data via UART
+volatile    bool        gFlg_Log_Enable     = true;     // Flag signal to enable sending data via UART
 volatile    bool        gFlg_Send_UART      = false;     // Flag signal to send data via UART now
 volatile    bool        gFlg_RUN_OuterLoop  = false;     // Flag signal to run outer loop
 volatile    bool        gFlg_RUN_InnerLoop  = false;     // Flag signal to run inner loop
 volatile    bool        gFlg_Motor_EN       = false;     // Flag signal to enable motors
 volatile    bool        gFlg_Read_CRSF      = false;     // Flag signal to read RC commands
+volatile    bool        gFlg_Batt_gauge     = false;     // Flag signal to update WS2812 battery gauge display
+volatile    bool        gFlg_Tilt_gauge     = false;     // Flag signal to update WS2812 tilt angle display
 // ----- COUNTERS -----
 volatile    uint32_t    gCnt_Heart_LED      = LED_HEART_ON_MS;
 volatile    uint8_t     gCnt_Heart_Tick     = 0U;
 volatile    uint32_t    gCnt_MPU_Delay      = TIME_MPU_DELAY_MS;
 volatile    uint32_t    gCnt_UART_Send      = TIME_SEND_DATA_MS;
 volatile    uint32_t    gCnt_OuterLoop      = TIME_MOTOR_OMEGA_MS;
-volatile    uint32_t    gCnt_Fail_Safe      = 0U;
+volatile    uint32_t    gCnt_Fail_Safe      = TIME_FAIL_SAFE_MS;
 volatile    uint32_t    gCnt_CRSF_Read      = TIME_CRSF_MS;
 volatile    uint32_t    gCnt_Identify       = 0U;
 volatile    uint32_t    gCnt_Sample         = 0U;
+volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
+volatile    uint32_t    gCnt_Tilt_gauge     = TIME_TILT_GAU_MS;
 // ----- ERROR COUNTERS -----
 volatile    uint32_t    er_ct[ 24 ];
 volatile    uint32_t    ab_ct[ 24 ]; 
@@ -263,7 +256,7 @@ dt_t duration_us;
 // end of new structure
 #define     MAX_TIMERS  (10U)
 volatile    uint16_t    dt[ MAX_TIMERS ];    // delta time in us
-volatile    uint16_t    dt_over[ MAX_TIMERS ];// delta time over some limit buffer in us
+volatile    uint16_t    dt_over[ MAX_TIMERS ];// delta time over some limit buffer in us - histogram
 volatile    uint16_t    t0[ MAX_TIMERS ];    // save timer value
 #define     STORE_TIMER6(i) ( t0[i] = (uint16_t)DL_TimerG_getTimerCount( TIMER_6_INST ) )
 #define     GET_DURATION(i) ( dt[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0[i]) )
@@ -302,11 +295,13 @@ typedef struct {
 typedef struct {
     // --- 10. GAINS (The "DNA") ---
     struct {
-        float   FF;     // Feed Forward gain     - DIRECT DRIVE
-        float   KP;     // Proportional gain     - SPRING
-        float   KI;     // Integral gain         - STEADY STATE
-        float   KD;     // Gyro derivative gain  - DAMPER
-        float   TI;     // Combined turning gain - YAW
+        float   FF;         // Angle Feed Forward gain     - DIRECT DRIVE
+        float   KP;         // Angle Proportional gain     - SPRING
+        float   KD;         // Angle Gyro derivative gain  - DAMPER
+        float   TI;         // Angle Combined turning gain - YAW
+        float   KP_Pos;     // Robot Position Proportional gain
+        float   KD_Pos;     // Robot Speed Proportional gain
+        // Default Gains see Below \/
     } gain;
     // --- 20. POWER (The "Health") ---
     struct {
@@ -347,13 +342,17 @@ typedef struct {
     struct { 
         float   FFterm_V;           // Feed Forward Term [V]
         float   KPterm_V;           // Proportional term [V]
-        float   KIterm_V;           // Integral term [V]
         float   KDterm_V;           // Derivative term - Damping from gyro [V]
         float   CMterm_V;           // Combined term - common - all action terms [V]
         float   TIterm_V;           // Turning term [V]
-        float   Int_Pitch_err;      // Balancing/Tilt Integral Error
-        float   Err_Pitch_rad;      // Balancing/Tilt Error [rad] - used for controller
         float   SP_Pitch_rad;       // Balancing/Tilt Setpoint [rad] - used from command
+        float   SP_Pos_m;           // Robot Position Setpoint [m] - used when no command received
+        float   SP_Speed_ms;        // Robot Speed Setpoint [m/s] - used when no command received
+        float   Err_Pitch_rad;      // Balancing/Tilt Error [rad] - used for controller
+        float   Err_Pos_m;          // Robot Position Error [m] - used for controller
+        float   Err_Speed_ms;       // Robot Speed Error [m/s] - used for controller
+        float   Correction_Pos_rad; // Angle to correct position error [rad]
+        float   Booster_P_gain;     // Angle correction proportional gain
     } control;
     // --- 70. RC (The "Remote Control") ---
     struct {
@@ -372,25 +371,31 @@ typedef struct {
     } rc_cmd;
 } Robot_t;
 // ----- Robot Defaults -----
-#define FF_GAIN_DEF     (1.01f)
-#define KP_GAIN_DEF     (9.01f)
-#define KI_GAIN_DEF     (5.00f)
-#define KD_GAIN_DEF     (1.51f)
-#define TI_GAIN_DEF     (1.01f)
+#define FF_GAIN_DEF         (1.00f) // Tilt - Feed Forward Default Gain
+#define KP_GAIN_DEF         (10.0f) // Tilt - Proportional Default Gain INNER LOOP (WAS 9.0)
+#define KD_GAIN_DEF         (2.50f) // Tilt - Derivative Default Gain INNER LOOP (WAS 1.5)
+#define TI_GAIN_DEF         (1.00f) // Turn - Proportional Default Gain SIDE LOOP
+#define KP_POS_GAIN_DEF     (0.40f) // Pos  - Proportional Default Gain OUTER LOOP (WAS 0.1)
+#define KD_POS_GAIN_DEF     (0.40f) // Pos  - Derivative Default Gain OUTER LOOP (WAS 0.1)
+// #define KI_GAIN_DEF     (0.00f)
 volatile Robot_t robot = {
     .gain = {
-        .FF = FF_GAIN_DEF,    // [V]
-        .KP = KP_GAIN_DEF,    // [V/rad]
-        .KI = KI_GAIN_DEF,    // [Vs]
-        .KD = KD_GAIN_DEF,    // [Vs/rad]
-        .TI = TI_GAIN_DEF     // [V]
+        .FF = FF_GAIN_DEF,              // [V]
+        .KP = KP_GAIN_DEF,              // [V/rad]
+        .KD = KD_GAIN_DEF,              // [Vs/rad]
+        .TI = TI_GAIN_DEF,              // [V]
+        .KP_Pos = KP_POS_GAIN_DEF,      // [V/m]
+        .KD_Pos = KD_POS_GAIN_DEF       // [V/m/s]
     },
     .power = {
         .batt_volt = VOLT_BATTERY_DEF,  // strong filter used for battery voltage
         .is_low_power = false
     },
     .control = {
-        .SP_Pitch_rad = 0.0f    // upright angle [rad]
+        .SP_Pitch_rad   = 0.0f,     // Default Upright Tilt Angle [rad]
+        .SP_Pos_m       = 0.0f,     // Default Stay Where You Are [m]
+        .SP_Speed_ms    = 0.0f,     // Default Dont Move [m/s]
+        .Booster_P_gain = 1.0f      // Default Booster Gain
     }
 };
 // ----- Define what a "ENCODER" is -----
@@ -678,8 +683,10 @@ int main( void ) {
 ****************************************/
 void TIMER_0_INST_IRQHandler()
 {
+    // ----- 1ms COUNTER for IDENT -----
     gCnt_Identify++;
-    // ----- Heart beat -----
+    
+    // ----- Heart LED beat -----
     if ( --gCnt_Heart_LED == 0 )
     {
         if ( gLED_Seq_Now & ( 1 << gCnt_Heart_Tick ) )
@@ -695,15 +702,52 @@ void TIMER_0_INST_IRQHandler()
         gCnt_Heart_Tick++;
         gCnt_Heart_Tick %= LED_TICK_COUNT;
     }
+
     // ----- MOTOR SPEED/OMEGA MEASUREMENT -----
     if ( --gCnt_OuterLoop == 0 )
     {
         gCnt_OuterLoop = TIME_MOTOR_OMEGA_MS;
         gFlg_RUN_OuterLoop = true;
     }
+
     // ----- MPU - DELAY -----
     if ( gCnt_MPU_Delay > 0 )
         --gCnt_MPU_Delay;
+    
+    // ----- UART - SEND DATA -----
+    if ( --gCnt_UART_Send == 0 )
+    {
+        gCnt_UART_Send = TIME_SEND_DATA_MS;
+        gFlg_Send_UART = true;
+    }
+    
+    // ----- RC - READ DATA -----
+    if ( --gCnt_CRSF_Read == 0 )
+    {
+        gCnt_CRSF_Read = TIME_CRSF_MS;
+        gFlg_Read_CRSF = true;
+    }
+    
+    // ----- COMMUNICATION TIME OUT - motors STOP
+    if ( gCnt_Fail_Safe > 0 )
+    {
+        if ( --gCnt_Fail_Safe == 0 ) {
+            robot.rc_cmd.is_connected = false;
+        }
+    }
+
+    // ----- BATT and TILT GAUGE -----
+    if ( --gCnt_Batt_gauge == 0 )
+    {
+        gCnt_Batt_gauge = TIME_BATT_GAU_MS;
+        gFlg_Batt_gauge = true;
+    }
+    if ( --gCnt_Tilt_gauge == 0 )
+    {
+        gCnt_Tilt_gauge = TIME_TILT_GAU_MS;
+        gFlg_Tilt_gauge = true;
+    }
+
     // ----- MPU - READ DATA -----
     // now in ISR
     // if ( --gCnt_MPU_Read == 0 )
@@ -711,21 +755,6 @@ void TIMER_0_INST_IRQHandler()
     //     gCnt_MPU_Read = TIME_MPU_READ_MS;
     //     gFlg_Read_MPU = true;
     // }
-    // ----- UART - SEND DATA -----
-    if ( --gCnt_UART_Send == 0 )
-    {
-        gCnt_UART_Send = TIME_SEND_DATA_MS;
-        gFlg_Send_UART = true;
-    }
-    // ----- RC - READ DATA -----
-    if ( --gCnt_CRSF_Read == 0 )
-    {
-        gCnt_CRSF_Read = TIME_CRSF_MS;
-        gFlg_Read_CRSF = true;
-    }
-    // ----- COMMUNICATION TIME OUT - motors STOP
-    if ( gCnt_Fail_Safe > 0 )
-        --gCnt_Fail_Safe;
 }
 
 /****************************************
@@ -1104,45 +1133,77 @@ STORE_TIMER6(7);
 
         // --- 40. Feed Forward Term "Direct Drive" (FFgain * CMD) ---
         robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
-        // --- 41. Proportional Term "Spring" (KP * ERR)---
+
+        // --- 41. Smooth the Setpoint Transition - Leaky Integrator Filter ---
+        // Higher alpha (0.99) = Slower, smoother convergence - can never reach the setpoint
+        // Lower alpha (0.90) = Sharper, faster response - zero steady state error
+        float alpha_sp = 0.975f; 
+
+        robot.control.SP_Pitch_rad = (alpha_sp * robot.control.SP_Pitch_rad) + 
+                                    ((1.0f - alpha_sp) * robot.control.Correction_Pos_rad);
+
+        // --- 41. Now calculate error from the smoothed setpoint ---
         robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
-        // P gain booster
+
+        // // --- 41. Smooth the Setpoint Transition - RAMP ---
+        // // 1. Calculate the raw difference (The gap)
+        // float diff = robot.control.Correction_Pos_rad - robot.control.SP_Pitch_rad;
+        // float MAX_SP_STEP = 0.00025f;
+        // // 2. Decide if we need to step up, step down, or we are 'there'
+        // if (diff > MAX_SP_STEP) {
+        //     // Gap is positive and large -> Step up
+        //     robot.control.SP_Pitch_rad += MAX_SP_STEP;
+        // } 
+        // else if (diff < -MAX_SP_STEP) {
+        //     // Gap is negative and large -> Step down
+        //     robot.control.SP_Pitch_rad -= MAX_SP_STEP;
+        // } 
+        // else {
+        //     // We are within one step of the target -> SNAP TO TARGET
+        //     // This is the secret to 0.0 steady-state error!
+        //     robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
+        // }
+        
+        // robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
+        
+        // --- 42. Proportional Term "Spring" (KP * ERR) ---
+        // Error is the difference between setpoint and actual
+        robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
+        
+        // --- 43. P gain Apply with booster - EXPERIMENTAL ---
+        float alpha_boost = 0.975f;
+
         if ( fabsf(robot.control.Err_Pitch_rad) < ANGLE_P_ZONE_RAD ) {
-            robot.control.KPterm_V  = robot.gain.KP * robot.control.Err_Pitch_rad;
+            // converge to default proportional gain
+            robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.00f));
         } else {
-            robot.control.KPterm_V  = 1.5f * robot.gain.KP * robot.control.Err_Pitch_rad;
+            // converge to maximum proportional gain
+            robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.25f));
         }
-        // --- 42. Derivative Term DUMPING "Counter-Force" (KD * RATE) ---
+
+        robot.control.KPterm_V  = robot.gain.KP * robot.control.Booster_P_gain * robot.control.Err_Pitch_rad;
+
+
+        // --- 44. Derivative Term DUMPING "Counter-Force" (KD * RATE) ---
         // If Rate is (+), Result is (-). If Rate is (-), Result is (+).
         robot.control.KDterm_V  = -(robot.gain.KD * robot.body.rateY_rads);
-        // --- 43. GATED Sum Term "Steady State Correction" (SUM=+(ERR*dT)) ---
-        if ( fabsf(robot.control.Err_Pitch_rad) < ANGLE_I_ZONE_RAD) {
-            // Only integrate if we are close to upright
-            robot.control.Int_Pitch_err += robot.control.Err_Pitch_rad * TIME_MPU_READ_SEC;
-        } else {
-            // Slowly bleed it to zero
-            robot.control.Int_Pitch_err *= 0.95f;
-        }
-        // --- 44. Anti-Windup ---
-        if (robot.control.Int_Pitch_err > (VOLT_MOTOR_LIM_I / robot.gain.KI)) 
-            robot.control.Int_Pitch_err = (VOLT_MOTOR_LIM_I / robot.gain.KI);
-        if (robot.control.Int_Pitch_err < -(VOLT_MOTOR_LIM_I / robot.gain.KI)) 
-            robot.control.Int_Pitch_err = -(VOLT_MOTOR_LIM_I / robot.gain.KI);
-        // --- 45. Integral Term (KI * SUM) ---
-        robot.control.KIterm_V = robot.gain.KI * robot.control.Int_Pitch_err;
+        
         // --- 46. Combine ALL Motor terms "Summing Junction" ---
         robot.control.CMterm_V = robot.control.FFterm_V + 
                                  robot.control.KPterm_V + 
-                                //  robot.control.KIterm_V +
                                  robot.control.KDterm_V;
+        
         // --- 47. Motor Voltage Limit ---
         if ( robot.control.CMterm_V > VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = VOLT_MOTOR_LIM_HI;
         if ( robot.control.CMterm_V < -VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = -VOLT_MOTOR_LIM_HI;
+        
         // --- 48. Calculate TURN term ---
         robot.control.TIterm_V  = robot.gain.TI * robot.rc_cmd.roll;
+        
         // --- 49. Motor mixing ---
         robot.motor.left.volt_V  = robot.control.CMterm_V + robot.control.TIterm_V;
         robot.motor.right.volt_V = robot.control.CMterm_V - robot.control.TIterm_V;
+        
         // --------------------------
         // ---- 499. MOTOR CONTROL ---
         // --------------------------
@@ -1190,32 +1251,33 @@ void PID_Outer_Loop( void )
 STORE_TIMER6(8);
         gFlg_RUN_OuterLoop = false;
 
-        // --- 310. Calculate Motor: Angle [rad], Rate [rad/s] and Wheel: Position [m] and Speed [m/s] ---
+        // --- 30. Calculate Motor: Angle [rad], Rate [rad/s] and Wheel: Position [m] and Speed [m/s] ---
         Robot_GetWheelPhysics(&robot.motor.left  , &robot.wheel.left);
         Robot_GetWheelPhysics(&robot.motor.right , &robot.wheel.right);
-        
-        // --- 312. Calculate Wheel speed ---
-        // Wheel_GetSpeed_SG();    // value in variables: bot.drive.wheel.left.speed_ms, bot.drive.wheel.right.speed_ms
-        
-        // --- 313. Calculate ROBOT BODY Position ---
+        // --- 31. Calculate ROBOT BODY Position ---
         robot.body.pos_m = (robot.wheel.left.pos_m + robot.wheel.right.pos_m) * 0.5f;
-        
-        // --- 314. Calculate ROBOT BODY Speed ---
+        // --- 32. Calculate ROBOT BODY Speed --- 
         robot.body.speed_ms = Robot_GetSpeed_SG();      // Savitzky-Golay Derivative Filter
-        
-        // --- 315. Calculate ROBOT TURN Angle ---
+        // --- 33. Calculate ROBOT TURN Angle ---
         robot.body.turn_rad = (robot.wheel.right.pos_m - robot.wheel.left.pos_m) / WHEEL_TRACK_M;
-        
-        // --- 316. Calculate ROBOT TURN Angle rate ---
+        // --- 34. Calculate ROBOT TURN Angle rate ---
         robot.body.turn_rate_rads = Robot_GetTurnRate_SG();    // Savitzky-Golay Derivative Filter
-        
-        // --- 320. Position Controller ---
-        // gPosition_error_m    = gPosition_setPoint_m - gPosition_m;
-        // gPosition_ActVal_deg = gPosition_error_m * gPosition_Gain;  // [deg] = [m] * [deg/m]
-        
-        // --- 330. Speed Controller ---
-        // gSpeed_error_msec    = gSpeed_setPoint_msec - gSpeed_msec;
-        // gSpeed_ActVal_deg    = gSpeed_error_msec * gSpeed_Gain;     // [deg] = [m/sec] * [deg/m/sec]
+        // --- 35. Position Controller ---
+        // run only when no RC communication is active
+        if (!robot.rc_cmd.is_connected)
+        {
+            robot.control.Err_Pos_m    = robot.control.SP_Pos_m    - robot.body.pos_m;
+            robot.control.Err_Speed_ms = robot.control.SP_Speed_ms - robot.body.speed_ms;
+            // Angle as Action Value shall be Negative (-) if Robot Position is positive (+) or Speed is positive (+)
+            robot.control.Correction_Pos_rad = -(robot.control.Err_Pos_m    * robot.gain.KP_Pos +
+                                                 robot.control.Err_Speed_ms * robot.gain.KD_Pos);
+
+            if ( robot.control.Correction_Pos_rad >  ANGLE_SP_PITCH_RAD )
+                robot.control.Correction_Pos_rad =  ANGLE_SP_PITCH_RAD;
+            if ( robot.control.Correction_Pos_rad < -ANGLE_SP_PITCH_RAD )
+                robot.control.Correction_Pos_rad = -ANGLE_SP_PITCH_RAD;
+        }       
+        // --- 3x. Speed Controller ---
         
 GET_DURATION(8);    
 duration_us.outer_loop = dt[8];
@@ -1229,7 +1291,7 @@ STORE_TIMER6( 9 );
     gFlg_Read_CRSF = false;
 
     // 1. SNAPSHOT: Extract and Parse into local/intermediate buffers
-    if (CSFR_Extract_Data() && gCnt_Fail_Safe > 0)
+    if (CSFR_Extract_Data() && robot.rc_cmd.is_connected)
     {
         CSFR_Parse_Data();
 
@@ -1425,12 +1487,12 @@ STORE_TIMER6( 6 );
                 break;
             // ----- REGULATION ------    
             case ROBO_STATE_BALA:      
-                UART0_Tele_Sig[ 0 ] = mpu.iq.iqPitch_rad;
-                UART0_Tele_Sig[ 1 ] = mpu.iq.iqPitch_fil_rad;
-                UART0_Tele_Sig[ 2 ] = 0U;
-                UART0_Tele_Sig[ 3 ] = 0U;
-                UART0_Tele_Sig[ 4 ] = 0U;
-                UART0_Tele_Sig[ 5 ] = 0U;
+                UART0_Tele_Sig[ 0 ] = 1000.0f * robot.body.pitch_rad;
+                UART0_Tele_Sig[ 1 ] = 1000.0f * robot.body.pos_m;
+                UART0_Tele_Sig[ 2 ] = 1000.0f * robot.body.speed_ms;
+                UART0_Tele_Sig[ 3 ] = 1000.0f * robot.control.Correction_Pos_rad;
+                UART0_Tele_Sig[ 4 ] = 1000.0f * robot.control.SP_Pitch_rad;
+                UART0_Tele_Sig[ 5 ] = 1000.0f * robot.control.Err_Pitch_rad;
                 UART0_Send_Tele( 6U );              
                 // UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
                 // UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
@@ -1797,6 +1859,7 @@ bool CSFR_Extract_Data( void )
             CSFR_Header_match++;
             // run Fail Safe Timer
             gCnt_Fail_Safe = TIME_FAIL_SAFE_MS;
+            robot.rc_cmd.is_connected = true;
             // Extract the 22 bytes following the header
             for ( int j = 0 ; j < CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ; j++ )
             {
@@ -2325,7 +2388,7 @@ void Robot_Ident( void )
 {
     if ( gRobot_State == ROBO_STATE_IDENT )
     {
-        switch ( gRobot_Ident ) {
+        switch ( gRobot_Ident_State ) {
         
             // --- MOTOR OFF (0.0V) ---
             case 0U:
@@ -2334,13 +2397,13 @@ void Robot_Ident( void )
                 Motor1_LH_SetVolt( robot.control.CMterm_V );
                 // clear timer counter and go to next state
                 gCnt_Identify = 0U;
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- WAIT 0.5s ---
             case 1U:
             if ( gCnt_Identify >= 500U )
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- SET LOW LEVEL ---
@@ -2351,13 +2414,13 @@ void Robot_Ident( void )
                 Motor1_LH_SetVolt( robot.control.CMterm_V );                    
                 // clear timer counter and go to next state
                 gCnt_Identify = 0U;
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- WAIT 0.5s ---
             case 3U:
             if ( gCnt_Identify >= 500U )
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- Start logging ---
@@ -2366,13 +2429,13 @@ void Robot_Ident( void )
                 gFlg_Log_Enable = true;
                 // clear timer counter and go to next state
                 gCnt_Identify = 0U;
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- WAIT 0.5s ---
             case 5U:
             if ( gCnt_Identify >= 500U )
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- SET HI LEVEL ---
@@ -2383,13 +2446,13 @@ void Robot_Ident( void )
                 Motor1_LH_SetVolt( robot.control.CMterm_V );
                 // clear timer counter and go to next state
                 gCnt_Identify = 0U;
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
             
             // --- WAIT 0.5s ---
             case 7U:
             if ( gCnt_Identify >= 500U )
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- SET LOW LEVEL ---
@@ -2400,13 +2463,13 @@ void Robot_Ident( void )
                 Motor1_LH_SetVolt( robot.control.CMterm_V );
                 // clear timer counter and go to next state
                 gCnt_Identify = 0U;
-                gRobot_Ident++;
+                gRobot_Ident_State++;
             break;
 
             // --- WAIT 0.5s ---
             case 9U:
                 if ( gCnt_Identify >= 500U )
-                    gRobot_Ident++;
+                    gRobot_Ident_State++;
             break;
 
             // --- MOTOR OFF (0.0V) ---
@@ -2420,7 +2483,7 @@ void Robot_Ident( void )
             // --- END ---
                 // reinitialization
                 gRobot_State = ROBO_STATE_BALA;
-                gRobot_Ident = 0U;
+                gRobot_Ident_State = 0U;
             break;                
         }                    
     }
@@ -2632,75 +2695,133 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
 
 void WS2812B_BattGauge_8LED(float voltage)
 {
-    const float Vmax = VOLT_BATTERY_DEF + 0.7f; // 12.0V
-    const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
-    const uint8_t LEDcount = 8;
-    const uint8_t LEDoffset = 0;
+    if ( gFlg_Batt_gauge) {
+        gFlg_Batt_gauge = false;
 
-    // --- Normalize voltage into 0..1 range ---
-    float norm = (voltage - Vmin) / (Vmax - Vmin);
-    if (norm < 0.0f) norm = 0.0f;
-    if (norm > 1.0f) norm = 1.0f;
+        static uint8_t last_active = 8; // Persistent memory
+        const float Vmax = VOLT_BATTERY_DEF + 0.7f; // 12.0V
+        const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
+        const float Hysteresis_V = 0.05f;           // 50mV gap
+        const uint8_t LEDcount = 8;
 
-    // --- Convert to LED steps ---
-    uint8_t active = (uint8_t)(norm * (LEDcount+LEDoffset));
-    if (active == 0) active = 1;   // always show at least 1 LED
+        // 1. Calculate the 'Ideal' active level based on current voltage
+        float norm = (voltage - Vmin) / (Vmax - Vmin);
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        
+        uint8_t current_target = (uint8_t)(norm * LEDcount);
+        if (current_target == 0) current_target = 1;
 
-    // --- Draw the gauge ---
-    for (uint8_t i = LEDoffset; i < (LEDcount+LEDoffset); i++)
-    {
-        if (i < active - 1)
-        {
-            // Full green LEDs
-            WS2812B_LED_Col(i, 0, 0x0F, 0);   // R,G,B
+        // 2. APPLY HYSTERESIS
+        // We only change 'last_active' if the voltage has moved significantly
+        // enough to clear the threshold for a different LED level.
+        
+        // Calculate the voltage threshold for the current LED level
+        float volts_per_led = (Vmax - Vmin) / (float)LEDcount;
+        float threshold_low  = Vmin + (volts_per_led * (last_active - 1)) - Hysteresis_V;
+        float threshold_high = Vmin + (volts_per_led * last_active) + Hysteresis_V;
+
+        if (voltage < threshold_low || voltage > threshold_high) {
+            last_active = current_target;
         }
-        else if (i == active - 1)
+
+        // Use our 'debounced' value for drawing
+        uint8_t active = last_active;
+
+        // --- Draw the gauge (Rest of your logic remains the same) ---
+        for (uint8_t i = 0; i < LEDcount; i++)
         {
-            // Last LED: color depends on battery level
-            if (active == 1)
-                WS2812B_LED_Col(i, 0x10, 0, 0);   // RED (low battery)
-            else
-                WS2812B_LED_Col(i, 0x10, 0x04, 0); // Yellow (transition)
-        }
-        else
-        {
-            // LEDs above active level = OFF
-            WS2812B_LED_Col(i, 0, 0, 0);
+            if (i < active - 1) {
+                WS2812B_LED_Col(i, 0, 0x0F, 0);   // Green
+            }
+            else if (i == active - 1) {
+                if (active == 1)
+                    WS2812B_LED_Col(i, 0x10, 0, 0);   // Red
+                else
+                    WS2812B_LED_Col(i, 0x0F, 0x05, 0); // Yellow
+            }
+            else {
+                WS2812B_LED_Col(i, 0, 0, 0); // Off
+            }
         }
     }
 }
 
+// void WS2812B_BattGauge_8LED(float voltage)
+// {
+//     const float Vmax = VOLT_BATTERY_DEF + 0.7f; // 12.0V
+//     const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
+//     const uint8_t LEDcount = 8;
+//     const uint8_t LEDoffset = 0;
+
+//     // --- Normalize voltage into 0..1 range ---
+//     float norm = (voltage - Vmin) / (Vmax - Vmin);
+//     if (norm < 0.0f) norm = 0.0f;
+//     if (norm > 1.0f) norm = 1.0f;
+
+//     // --- Convert to LED steps ---
+//     uint8_t active = (uint8_t)(norm * (LEDcount+LEDoffset));
+//     if (active == 0) active = 1;   // always show at least 1 LED
+
+//     // --- Draw the gauge ---
+//     for (uint8_t i = LEDoffset; i < (LEDcount+LEDoffset); i++)
+//     {
+//         if (i < active - 1)
+//         {
+//             // Full green LEDs
+//             WS2812B_LED_Col(i, 0, 0x0F, 0);   // R,G,B
+//         }
+//         else if (i == active - 1)
+//         {
+//             // Last LED: color depends on battery level
+//             if (active == 1)
+//                 WS2812B_LED_Col(i, 0x10, 0, 0);   // RED (low battery)
+//             else
+//                 WS2812B_LED_Col(i, 0x10, 0x04, 0); // Yellow (transition)
+//         }
+//         else
+//         {
+//             // LEDs above active level = OFF
+//             WS2812B_LED_Col(i, 0, 0, 0);
+//         }
+//     }
+// }
+
 void WS2812B_TiltGauge_8LED(float tilt_rad)
 {
-    const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
-    const uint8_t LED_COUNT    = 8;
-    const uint8_t LED_OFFSET   = 8; 
+    if ( gFlg_Tilt_gauge) {
+        gFlg_Tilt_gauge = false;
+        
+        const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
+        const uint8_t LED_COUNT    = 8;
+        const uint8_t LED_OFFSET   = 8; 
 
-    // 1. Clamp tilt using the symmetric limit
-    if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
-    if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
+        // 1. Clamp tilt using the symmetric limit
+        if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
+        if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
 
-    // 2. Normalize tilt into 0.0 .. 1.0 range
-    // (tilt + limit) / (2 * limit)
-    float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
+        // 2. Normalize tilt into 0.0 .. 1.0 range
+        // (tilt + limit) / (2 * limit)
+        float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
 
-    // 3. Map to "Left LED" index of the pair (0 to 6)
-    // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
-    uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
-    uint8_t idxB = idxA + 1;
+        // 3. Map to "Left LED" index of the pair (0 to 6)
+        // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
+        uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
+        uint8_t idxB = idxA + 1;
 
-    // 4. Update the LED strip
-    for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
-    {
-        if (i == idxA || i == idxB)
+        // 4. Update the LED strip
+        for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
         {
-            // Active Tilt "Needle" - Red
-            WS2812B_LED_Col(i, 0x0F, 0x00, 0x00); 
-        }
-        else
-        {
-            // Background / Off
-            WS2812B_LED_Col(i, 0x00, 0x00, 0x00);
+            if (i == idxA || i == idxB)
+            {
+                // Active Tilt "Needle" - Red
+                WS2812B_LED_Col(i, 0x0F, 0x00, 0x00); 
+            }
+            else
+            {
+                // Background / Off
+                WS2812B_LED_Col(i, 0x00, 0x00, 0x00);
+            }
         }
     }
 }
