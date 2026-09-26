@@ -4,10 +4,23 @@
  * HARDWARE SPECIFICATIONS:
  *   - 2xPOLOLU 4753 (50:1 Metal Gearmotor 37Dx70Lmm/12V/64CPR)
  *   - MSPM0G3507@80MHz/12.5ns
+ * BAUD RATE: 2.0Mbps
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-05-03 12:12:17
+ * LAST MODIFIED: 2026-09-26 22:59:17
  **********************************************************************/
+
+/*******************************************************************************
+ * JUGGERNAUT SYSTEM TIMING & CONTROL ARCHITECTURE
+ *******************************************************************************
+ * Domain        | Loop Function       | Period  | Rate     | Target / Method
+ * --------------|---------------------|---------|----------|-------------------
+ * Current Loop  | Motor Current       |  400 us | 2.50 kHz | Field/Torque (Unused)
+ * Inner Loop    | Tilt/Balance Ctrl   |  800 us | 1.25 kHz | Angle & Gyro Rate
+ * Command Stream| CRSF/ELRS Receiver  |    4 ms |  250 Hz  | Direct Event ISR
+ * Outer Loop    | Position / Traject  |   10 ms |  100 Hz  | Encoder & Velocity
+ * Telemetry     | PC Diagnostic UART  |   50 ms |   20 Hz  | Telemetry string
+ ******************************************************************************/
 
 /* MSPM0G3507 MCU PIN MAPPING: PORT A & B COMPACT VIEW
  * PORT A (LEFT)                           | PORT B (RIGHT)
@@ -47,8 +60,13 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - Pgain bosster filter added
-// - Position control added (Itegral part removed) - PD-PD controller implemented
+// - Set Point Control from Pitch stick added
+// - Flesh-to-Pass Override added to Tilt Gauge
+// - FF gain term is now boosted by throttle stick in range 1.0f to 2.0f
+// - Motor Current filtering updated, Median 5 filter used with max change by Delta step/slope (50mA/400us) used
+// - Crossfire WAS read in 50ms loop - now a 4ms loop is obtained by direct Header detector in ISR (full speed of CRFR)
+// - Position controller was in conflict with Radio Commands - update/working
+// - Motor Current sampling misaaligment now sample rate is 400us - fix
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -68,8 +86,8 @@
 #define     GLOBAL_IQ 16
 #include    <ti/iqmath/include/IQmathLib.h>
 
-#define     LED_HEART_ON_MS         (100U)          // LED heartbeat turn on
-#define     LED_HEART_OFF_MS        (100U)          // LED heartbeat turn off
+#define     LED_HEART_ON_MS         (97U)           // LED heartbeat turn on
+#define     LED_HEART_OFF_MS        (101U)          // LED heartbeat turn off
 #define     LED_TICK_COUNT          (15U)           // LED heartbeat period
 
 #define     LED_SEQUENCE_0          (0b111111)      // long  blink
@@ -80,18 +98,18 @@
 #define     LED_SEQUENCE_5          (0b101010101)   // five blink
 #define     LED_SEQUENCE_6          (0b10101010101) // six blink
 
-#define     TIME_SEND_DATA_MS       (100U)       // 10Hz send data rate
-// #define     TIME_SEND_DATA_MS       (4U)        // 250Hz updated send rate for identification
-#define     TIME_MOTOR_OMEGA_MS     (10U)       // rate to calculate impulses to determine motor speed
-#define     TIME_MOTOR_OMEGA_S      (0.01f)     // in seconds
-#define     TIME_MPU_DELAY_MS       (250U)      // delay before MPU is initiated
-#define     TIME_MPU_READ_SEC       (0.0008f)   // reading rate of MPU in seconds - Main Sample Period - Inner Loop
-#define     iqTIME_MPU_READ_S    _IQ(0.0008f)   // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
-#define     TIME_CRSF_MS            (50U)       // Cross Fire (Radio Control) protocol
-#define     TIME_FAIL_SAFE_MS       (1500U)     // No command received
+// co-prime numbers are used to avoid harmonics in timebased routines
+#define     TIME_SEND_DATA_MS       (49U)           // 20Hz send data rate
+#define     TIME_MOTOR_OMEGA_MS     (10U)           // rate to calculate impulses to determine motor speed
+#define     TIME_MOTOR_OMEGA_S      (0.01f)         // in seconds
+#define     TIME_MPU_DELAY_MS       (249U)          // delay before MPU is initiated
+#define     TIME_MPU_READ_SEC       (0.0008f)       // reading rate of MPU in seconds - Main Sample Period - Inner Loop
+#define     iqTIME_MPU_READ_S    _IQ(0.0008f)       // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
+#define     TIME_FAIL_SAFE_MS       (1499U)         // No command received
+// #define     TIME_CRSF_MS            (50U)           // Cross Fire (Radio Control) protocol
 
-#define     TIME_BATT_GAU_MS        (250U)      // 4Hz update data rate for battery gauge WS2812B display
-#define     TIME_TILT_GAU_MS        (100U)      // 10Hz update data rate for tilt gauge WS2812B display
+#define     TIME_BATT_GAU_MS        (247U)          // 4Hz update data rate for battery gauge WS2812B display
+#define     TIME_TILT_GAU_MS        (41U)           // 25Hz update data rate for tilt gauge WS2812B display
 
 #define     CRSF_MSG_HEAD_SIZE      (3U)        // 0xC8 SYNC (Start-of-frame), 0x18 LEN (Length of TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
 #define     CRSF_MSG_DATA_SIZE      (22U)       // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
@@ -100,10 +118,10 @@
 #define     CRSF_CHANNEL_COUNT      (16U)
 #define     CRSF_CRC_POLY           (0xD5)      // 0xD5 gives better burst‑error detection for short frames
 
-#define     ANGLE_LIM_BODY_RAD      (0.80f)     // Angle limit - beyond Controller controll is OFF - 0.8rad = 45deg
-#define     ANGLE_LIM_HYST_RAD      (0.40f)     // Angle hysteresis - preventing oscilations - 0.3rad = 18deg
-#define     ANGLE_P_ZONE_RAD        (0.20f)     // Region to boost P terms - 0.2rad = 12deg
-#define     ANGLE_SP_PITCH_RAD      (0.05f)     // Set Point limit for position controller
+#define     ANGLE_LIM_BODY_RAD      (0.80f)     // Angle limit - beyond Controller is OFF   - 0.80rad = 45deg
+#define     ANGLE_LIM_HYST_RAD      (0.40f)     // Angle hysteresis - preventing oscilations- 0.40rad = 24deg
+#define     ANGLE_P_ZONE_RAD        (0.20f)     // Region to boost P terms                  - 0.20rad = 12deg
+#define     ANGLE_SP_PITCH_RAD      (0.05f)     // Set Point limit for position controller  - 0.05rad = 3deg
 
 #define     VOLT_MOTOR_LIM_HI       (8.00f)     // Action value limit for Inner Loop
 #define     VOLT_MOTOR_LIM_LO       (4.00f)     // Action value limit for Side Loop
@@ -116,6 +134,8 @@
 #define     VOLT_SCHTKY_DROP        (0.15f)     // Input rectifier drop
 #define     VOLT_DIVIDER_RATIO      (11.0f)     // (47k + 4.7k) / 4.7k - Batt Voltage divider ratio
 #define     ADC_CNT                 (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
+
+#define     MAX_CURRENT_STEP_A      (0.050f)    // Max allowed change per 400us step (30mA) during Motor Current Measurement
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
 #define     MOTOR_GEAR_RATIO        (50.0f)     // gear ratio
@@ -228,7 +248,7 @@ volatile    uint32_t    gCnt_MPU_Delay      = TIME_MPU_DELAY_MS;
 volatile    uint32_t    gCnt_UART_Send      = TIME_SEND_DATA_MS;
 volatile    uint32_t    gCnt_OuterLoop      = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    gCnt_Fail_Safe      = TIME_FAIL_SAFE_MS;
-volatile    uint32_t    gCnt_CRSF_Read      = TIME_CRSF_MS;
+// volatile    uint32_t    gCnt_CRSF_Read      = TIME_CRSF_MS;
 volatile    uint32_t    gCnt_Identify       = 0U;
 volatile    uint32_t    gCnt_Sample         = 0U;
 volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
@@ -240,21 +260,23 @@ volatile    uint32_t    ab_wr_ct[ 4 ];  // I2C duration in CPU_tics only for MPU
 volatile    uint32_t    ab_rl_ct[ 9 ];  // I2C duration in CPU_tics only for MPU_Read_Len();
 // ----- DURATION TIMERS -----
 typedef struct {
-    uint32_t quad_isr;      // dt 0: ISR
+    uint32_t quad_isr;      // dt 0: quadrature ISR
     uint32_t mpu_read;      // dt 1: I2C/SPI overhead
     uint32_t uav_physics;   // dt 2 & 3: Scaling, G-calc, Rad/s
     uint32_t trigonometry;  // dt 4: atan2f, sqrt
     uint32_t comp_filter;   // dt 5: The Alpha blend
     uint32_t uart_comms;    // dt 6: Buffer filling and TX
-    uint32_t inner_loop;    // dt 7
-    uint32_t outer_loop;    // dt 8
-    uint32_t csfr;          // dt 9
+    uint32_t inner_loop;    // dt 7: Tilt control
+    uint32_t outer_loop;    // dt 8: Position control
+    uint32_t csfr;          // dt 9: Commands
+    uint32_t adc_m0;        // dt 10: ADC M0 sample time
+    uint32_t adc_m1;        // dt 11: ADC M1 sample time
     uint32_t total_loop;    // total sum - The heartbeat of your UAV
 } dt_t;
 // Global or module-level instance
 dt_t duration_us;
 // end of new structure
-#define     MAX_TIMERS  (10U)
+#define     MAX_TIMERS  (12U)   // number of timers WAS 10
 volatile    uint16_t    dt[ MAX_TIMERS ];    // delta time in us
 volatile    uint16_t    dt_over[ MAX_TIMERS ];// delta time over some limit buffer in us - histogram
 volatile    uint16_t    t0[ MAX_TIMERS ];    // save timer value
@@ -262,7 +284,7 @@ volatile    uint16_t    t0[ MAX_TIMERS ];    // save timer value
 #define     GET_DURATION(i) ( dt[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0[i]) )
 // ----- ANALOG - EMA COEF -----
 #define     BATT_VOLT_EMA_ALPHA     (0.01f)         // Exponential Moving Average coef - Battery voltage
-#define     MOTOR_CURR_EMA_ALPHA    (0.01f)         // Exponential Moving Average coef - Motor Current
+#define     MOTOR_CURR_EMA_ALPHA    (0.01f)         // Exponential Moving Average coef - Motor Current - WAS 0.01
 volatile    float       gBATT_EMA_Coef   = BATT_VOLT_EMA_ALPHA;
 volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
 // ----- ANALOG - All channels -----
@@ -280,8 +302,10 @@ typedef struct {
     float   theta_rad;          // Motor Angle (rad)
     float   theta_hist_rad[5];  // Motor Angle history (rad) - for SG derivative filter
     float   omega_rads;         // Motor Angular velocity (rad/s)
-    float   curr_A;             // Motor Current (A)
-    float   curr_hist_A[3];     // Motor Current history (A) - for Median filter
+    float   curr_ema_A;         // Motor Current (A) - Exponential Moving Average filter
+    float   curr_med3_A;        // Motor Current (A) - Median filter - Almost raw data
+    float   curr_med5_A;        // Motor Current (A) - Median filter - Almost raw data
+    float   curr_hist_A[5];     // Motor Current history (A) - for Median filter
     float   volt_V;             // Motor Voltage (V)
 } motor_t;
 // ----- Define what a "POWER" is -----
@@ -367,16 +391,17 @@ typedef struct {
         float state3_L;             // [-1.00, 1.00] - State 3 switch input
         float state3_R;             // [-1.00, 1.00] - State 3 switch input
         float latch_R;              // [-1.00, 1.00] - Latch switch input
+        float button_L;             // [-1.00, 1.00] - Button switch input
         bool is_connected;          // Failsafe flag
     } rc_cmd;
 } Robot_t;
 // ----- Robot Defaults -----
-#define FF_GAIN_DEF         (1.00f) // Tilt - Feed Forward Default Gain
-#define KP_GAIN_DEF         (10.0f) // Tilt - Proportional Default Gain INNER LOOP (WAS 9.0)
-#define KD_GAIN_DEF         (2.50f) // Tilt - Derivative Default Gain INNER LOOP (WAS 1.5)
-#define TI_GAIN_DEF         (1.00f) // Turn - Proportional Default Gain SIDE LOOP
-#define KP_POS_GAIN_DEF     (0.40f) // Pos  - Proportional Default Gain OUTER LOOP (WAS 0.1)
-#define KD_POS_GAIN_DEF     (0.40f) // Pos  - Derivative Default Gain OUTER LOOP (WAS 0.1)
+#define FF_GAIN_DEF         (2.50f) // Tilt - Feed Forward Default Gain             (WAS 1.0)
+#define KP_GAIN_DEF         (10.0f) // Tilt - Proportional Default Gain INNER LOOP  (WAS 9.0)
+#define KD_GAIN_DEF         (2.00f) // Tilt - Derivative Default Gain INNER LOOP    (WAS 1.5)
+#define TI_GAIN_DEF         (2.50f) // Turn - Proportional Default Gain SIDE LOOP   (WAS 1.0)
+#define KP_POS_GAIN_DEF     (0.00f) // Pos  - Proportional Default Gain OUTER LOOP  (WAS 0.4)
+#define KD_POS_GAIN_DEF     (0.00f) // Pos  - Derivative Default Gain OUTER LOOP    (WAS 0.4)
 // #define KI_GAIN_DEF     (0.00f)
 volatile Robot_t robot = {
     .gain = {
@@ -441,20 +466,21 @@ volatile    uint8_t     gUART0_MessageLength = 0;
 volatile    uint8_t     gUART0_TXbytes = 0;
 
 // ***** UART1 - Radio Control *****
-#define     RX1_BUFF_N  (5U) 
-#define     UART1_RX_BUFFER_SIZE (1U<<RX1_BUFF_N)
+#define     RX1_BUFF_N  (5U)    // 5 -> 2^5 -> 32
+#define     UART1_RX_BUFFER_SIZE (1U<<RX1_BUFF_N)   // 32
 volatile    uint8_t     gUART1_RXbuffer[ UART1_RX_BUFFER_SIZE ];
 volatile    uint8_t     gUART1_RXbuffer_index = 0;
-volatile    uint8_t     UART1_TX_counter = 0;
-// Cross Fire
-volatile    uint32_t    CSFR_Header_match = 0;
-volatile    uint32_t    CSFR_CRC_match = 0;
-volatile    uint32_t    CSFR_CRC_error = 0;
+volatile    bool        gUART1_frame_ready = false; // CSFR frame is ready (received)
+// volatile    uint8_t     UART1_TX_counter = 0;
+// Cross Fire Counters
+volatile    uint32_t    gCSFR_Header_match_cnt = 0;
+volatile    uint32_t    gCSFR_CRC_match_cnt = 0;
+volatile    uint32_t    gCSFR_CRC_error_cnt = 0;
 
-volatile    uint8_t     CSFR_Data_RX[ CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ];
-volatile    uint8_t     CSFR_Data_Reversed[ CRSF_MSG_DATA_SIZE ];
-volatile    uint8_t     CSFR_CRC_Received = 0;
-volatile    uint8_t     CSFR_CRC_Calculated = 0;
+volatile    uint8_t     gCSFR_Data_RX[ CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ];
+volatile    uint8_t     gCSFR_Data_Reversed[ CRSF_MSG_DATA_SIZE ];
+// volatile    uint8_t     CSFR_CRC_Received = 0;
+volatile    uint8_t     gCSFR_CRC_Calculated = 0;
 volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
 
 // ***** I2C1 - GYRO ACCELEROMETER *****
@@ -620,6 +646,7 @@ void        Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawAD
 void        Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB );
 
 static inline float Filter_Median3_f(float a, float b, float c);
+static inline float Filter_Median5_f(float p0, float p1, float p2, float p3, float p4);
 
 bool        MPU_UAV_Calculation ( volatile mpu_t *argMPU );
 uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA );
@@ -631,8 +658,6 @@ void        WS2812B_TiltGauge_8LED(float tilt_rad);
 void        WS2812B_All_LED(uint8_t ArgColor, uint8_t ArgBrightness);
 void        WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B);
 void        WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2, uint8_t argBrg1, uint8_t argBrg2);
-
-char* Fast_f2s_SigFigs(char* argBuffer, float argVal, uint8_t argSigFigs);
 
 // *****************************************  *****************************************  *****************************************
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
@@ -722,11 +747,11 @@ void TIMER_0_INST_IRQHandler()
     }
     
     // ----- RC - READ DATA -----
-    if ( --gCnt_CRSF_Read == 0 )
-    {
-        gCnt_CRSF_Read = TIME_CRSF_MS;
-        gFlg_Read_CRSF = true;
-    }
+    // if ( --gCnt_CRSF_Read == 0 )
+    // {
+    //     gCnt_CRSF_Read = TIME_CRSF_MS;
+    //     gFlg_Read_CRSF = true;
+    // }
     
     // ----- COMMUNICATION TIME OUT - motors STOP
     if ( gCnt_Fail_Safe > 0 )
@@ -781,6 +806,9 @@ void ADC12_0_INST_IRQHandler( void )
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
             gFlg_ADC[ 2 ] = true;
             gADC_LSB[ 2 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_CURR_M1 );
+GET_DURATION(11);
+duration_us.adc_m1 = dt[11];
+STORE_TIMER6(11);
             break;    
         default:
             break;
@@ -803,6 +831,9 @@ void ADC12_1_INST_IRQHandler( void )
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
             gFlg_ADC[ 1 ] = true;
             gADC_LSB[ 1 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_CURR_M0 );
+GET_DURATION(10);
+duration_us.adc_m0 = dt[10];
+STORE_TIMER6(10);
             break;    
         case DL_ADC12_IIDX_MEM2_RESULT_LOADED:
             gFlg_ADC[ 0 ] = true;
@@ -848,22 +879,90 @@ void UART_0_INST_IRQHandler( void )
 ****************************************/
 void UART_1_INST_IRQHandler( void )
 {
+    uint8_t rx_byte = 0;
+
     switch ( DL_UART_Main_getPendingInterrupt( UART_1_INST ) )
     {
         case DL_UART_MAIN_IIDX_RX:
-            gUART1_RXbuffer[ gUART1_RXbuffer_index ] = DL_UART_Main_receiveData( UART_1_INST );
-            gUART1_RXbuffer_index = ( gUART1_RXbuffer_index + 1 ) % UART1_RX_BUFFER_SIZE;
-                // UART1_RXbuffer[ UART1_RXbuffer_index++ % UART1_RX_BUFFER_SIZE ] = DL_UART_Main_receiveData( UART_1_INST );  
-        break;
+            // Read hardware FIFO directly into local variable
+            rx_byte = (uint8_t)DL_UART_Main_receiveData( UART_1_INST );
+
+            // --- BYTE 0: Must be SYNC (0xC8) ---
+            if ( gUART1_RXbuffer_index == 0 )
+            {
+                if ( rx_byte == 0xC8 )
+                {
+                    gUART1_RXbuffer[0] = rx_byte;
+                    gUART1_RXbuffer_index = 1;
+                }
+                break;
+            }
+
+            // --- BYTE 1: Must be LENGTH (0x18) ---
+            if ( gUART1_RXbuffer_index == 1 )
+            {
+                if ( rx_byte == 0x18 )
+                {
+                    gUART1_RXbuffer[1] = rx_byte;
+                    gUART1_RXbuffer_index = 2;
+                }
+                else
+                {
+                    gUART1_RXbuffer_index = 0; // Alignment lost, reset
+                }
+                break;
+            }
+
+            // --- BYTE 2: Must be TYPE (0x16) ---
+            if ( gUART1_RXbuffer_index == 2 )
+            {
+                if ( rx_byte == 0x16 )
+                {
+                    gUART1_RXbuffer[2] = rx_byte;
+                    gUART1_RXbuffer_index = 3;
+                }
+                else
+                {
+                    gUART1_RXbuffer_index = 0; // Alignment lost, reset
+                }
+                break;
+            }
+
+            // --- PAYLOAD & CRC (Bytes 3 to 25) ---
+            gUART1_RXbuffer[gUART1_RXbuffer_index++] = rx_byte;
+
+            // Full 24-byte packet collected
+            if ( gUART1_RXbuffer_index >= 26 )
+            {
+                gUART1_frame_ready = true; // Signal main loop to run CRC & decode channels
+                gUART1_RXbuffer_index = 0; // Reset index for next incoming frame
+            }
+            break;
 
         case DL_UART_MAIN_IIDX_TX:
-
-        break;
+            break;
 
         default:
             break;
     }
 }
+// void UART_1_INST_IRQHandler( void )
+// {
+//     switch ( DL_UART_Main_getPendingInterrupt( UART_1_INST ) )
+//     {
+//         case DL_UART_MAIN_IIDX_RX:
+//             gUART1_RXbuffer[ gUART1_RXbuffer_index ] = DL_UART_Main_receiveData( UART_1_INST );
+//             gUART1_RXbuffer_index = ( gUART1_RXbuffer_index + 1 ) % UART1_RX_BUFFER_SIZE;
+//         break;
+
+//         case DL_UART_MAIN_IIDX_TX:
+
+//         break;
+
+//         default:
+//             break;
+//     }
+// }
 /****************************************
 *****   I2C 1 TRANSMITTER          *****
 ****************************************/
@@ -1128,49 +1227,36 @@ void PID_Inner_Loop( void )
     
     if ( (gFlg_RUN_InnerLoop) && (gRobot_State == ROBO_STATE_BALA) )
     {
+GET_DURATION(7);
+duration_us.inner_loop = dt[7];
 STORE_TIMER6(7);
         gFlg_RUN_InnerLoop = false;
 
         // --- 40. Feed Forward Term "Direct Drive" (FFgain * CMD) ---
         robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
 
+        // --- 41. Determine the Setpoint ---
+        if (robot.rc_cmd.is_connected){
+            // robot.control.SP_Pitch_rad = 0.0f;
+        } else {
+            robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
+        }
+        
         // --- 41. Smooth the Setpoint Transition - Leaky Integrator Filter ---
         // Higher alpha (0.99) = Slower, smoother convergence - can never reach the setpoint
         // Lower alpha (0.90) = Sharper, faster response - zero steady state error
-        float alpha_sp = 0.975f; 
+        // float alpha_sp = 0.975f; 
 
-        robot.control.SP_Pitch_rad = (alpha_sp * robot.control.SP_Pitch_rad) + 
-                                    ((1.0f - alpha_sp) * robot.control.Correction_Pos_rad);
-
+        // robot.control.SP_Pitch_rad = (alpha_sp * robot.control.SP_Pitch_rad) + 
+        //                             ((1.0f - alpha_sp) * robot.control.Correction_Pos_rad);
         // --- 41. Now calculate error from the smoothed setpoint ---
-        robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
-
-        // // --- 41. Smooth the Setpoint Transition - RAMP ---
-        // // 1. Calculate the raw difference (The gap)
-        // float diff = robot.control.Correction_Pos_rad - robot.control.SP_Pitch_rad;
-        // float MAX_SP_STEP = 0.00025f;
-        // // 2. Decide if we need to step up, step down, or we are 'there'
-        // if (diff > MAX_SP_STEP) {
-        //     // Gap is positive and large -> Step up
-        //     robot.control.SP_Pitch_rad += MAX_SP_STEP;
-        // } 
-        // else if (diff < -MAX_SP_STEP) {
-        //     // Gap is negative and large -> Step down
-        //     robot.control.SP_Pitch_rad -= MAX_SP_STEP;
-        // } 
-        // else {
-        //     // We are within one step of the target -> SNAP TO TARGET
-        //     // This is the secret to 0.0 steady-state error!
-        //     robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
-        // }
+        // robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
         
-        // robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
         
-        // --- 42. Proportional Term "Spring" (KP * ERR) ---
         // Error is the difference between setpoint and actual
         robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
         
-        // --- 43. P gain Apply with booster - EXPERIMENTAL ---
+        // --- 42. P gain Updated with booster - EXPERIMENTAL ---
         float alpha_boost = 0.975f;
 
         if ( fabsf(robot.control.Err_Pitch_rad) < ANGLE_P_ZONE_RAD ) {
@@ -1178,9 +1264,10 @@ STORE_TIMER6(7);
             robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.00f));
         } else {
             // converge to maximum proportional gain
-            robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.25f));
+            robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.50f));
         }
 
+        // --- 43. Proportional Term "Spring" (KP * ERR) ---
         robot.control.KPterm_V  = robot.gain.KP * robot.control.Booster_P_gain * robot.control.Err_Pitch_rad;
 
 
@@ -1236,8 +1323,6 @@ STORE_TIMER6(7);
             Motor0_RH_SetVolt( 0.0f );
             Motor1_LH_SetVolt( 0.0f );
         }
-GET_DURATION(7);
-duration_us.inner_loop = dt[7];
     }
 }
 
@@ -1248,6 +1333,8 @@ void PID_Outer_Loop( void )
 {
     if ( gFlg_RUN_OuterLoop )
     {
+GET_DURATION(8);    
+duration_us.outer_loop = dt[8];
 STORE_TIMER6(8);
         gFlg_RUN_OuterLoop = false;
 
@@ -1263,6 +1350,7 @@ STORE_TIMER6(8);
         // --- 34. Calculate ROBOT TURN Angle rate ---
         robot.body.turn_rate_rads = Robot_GetTurnRate_SG();    // Savitzky-Golay Derivative Filter
         // --- 35. Position Controller ---
+        
         // run only when no RC communication is active
         if (!robot.rc_cmd.is_connected)
         {
@@ -1276,82 +1364,14 @@ STORE_TIMER6(8);
                 robot.control.Correction_Pos_rad =  ANGLE_SP_PITCH_RAD;
             if ( robot.control.Correction_Pos_rad < -ANGLE_SP_PITCH_RAD )
                 robot.control.Correction_Pos_rad = -ANGLE_SP_PITCH_RAD;
-        }       
-        // --- 3x. Speed Controller ---
+        } else {
+            robot.control.Err_Pos_m    = 0.0f;
+            robot.control.Err_Speed_ms = 0.0f;
+            robot.control.Correction_Pos_rad = 0.0f;
+        }
         
-GET_DURATION(8);    
-duration_us.outer_loop = dt[8];
+        
     }
-}
-
-void CSFR_Update(void)
-{
-    if (!gFlg_Read_CRSF) return;
-STORE_TIMER6( 9 );
-    gFlg_Read_CRSF = false;
-
-    // 1. SNAPSHOT: Extract and Parse into local/intermediate buffers
-    if (CSFR_Extract_Data() && robot.rc_cmd.is_connected)
-    {
-        CSFR_Parse_Data();
-
-        // 2. PROCESS: Use local variables for math to keep the pipeline clean
-        // Pre-calculated coefficients (using 174-1811 range) to map into -1.00f to +1.00f
-        // a = (+1.00-(-1.00)) / (1811-174) = 0.00122175f
-        // b = -1.00 - (a * 174) ≈ -1.21258f
-        const float a1 = 0.00122175f;
-        const float b1 = -1.21258f;
-
-        // Map primary sticks (-100 to +100)
-        float loc_roll     = a1 * (float)robot.rc_cmd.ch[0] + b1;
-        float loc_pitch    = a1 * (float)robot.rc_cmd.ch[1] + b1;
-        float loc_throttle = a1 * (float)robot.rc_cmd.ch[2] + b1;
-        float loc_yaw      = a1 * (float)robot.rc_cmd.ch[3] + b1;
-
-        // Pre-calculated coefficients (using 191-1792 range) to map into 1.00f to 1.50f
-        // currently used to boost gains
-        const float a2 = (1.5f-(1.0f)) / (1792.0f-191.0f);    // results in 0.000278141f
-        const float b2 = (1.0f) - (a2 * 191.0f);
-        
-        float loc_latch_L  = a2 * (float)robot.rc_cmd.ch[4] + b2;
-        float loc_state3_L = a2 * (float)robot.rc_cmd.ch[5] + b2;
-        float loc_state3_R = a2 * (float)robot.rc_cmd.ch[6] + b2;
-        float loc_latch_R  = a2 * (float)robot.rc_cmd.ch[7] + b2;
-
-        // 3. COMMIT: Write processed data back to the global struct in one block
-        robot.rc_cmd.roll     = loc_roll;
-        robot.rc_cmd.pitch    = loc_pitch;
-        robot.rc_cmd.throttle = loc_throttle;
-        robot.rc_cmd.yaw      = loc_yaw;
-        
-        robot.rc_cmd.latch_L  = loc_latch_L;
-        robot.rc_cmd.state3_L = loc_state3_L;
-        robot.rc_cmd.state3_R = loc_state3_R;
-        robot.rc_cmd.latch_R  = loc_latch_R;
-
-        // Setpoint and Feed Forward term update
-        float sp_pitch          = -1.0f * (float)loc_pitch;    // Pitch Set point range -1.0 to 1.0 rad
-        
-        // Apply Limits
-        #define PITCH_ANGLE_LIMIT_RAD (1.05f)
-        if (sp_pitch >  PITCH_ANGLE_LIMIT_RAD) sp_pitch =  PITCH_ANGLE_LIMIT_RAD;
-        if (sp_pitch < -PITCH_ANGLE_LIMIT_RAD) sp_pitch = -PITCH_ANGLE_LIMIT_RAD;
-        
-        robot.control.SP_Pitch_rad = sp_pitch;
-
-        // Apply boosted gains
-        robot.gain.KP = KP_GAIN_DEF * loc_latch_L * loc_state3_L;
-        robot.gain.KD = KD_GAIN_DEF * loc_latch_R * loc_state3_R;
-    }
-    else
-    {
-        // FAILSAFE COMMIT
-        robot.control.SP_Pitch_rad  *= 0.9f;    // upright angle fade
-        robot.rc_cmd.roll           *= 0.9f;    // turning fade
-        robot.rc_cmd.pitch          *= 0.9f;    // pitching fade
-    }
-GET_DURATION( 9 );
-duration_us.csfr = dt[9];  
 }
 
 // ----- ANALOG MEASUREMENT -----
@@ -1370,7 +1390,6 @@ void ADC12_Update( void )
             if ( i == 0 ) {
                 Robot_GetBatteryVoltage( (power_t *)&robot.power , gADC_LSB[0] );
             }
-
             // >> MOTORS  <<            
             // Motor 0
             if ( i == 1 ) {
@@ -1487,13 +1506,22 @@ STORE_TIMER6( 6 );
                 break;
             // ----- REGULATION ------    
             case ROBO_STATE_BALA:      
-                UART0_Tele_Sig[ 0 ] = 1000.0f * robot.body.pitch_rad;
-                UART0_Tele_Sig[ 1 ] = 1000.0f * robot.body.pos_m;
-                UART0_Tele_Sig[ 2 ] = 1000.0f * robot.body.speed_ms;
-                UART0_Tele_Sig[ 3 ] = 1000.0f * robot.control.Correction_Pos_rad;
-                UART0_Tele_Sig[ 4 ] = 1000.0f * robot.control.SP_Pitch_rad;
-                UART0_Tele_Sig[ 5 ] = 1000.0f * robot.control.Err_Pitch_rad;
-                UART0_Send_Tele( 6U );              
+                // UART0_Tele_Sig[ 0 ] =duration_us.adc_m0;    // motor 0 (right) current duration
+                // UART0_Tele_Sig[ 1 ] =duration_us.adc_m1;    // motor 1 (left) current duration
+                UART0_Tele_Sig[ 0 ] = 1000.0f * robot.motor.left.curr_med5_A;
+                UART0_Tele_Sig[ 1 ] = 1000.0f * robot.motor.left.curr_ema_A;
+                UART0_Tele_Sig[ 2 ] = 1000.0f * robot.motor.right.curr_med5_A;
+                UART0_Tele_Sig[ 3 ] = 1000.0f * robot.motor.right.curr_ema_A;
+                UART0_Send_Tele( 4U );              
+                // UART0_Tele_Sig[ 4 ] = duration_us.csfr;    // CSFR duration
+                
+                // UART0_Tele_Sig[ 0 ] = 1000.0f * robot.body.pitch_rad;
+                // UART0_Tele_Sig[ 1 ] = 1000.0f * robot.body.pos_m;
+                // UART0_Tele_Sig[ 2 ] = 1000.0f * robot.body.speed_ms;
+                // UART0_Tele_Sig[ 3 ] = 1000.0f * robot.control.Correction_Pos_rad;
+                // UART0_Tele_Sig[ 4 ] = 1000.0f * robot.control.SP_Pitch_rad;
+                // UART0_Tele_Sig[ 5 ] = 1000.0f * robot.control.Err_Pitch_rad;
+                // UART0_Send_Tele( 6U );              
                 // UART0_signals[  0 ] = 100.0f * gAngle_PITCH_Deg;         // raw Pitch FAST
                 // UART0_signals[  1 ] = 100.0f * gAngle_PITCH_Deg_CF;   // filtered Pitch
                 // UART0_signals[  2 ] = 100.0f * PID_actVal;              // Total Action value volt
@@ -1540,8 +1568,8 @@ STORE_TIMER6( 6 );
                 UART0_Tele_Sig[ 1 ] = robot.control.CMterm_V;
                 UART0_Tele_Sig[ 2 ] = robot.motor.left.imp;
                 UART0_Tele_Sig[ 3 ] = robot.motor.right.imp;
-                UART0_Tele_Sig[ 4 ] = 1000.0f * robot.motor.left.curr_A;
-                UART0_Tele_Sig[ 5 ] = 1000.0f * robot.motor.right.curr_A;
+                UART0_Tele_Sig[ 4 ] = 1000.0f * robot.motor.left.curr_ema_A;
+                UART0_Tele_Sig[ 5 ] = 1000.0f * robot.motor.right.curr_ema_A;
                 UART0_Send_Tele ( 6U );
                 break;
             // ----- ERROR ------
@@ -1798,6 +1826,90 @@ void UART0_ClearBuff( void )
     gUART0_RXbytes = 0;
 }
 
+void CSFR_Update(void)
+{
+    // if (!gFlg_Read_CRSF) return; - time based eliminated
+    // gFlg_Read_CRSF = false;
+
+    if (!gUART1_frame_ready) return;
+    gUART1_frame_ready = false;
+
+GET_DURATION( 9 );
+duration_us.csfr = dt[9];  
+STORE_TIMER6( 9 );
+
+    // 1. SNAPSHOT: Extract and Parse into local/intermediate buffers
+    if (CSFR_Extract_Data() && robot.rc_cmd.is_connected)
+    {
+        CSFR_Parse_Data();
+
+        // 2. PROCESS: Use local variables for math to keep the pipeline clean
+        
+        // Pre-calculated coefficients (using 174-1811 range) to map into -1.00f to +1.00f
+        // a = (+1.00-(-1.00)) / (1811-174) = 0.00122175f
+        // b = -1.00 - (a * 174) ≈ -1.21258f
+        const float a1 = 0.00122175f;
+        const float b1 = -1.21258f;
+
+        float loc_roll     = a1 * (float)robot.rc_cmd.ch[0] + b1;
+        float loc_pitch    = a1 * (float)robot.rc_cmd.ch[1] + b1;
+        // float loc_throttle = a1 * (float)robot.rc_cmd.ch[2] + b1;
+        float loc_yaw      = a1 * (float)robot.rc_cmd.ch[3] + b1;
+
+        // Pre-calculated coefficients (using 191.0f-1792.0f range) to map into +1.00f to +1.50f
+        const float a2 = (+1.50f-(+1.00f)) / (1792.0f-191.0f);    // results in 0.000278141f
+        const float b2 = (+1.00f) - (a2 * 191.0f);
+        
+        float loc_latch_L  = a2 * (float)robot.rc_cmd.ch[4] + b2;
+        float loc_state3_L = a2 * (float)robot.rc_cmd.ch[5] + b2;
+        float loc_state3_R = a2 * (float)robot.rc_cmd.ch[6] + b2;
+        float loc_latch_R  = a2 * (float)robot.rc_cmd.ch[7] + b2;
+        float loc_button_L = a2 * (float)robot.rc_cmd.ch[8] + b2;
+
+        // Pre-calculated coefficients (using 174-1811 range) to map into +1.00f to +2.00f
+        const float a3 = (+2.0f-(+1.0f)) / (1811.0f-174.0f);
+        const float b3 = (+1.0f) - (a3 * 174.0f);
+
+        float loc_throttle = a3 * (float)robot.rc_cmd.ch[2] + b3;
+
+        // 3. COMMIT: Write processed data back to the global struct in one block
+        robot.rc_cmd.roll     = loc_roll;
+        robot.rc_cmd.pitch    = loc_pitch;
+        robot.rc_cmd.throttle = loc_throttle;
+        robot.rc_cmd.yaw      = loc_yaw;
+        
+        robot.rc_cmd.latch_L  = loc_latch_L;
+        robot.rc_cmd.state3_L = loc_state3_L;
+        robot.rc_cmd.state3_R = loc_state3_R;
+        robot.rc_cmd.latch_R  = loc_latch_R;
+
+        robot.rc_cmd.button_L = loc_button_L;
+
+        // Setpoint and Feed Forward term update
+        float sp_pitch          = 0.25f * (float)loc_pitch;    // Pitch Set point range -1.0 to 1.0 rad
+        
+        // Apply Limits
+        #define PITCH_ANGLE_LIMIT_RAD (1.05f)
+        if (sp_pitch >  PITCH_ANGLE_LIMIT_RAD) sp_pitch =  PITCH_ANGLE_LIMIT_RAD;
+        if (sp_pitch < -PITCH_ANGLE_LIMIT_RAD) sp_pitch = -PITCH_ANGLE_LIMIT_RAD;
+        
+        robot.control.SP_Pitch_rad = sp_pitch;
+
+        // Apply boosted gains
+        robot.gain.KP = KP_GAIN_DEF * loc_latch_L * loc_state3_L;
+        robot.gain.KD = KD_GAIN_DEF * loc_latch_R * loc_state3_R;
+        // new boosted Feed Forward term
+        robot.gain.FF = FF_GAIN_DEF * loc_throttle;
+    }
+    else
+    {
+        // FAILSAFE COMMIT
+        robot.control.SP_Pitch_rad  *= 0.9f;    // upright angle fade
+        robot.rc_cmd.roll           *= 0.9f;    // turning fade
+        robot.rc_cmd.pitch          *= 0.9f;    // pitching fade
+    }
+}
+
 uint8_t CSFR_Get_CRC8( void )
 {
     uint8_t crc = 0;
@@ -1805,7 +1917,7 @@ uint8_t CSFR_Get_CRC8( void )
     crc = crc8tab[ crc ^ 0x16 ];
 
     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
-        crc = crc8tab[ crc ^ CSFR_Data_RX[ i ] ];
+        crc = crc8tab[ crc ^ gCSFR_Data_RX[ i ] ];
     return crc;
 }    
 
@@ -1845,7 +1957,10 @@ uint8_t CSFR_Get_CRC8( void )
 // Function to extract data following the header
 bool CSFR_Extract_Data( void ) 
 {
-    // Define header sequence - Sync Byte, Bytes count, 16 RC channels
+    // Define header sequence - Sync Byte (Flight Controller), Bytes count, 16 RC channels
+    // 0xC8 - Flight Controller
+    // 0x18 - Payload Length = Frame ID (1B) + Data (22B) + CRC byte (1B) = 24B -> 0x18
+    // 0x16 - Frame ID - RC channels
     uint8_t header[ CRSF_MSG_HEAD_SIZE ] = { 0xC8 , 0x18 , 0x16 };
 
     // Search for header in the buffer
@@ -1856,29 +1971,29 @@ bool CSFR_Extract_Data( void )
             gUART1_RXbuffer[ ( i + 1 ) % UART1_RX_BUFFER_SIZE ] == header[ 1 ] &&
             gUART1_RXbuffer[ ( i + 2 ) % UART1_RX_BUFFER_SIZE ] == header[ 2 ] )
         {
-            CSFR_Header_match++;
+            gCSFR_Header_match_cnt++;
             // run Fail Safe Timer
             gCnt_Fail_Safe = TIME_FAIL_SAFE_MS;
             robot.rc_cmd.is_connected = true;
             // Extract the 22 bytes following the header
             for ( int j = 0 ; j < CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ; j++ )
             {
-                CSFR_Data_RX[ j ] = gUART1_RXbuffer[ ( i + CRSF_MSG_HEAD_SIZE + j ) % UART1_RX_BUFFER_SIZE ];
+                gCSFR_Data_RX[ j ] = gUART1_RXbuffer[ ( i + CRSF_MSG_HEAD_SIZE + j ) % UART1_RX_BUFFER_SIZE ];
             }
             // clear UART buffer
             for ( int k = 0 ; k < UART1_RX_BUFFER_SIZE ; k++ )
                 gUART1_RXbuffer[ k ] = 0x00;
 
-            CSFR_CRC_Calculated = CSFR_Get_CRC8();
+            gCSFR_CRC_Calculated = CSFR_Get_CRC8();
 
-            if ( CSFR_CRC_Calculated == CSFR_Data_RX[ 22 ] )   // CRC match?
+            if ( gCSFR_CRC_Calculated == gCSFR_Data_RX[ 22 ] )   // CRC match?
             {
-                CSFR_CRC_match++;
+                gCSFR_CRC_match_cnt++;
                 return true; // Data extraction successful and CRC is OK
             }
             else
             {
-                CSFR_CRC_error++;
+                gCSFR_CRC_error_cnt++;
                 return false; // Header found but CRC error
             }            
         }
@@ -1909,26 +2024,28 @@ void CSFR_Parse_Data( void )
         
         for ( uint8_t j = 0 ; j < 8 ; j++ )
         {
-            if ( ( CSFR_Data_RX[ i ] >> j ) & 0x01 )
+            if ( ( gCSFR_Data_RX[ i ] >> j ) & 0x01 )
                 reversed |= 1 << ( 7 - j );
         }
-        CSFR_Data_Reversed[ i ] = reversed;
+        gCSFR_Data_Reversed[ i ] = reversed;
         
     }
     
-    RC_channels[ 0 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 0 ] & 0xFF ) << 3 ) | ( CSFR_Data_Reversed[  1 ] >> 5 ) );
-    RC_channels[ 1 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 1 ] & 0x1F ) << 6 ) | ( CSFR_Data_Reversed[  2 ] >> 2 ) );
-    RC_channels[ 2 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 2 ] & 0x3F ) << 9 ) | ( CSFR_Data_Reversed[  3 ] << 1 ) | ( CSFR_Data_Reversed[ 4 ] >> 7 ) );
-    RC_channels[ 3 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 4 ] & 0x7F ) << 4 ) | ( CSFR_Data_Reversed[  5 ] >> 4 ) );
+    RC_channels[ 0 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  0 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[  1 ] >> 5 ) );
+    RC_channels[ 1 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  1 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[  2 ] >> 2 ) );
+    RC_channels[ 2 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  2 ] & 0x3F ) << 9 ) | ( gCSFR_Data_Reversed[  3 ] << 1 ) | ( gCSFR_Data_Reversed[ 4 ] >> 7 ) );
+    RC_channels[ 3 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  4 ] & 0x7F ) << 4 ) | ( gCSFR_Data_Reversed[  5 ] >> 4 ) );
     
-    RC_channels[ 4 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 5 ] & 0x0F ) << 7 ) | ( CSFR_Data_Reversed[  6 ] >> 1 ) );
-    RC_channels[ 5 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 6 ] & 0x01 ) << 10 )| ( CSFR_Data_Reversed[  7 ] << 2 ) | ( CSFR_Data_Reversed[ 8 ] >> 6 ) );
-    RC_channels[ 6 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 8 ] & 0x3F ) << 5 ) | ( CSFR_Data_Reversed[  9 ] >> 3 ) );
-    RC_channels[ 7 ] = CSFR_Reverse11( ( ( CSFR_Data_Reversed[ 9 ] & 0x07 ) << 8 ) | ( CSFR_Data_Reversed[ 10 ] >> 0 ) );
+    RC_channels[ 4 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  5 ] & 0x0F ) << 7 ) | ( gCSFR_Data_Reversed[  6 ] >> 1 ) );
+    RC_channels[ 5 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  6 ] & 0x01 ) << 10 )| ( gCSFR_Data_Reversed[  7 ] << 2 ) | ( gCSFR_Data_Reversed[ 8 ] >> 6 ) );
+    RC_channels[ 6 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  8 ] & 0x3F ) << 5 ) | ( gCSFR_Data_Reversed[  9 ] >> 3 ) );
+    RC_channels[ 7 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  9 ] & 0x07 ) << 8 ) | ( gCSFR_Data_Reversed[ 10 ] >> 0 ) );
 
-    for ( uint8_t j = 0 ; j < 8 ; j++ )
+    RC_channels[ 8 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[ 11 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[ 12 ] >> 5 ) );
+    RC_channels[ 9 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[ 12 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[ 13 ] >> 2 ) );
+
+    for ( uint8_t j = 0 ; j < 10 ; j++ )
         robot.rc_cmd.ch[ j ] = RC_channels[ j ];
-    
 }
 /*****************************
 *****   MOTOR VOLTAGE   *****
@@ -2569,6 +2686,7 @@ float   Robot_GetTurnRate_SG(void)
 void    Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LSB )
 // Motor_current[A] = V_sns[V] / ( R_sns[R] * INA_GAIN[-] ) => Motor_cuureent = V_sns / 0.033R * 20
 {
+    float delta = 0.0f;
     // 1. Snapshot
     motor_t temp = *argMotor;
 
@@ -2577,19 +2695,41 @@ void    Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LS
     float currentSample = ((float)argRawADC_LSB * VOLT_ADC_REF / 4096.0f) / (0.033f * 20.0f);
 
     // 3. Shift Median History
+    // temp.curr_hist_A[0] = temp.curr_hist_A[1];
+    // temp.curr_hist_A[1] = temp.curr_hist_A[2];
+    // temp.curr_hist_A[2] = currentSample;
+
+    // 3. Shift 5-sample history
     temp.curr_hist_A[0] = temp.curr_hist_A[1];
     temp.curr_hist_A[1] = temp.curr_hist_A[2];
-    temp.curr_hist_A[2] = currentSample;
+    temp.curr_hist_A[2] = temp.curr_hist_A[3];
+    temp.curr_hist_A[3] = temp.curr_hist_A[4];
+    temp.curr_hist_A[4] = currentSample;
 
     // 4. Calculate Median
-    float medCurrent = Filter_Median3_f(temp.curr_hist_A[0], 
-                                       temp.curr_hist_A[1], 
-                                       temp.curr_hist_A[2]);
+    // float medCurrent = Filter_Median3_f(temp.curr_hist_A[0], 
+    //                                    temp.curr_hist_A[1], 
+    //                                    temp.curr_hist_A[2]);
+    // temp.curr_med3_A = medCurrent;
+
+    // 4. Calculate Median5 (Inlined, completely ignores up to 2 corrupt samples)
+    float medCurrent = Filter_Median5_f(temp.curr_hist_A[0], 
+                                        temp.curr_hist_A[1], 
+                                        temp.curr_hist_A[2],
+                                        temp.curr_hist_A[3],
+                                        temp.curr_hist_A[4]);
+    
+    // 41. Adding Delta step to increase or decrease current in case of spikes
+    delta = medCurrent - temp.curr_med5_A;
+
+    if (delta > MAX_CURRENT_STEP_A)         temp.curr_med5_A += MAX_CURRENT_STEP_A;
+    else if (delta < -MAX_CURRENT_STEP_A)   temp.curr_med5_A -= MAX_CURRENT_STEP_A;
+    else                                    temp.curr_med5_A = medCurrent;
 
     // 5. Exponential Moving Average (EMA)
     // We apply EMA on top of the Median to smooth out the remaining ripple
-    temp.curr_A = (gCURR_EMA_Coef * medCurrent) + 
-                  ((1.0f - gCURR_EMA_Coef) * temp.curr_A);
+    temp.curr_ema_A = (gCURR_EMA_Coef * medCurrent) + 
+                  ((1.0f - gCURR_EMA_Coef) * temp.curr_ema_A);
 
     // 6. Commit
     *argMotor = temp;
@@ -2628,12 +2768,31 @@ void    Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB
     *argPower = temp;
 }
 
-// Calculate the median of 3 floats
+// ***** CALCULATION OF MEDIAN OF THREE FLOAT VALUES *****
 static inline float Filter_Median3_f(float a, float b, float c)
+// Clock Cycles (Worst Case): approx 8 to 12 cycles
+// Noise rejection: medium to small as 400-800mA spikes can easily walk through during 25mA motor current (no load/small Va)
 {
     if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
     if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
     return c;
+}
+
+// ***** CALCULATION OF MEDIAN OF FIVE FLOAT VALUES *****
+static inline float Filter_Median5_f(float a, float b, float c, float d, float e)
+// Clock Cycles (Worst Case): approx 25 to 35 cycles
+// Noise rejection: good as 200-300mA spikes can walk through during 25mA motor current (no load/small Va)
+{
+    float t;
+    if (a > b) { t = a; a = b; b = t; }
+    if (c > d) { t = c; c = d; d = t; }
+    if (a > c) { t = a; a = c; c = t; t = b; b = d; d = t; }
+    if (a > e) { a = e; }
+    if (b > e) { t = b; b = e; e = t; }
+    if (b > c) { t = b; b = c; c = t; }
+    if (c > d) { t = c; c = d; d = t; }
+    if (c > e) { t = c; c = e; e = t; }
+    return c; // 'c' holds the true median
 }
 
 // Converts 8-bit RGB color into WS2812 PWM pattern (0x1C = 0, 0x38 = 1)
@@ -2747,65 +2906,38 @@ void WS2812B_BattGauge_8LED(float voltage)
     }
 }
 
-// void WS2812B_BattGauge_8LED(float voltage)
-// {
-//     const float Vmax = VOLT_BATTERY_DEF + 0.7f; // 12.0V
-//     const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
-//     const uint8_t LEDcount = 8;
-//     const uint8_t LEDoffset = 0;
-
-//     // --- Normalize voltage into 0..1 range ---
-//     float norm = (voltage - Vmin) / (Vmax - Vmin);
-//     if (norm < 0.0f) norm = 0.0f;
-//     if (norm > 1.0f) norm = 1.0f;
-
-//     // --- Convert to LED steps ---
-//     uint8_t active = (uint8_t)(norm * (LEDcount+LEDoffset));
-//     if (active == 0) active = 1;   // always show at least 1 LED
-
-//     // --- Draw the gauge ---
-//     for (uint8_t i = LEDoffset; i < (LEDcount+LEDoffset); i++)
-//     {
-//         if (i < active - 1)
-//         {
-//             // Full green LEDs
-//             WS2812B_LED_Col(i, 0, 0x0F, 0);   // R,G,B
-//         }
-//         else if (i == active - 1)
-//         {
-//             // Last LED: color depends on battery level
-//             if (active == 1)
-//                 WS2812B_LED_Col(i, 0x10, 0, 0);   // RED (low battery)
-//             else
-//                 WS2812B_LED_Col(i, 0x10, 0x04, 0); // Yellow (transition)
-//         }
-//         else
-//         {
-//             // LEDs above active level = OFF
-//             WS2812B_LED_Col(i, 0, 0, 0);
-//         }
-//     }
-// }
-
 void WS2812B_TiltGauge_8LED(float tilt_rad)
 {
-    if ( gFlg_Tilt_gauge) {
+    if (gFlg_Tilt_gauge) {
         gFlg_Tilt_gauge = false;
         
         const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
         const uint8_t LED_COUNT    = 8;
         const uint8_t LED_OFFSET   = 8; 
 
+        // --- FEATURE: Flash-To-Pass Override ---
+        // Checks if left button/trigger is pressed beyond threshold (> 1.2f)
+        if (robot.rc_cmd.button_L > 1.2f)
+        {
+            // Flash all 8 LEDs high-intensity White/Blue headlight pulse
+            for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
+            {
+                WS2812B_LED_Col(i, 0xFF, 0xFF, 0xFF); // High-beam White
+                // WS2812B_LED_Col(i, 0x00, 0x10, 0xFF); // POLICE
+            }
+            return; // Skip normal tilt calculation while flashing
+        }
+
+        // --- STANDARD TILT GAUGE MODE ---
+
         // 1. Clamp tilt using the symmetric limit
         if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
         if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
 
         // 2. Normalize tilt into 0.0 .. 1.0 range
-        // (tilt + limit) / (2 * limit)
         float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
 
         // 3. Map to "Left LED" index of the pair (0 to 6)
-        // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
         uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
         uint8_t idxB = idxA + 1;
 
@@ -2826,88 +2958,41 @@ void WS2812B_TiltGauge_8LED(float tilt_rad)
     }
 }
 
-// Advanced Float to ASCII: Significant Figures Logic
-// argBuffer: Destination
-// argVal: Input float
-// argSigFigs: Number of valid digits to keep (e.g., 6)
-char* Fast_f2s_SigFigs(char* argBuffer, float argVal, uint8_t argSigFigs)
-{
-    char* ptr = argBuffer;
+// void WS2812B_TiltGauge_8LED(float tilt_rad)
+// {
+//     if ( gFlg_Tilt_gauge) {
+//         gFlg_Tilt_gauge = false;
+        
+//         const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
+//         const uint8_t LED_COUNT    = 8;
+//         const uint8_t LED_OFFSET   = 8; 
 
-    // 1. Handle zero explicitly
-    if (argVal == 0.0f) {
-        *ptr++ = '0';
-        *ptr = '\0';
-        return ptr;
-    }
+//         // 1. Clamp tilt using the symmetric limit
+//         if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
+//         if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
 
-    // 2. Handle sign
-    if (argVal < 0) {
-        *ptr++ = '-';
-        argVal = -argVal;
-    }
+//         // 2. Normalize tilt into 0.0 .. 1.0 range
+//         // (tilt + limit) / (2 * limit)
+//         float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
 
-    // 3. Determine the magnitude (base 10 exponent)
-    // We want to scale the number so the first digit is in the 10^(SigFigs-1) place
-    int16_t exponent = 0;
-    float tempVal = argVal;
-    
-    if (tempVal >= 1.0f) {
-        while (tempVal >= 10.0f) { tempVal /= 10.0f; exponent++; }
-    } else {
-        while (tempVal < 1.0f) { tempVal *= 10.0f; exponent--; }
-    }
+//         // 3. Map to "Left LED" index of the pair (0 to 6)
+//         // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
+//         uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
+//         uint8_t idxB = idxA + 1;
 
-    // 4. Scale to integer mantissa based on desired significant figures
-    // Example: 0.000123456 -> 1.23456 (exponent -4) -> 123456 (for 6 sig figs)
-    float scale = 1.0f;
-    for (uint8_t i = 1; i < argSigFigs; i++) scale *= 10.0f;
-    
-    uint32_t mantissa = (uint32_t)(tempVal * scale + 0.5f);
-
-    // 5. Format based on exponent (Small vs Large)
-    // If it's a "human readable" range, we place the dot. 
-    // If it's extreme (0.0000001), we switch to 'e' notation.
-    if (exponent >= -3 && exponent < argSigFigs) {
-        // "Natural" decimal placement
-        char digits[12];
-        for (int8_t i = argSigFigs - 1; i >= 0; i--) {
-            digits[i] = (mantissa % 10) + '0';
-            mantissa /= 10;
-        }
-
-        int16_t dotPos = exponent + 1;
-        if (dotPos <= 0) {
-            *ptr++ = '0';
-            *ptr++ = '.';
-            while (dotPos < 0) { *ptr++ = '0'; dotPos++; }
-            for (uint8_t i = 0; i < argSigFigs; i++) *ptr++ = digits[i];
-        } else {
-            for (uint8_t i = 0; i < argSigFigs; i++) {
-                if (i == dotPos) *ptr++ = '.';
-                *ptr++ = digits[i];
-            }
-            // If dot is at the end, don't leave it dangling
-            if (dotPos >= argSigFigs) { /* Optional: add .0 */ }
-        }
-    } else {
-        // Engineering/Scientific Notation: 1.23456e-7
-        char digits[12];
-        for (int8_t i = argSigFigs - 1; i >= 0; i--) {
-            digits[i] = (mantissa % 10) + '0';
-            mantissa /= 10;
-        }
-        *ptr++ = digits[0];
-        *ptr++ = '.';
-        for (uint8_t i = 1; i < argSigFigs; i++) *ptr++ = digits[i];
-        *ptr++ = 'e';
-        // Simple itoa for exponent
-        if (exponent < 0) { *ptr++ = '-'; exponent = -exponent; }
-        else { *ptr++ = '+'; }
-        if (exponent >= 10) *ptr++ = (exponent / 10) + '0';
-        *ptr++ = (exponent % 10) + '0';
-    }
-
-    *ptr = '\0';
-    return ptr;
-}
+//         // 4. Update the LED strip
+//         for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
+//         {
+//             if (i == idxA || i == idxB)
+//             {
+//                 // Active Tilt "Needle" - Red
+//                 WS2812B_LED_Col(i, 0x0F, 0x00, 0x00); 
+//             }
+//             else
+//             {
+//                 // Background / Off
+//                 WS2812B_LED_Col(i, 0x00, 0x00, 0x00);
+//             }
+//         }
+//     }
+// }

@@ -1,9 +1,9 @@
 /**
  * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
  * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
- * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.09.00.02"
- * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.09.00.02"
- * @versions {"tool":"1.24.0+4150"}
+ * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @versions {"tool":"1.27.0+4565"}
  */
 
 /**
@@ -59,8 +59,8 @@ ADC121.interruptPriority          = "2";
 ADC121.samplingOperationMode      = "sequence";
 ADC121.endAdd                     = 1;
 ADC121.sampClkDiv                 = "DL_ADC12_CLOCK_DIVIDE_48";
-ADC121.sampleTime0                = "1 ms";
 ADC121.sampleTime1                = "10 ms";
+ADC121.sampleTime0                = "200us";
 ADC121.adcPin1Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric9";
 ADC121.peripheral.$assign         = "ADC0";
 ADC121.peripheral.adcPin1.$assign = "PA26";
@@ -79,8 +79,8 @@ ADC122.enabledInterrupts          = ["DL_ADC12_INTERRUPT_MEM0_RESULT_LOADED","DL
 ADC122.interruptPriority          = "2";
 ADC122.samplingOperationMode      = "sequence";
 ADC122.endAdd                     = 2;
-ADC122.sampleTime0                = "1 ms";
-ADC122.sampleTime1                = "10 ms";
+ADC122.sampleTime1                = "50ms";
+ADC122.sampleTime0                = "133us";
 ADC122.adcPin0Config.$name        = "ti_driverlib_gpio_GPIOPinGeneric10";
 ADC122.peripheral.$assign         = "ADC1";
 ADC122.peripheral.adcPin0.$assign = "PA15";
