@@ -7,7 +7,7 @@
  * BAUD RATE: 2.0Mbps
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-09-26 22:59:17
+ * LAST MODIFIED: 2026-09-28 09:03:13
  **********************************************************************/
 
 /*******************************************************************************
@@ -60,13 +60,8 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - Set Point Control from Pitch stick added
-// - Flesh-to-Pass Override added to Tilt Gauge
-// - FF gain term is now boosted by throttle stick in range 1.0f to 2.0f
-// - Motor Current filtering updated, Median 5 filter used with max change by Delta step/slope (50mA/400us) used
-// - Crossfire WAS read in 50ms loop - now a 4ms loop is obtained by direct Header detector in ISR (full speed of CRFR)
-// - Position controller was in conflict with Radio Commands - update/working
-// - Motor Current sampling misaaligment now sample rate is 400us - fix
+// - PD and SMC can be switched by remote control
+// - Sliding Mode Controller added and tuned (first loop)
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -76,6 +71,8 @@
 #include    "ti/driverlib/dl_gpio.h"
 #include    "ti_msp_dl_config.h"
 
+#define     GLOBAL_IQ 16
+#include    <ti/iqmath/include/IQmathLib.h>
 /* IQ TYPE  | INT BITS | FRAC BITS | MIN RANGE         | MAX RANGE         | RESOLUTION    */
 /* _iq30    | 2        | 30        | -2                | 1.999999999       | 0.000000001   */
 /* _iq24    | 8        | 24        | -128              | 127.999999940     | 0.000000060   */
@@ -83,12 +80,6 @@
 /* _iq8     | 24       | 8         | -8388608          | 8388607.996093750 | 0.003906250   */
 /* _iq1     | 31       | 1         | -1073741824       | 1073741823.500000 | 0.500000000   */
 // https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
-#define     GLOBAL_IQ 16
-#include    <ti/iqmath/include/IQmathLib.h>
-
-#define     LED_HEART_ON_MS         (97U)           // LED heartbeat turn on
-#define     LED_HEART_OFF_MS        (101U)          // LED heartbeat turn off
-#define     LED_TICK_COUNT          (15U)           // LED heartbeat period
 
 #define     LED_SEQUENCE_0          (0b111111)      // long  blink
 #define     LED_SEQUENCE_1          (0b111)         // one   blink
@@ -97,8 +88,10 @@
 #define     LED_SEQUENCE_4          (0b11011011011) // four blink
 #define     LED_SEQUENCE_5          (0b101010101)   // five blink
 #define     LED_SEQUENCE_6          (0b10101010101) // six blink
-
+#define     LED_TICK_COUNT          (15U)           // LED heartbeat period
 // co-prime numbers are used to avoid harmonics in timebased routines
+#define     TIME_LED_ON_MS          (97U)           // LED heartbeat turn on
+#define     TIME_LED_OFF_MS         (101U)          // LED heartbeat turn off
 #define     TIME_SEND_DATA_MS       (49U)           // 20Hz send data rate
 #define     TIME_MOTOR_OMEGA_MS     (10U)           // rate to calculate impulses to determine motor speed
 #define     TIME_MOTOR_OMEGA_S      (0.01f)         // in seconds
@@ -106,36 +99,33 @@
 #define     TIME_MPU_READ_SEC       (0.0008f)       // reading rate of MPU in seconds - Main Sample Period - Inner Loop
 #define     iqTIME_MPU_READ_S    _IQ(0.0008f)       // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
 #define     TIME_FAIL_SAFE_MS       (1499U)         // No command received
-// #define     TIME_CRSF_MS            (50U)           // Cross Fire (Radio Control) protocol
-
 #define     TIME_BATT_GAU_MS        (247U)          // 4Hz update data rate for battery gauge WS2812B display
 #define     TIME_TILT_GAU_MS        (41U)           // 25Hz update data rate for tilt gauge WS2812B display
 
-#define     CRSF_MSG_HEAD_SIZE      (3U)        // 0xC8 SYNC (Start-of-frame), 0x18 LEN (Length of TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
-#define     CRSF_MSG_DATA_SIZE      (22U)       // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
-#define     CRSF_MSG_CRC_SIZE       (1U)        // CRC-8 0xD5
+#define     CRSF_MSG_HEAD_SIZE      (3U)            // 0xC8 SYNC, 0x18 LEN (TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
+#define     CRSF_MSG_DATA_SIZE      (22U)           // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
+#define     CRSF_MSG_CRC_SIZE       (1U)            // CRC-8 0xD5
 #define     CRSF_MESSAGE_SIZE       (CRSF_MSG_HEAD_SIZE+CRSF_MSG_DATA_SIZE+CRSF_MSG_CRC_SIZE)
-#define     CRSF_CHANNEL_COUNT      (16U)
-#define     CRSF_CRC_POLY           (0xD5)      // 0xD5 gives better burst‑error detection for short frames
+#define     CRSF_CHANNEL_COUNT      (16U)           // Standart 16-chan, but Radiomaster Pocket use 10chans
+#define     CRSF_CRC_POLY           (0xD5)          // 0xD5 gives better burst‑error detection for short frames
 
-#define     ANGLE_LIM_BODY_RAD      (0.80f)     // Angle limit - beyond Controller is OFF   - 0.80rad = 45deg
-#define     ANGLE_LIM_HYST_RAD      (0.40f)     // Angle hysteresis - preventing oscilations- 0.40rad = 24deg
-#define     ANGLE_P_ZONE_RAD        (0.20f)     // Region to boost P terms                  - 0.20rad = 12deg
-#define     ANGLE_SP_PITCH_RAD      (0.05f)     // Set Point limit for position controller  - 0.05rad = 3deg
+#define     ANGLE_LIM_BODY_RAD      (0.60f)         // Angle limit - beyond Controller is OFF   - 0.60rad = 36deg
+#define     ANGLE_LIM_HYST_RAD      (0.20f)         // Angle hysteresis - preventing oscilations- 0.20rad = 12deg
+#define     ANGLE_P_ZONE_RAD        (0.20f)         // Region to boost P terms                  - 0.20rad = 12deg
+#define     ANGLE_SP_PITCH_RAD      (0.05f)         // Set Point limit for position controller  - 0.05rad = 3deg
 
-#define     VOLT_MOTOR_LIM_HI       (8.00f)     // Action value limit for Inner Loop
-#define     VOLT_MOTOR_LIM_LO       (4.00f)     // Action value limit for Side Loop
+#define     VOLT_MOTOR_LIM_HI       (8.00f)         // Action value limit for Inner Loop
+#define     VOLT_MOTOR_LIM_LO       (4.00f)         // Action value limit for Side Loop
+#define     VOLT_MOTOR_MIN          (0.25f)         // Motor voltage minimum value
+#define     VOLT_MOTOR_HYST         (0.10f)         // Small hysteresis to prevent oscillations
+#define     VOLT_BATTERY_MIN        (10.2f)         // Li-Pol low voltage - 3.4V per cell
+#define     VOLT_BATTERY_DEF        (11.3f)         // Li-Pol default voltage - 3.75V per cell
+#define     VOLT_ADC_REF            (3.60f)         // ADC reference voltage
+#define     VOLT_SCHTKY_DROP        (0.15f)         // Input rectifier drop
+#define     VOLT_DIVIDER_RATIO      (11.0f)         // (47k + 4.7k) / 4.7k - Batt Voltage divider ratio
+#define     ADC_CNT                 (5U)            // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
 
-#define     VOLT_MOTOR_MIN          (0.25f)     // Motor voltage minimum value
-#define     VOLT_MOTOR_HYST         (0.10f)     // Small hysteresis to prevent oscillations
-#define     VOLT_BATTERY_MIN        (10.2f)     // Li-Pol low voltage - 3.4V per cell
-#define     VOLT_BATTERY_DEF        (11.3f)     // Li-Pol default voltage - 3.75V per cell
-#define     VOLT_ADC_REF            (3.60f)     // ADC reference voltage
-#define     VOLT_SCHTKY_DROP        (0.15f)     // Input rectifier drop
-#define     VOLT_DIVIDER_RATIO      (11.0f)     // (47k + 4.7k) / 4.7k - Batt Voltage divider ratio
-#define     ADC_CNT                 (5U)        // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
-
-#define     MAX_CURRENT_STEP_A      (0.050f)    // Max allowed change per 400us step (30mA) during Motor Current Measurement
+#define     MAX_CURRENT_STEP_A      (0.050f)        // Max allowed change per 400us step (30mA) during Motor Current Measurement
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
 #define     MOTOR_GEAR_RATIO        (50.0f)     // gear ratio
@@ -150,6 +140,10 @@
 #define     ROBO_STATE_CALIB        (2U)        //
 #define     ROBO_STATE_IDENT        (3U)        //
 #define     ROBO_STATE_NOK          (4U)        //
+
+#define     CONTROLLER_TYPE_PID     (0U)
+#define     CONTROLLER_TYPE_SMC     (1U)
+#define     CONTROLLER_TYPE_LQR     (2U)
 
 #define     ALFA_CF_COEF            (0.03f)             // Complementary filter coefficient - Acc Gyro
 #define     iqALPHA              _IQ(ALFA_CF_COEF)      // Alpha
@@ -227,6 +221,7 @@ volatile uint8_t crc8tab[256] = {
 volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_1;
 volatile    uint8_t     gRobot_State        = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_State_1      = ROBO_STATE_BALA;
+volatile    uint8_t     gController_Type    = CONTROLLER_TYPE_PID;  // Default state use PID
 
 volatile    uint8_t     gRobot_Ident_State = 0U;
 
@@ -242,13 +237,12 @@ volatile    bool        gFlg_Read_CRSF      = false;     // Flag signal to read 
 volatile    bool        gFlg_Batt_gauge     = false;     // Flag signal to update WS2812 battery gauge display
 volatile    bool        gFlg_Tilt_gauge     = false;     // Flag signal to update WS2812 tilt angle display
 // ----- COUNTERS -----
-volatile    uint32_t    gCnt_Heart_LED      = LED_HEART_ON_MS;
+volatile    uint32_t    gCnt_Heart_LED      = TIME_LED_ON_MS;
 volatile    uint8_t     gCnt_Heart_Tick     = 0U;
 volatile    uint32_t    gCnt_MPU_Delay      = TIME_MPU_DELAY_MS;
 volatile    uint32_t    gCnt_UART_Send      = TIME_SEND_DATA_MS;
 volatile    uint32_t    gCnt_OuterLoop      = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    gCnt_Fail_Safe      = TIME_FAIL_SAFE_MS;
-// volatile    uint32_t    gCnt_CRSF_Read      = TIME_CRSF_MS;
 volatile    uint32_t    gCnt_Identify       = 0U;
 volatile    uint32_t    gCnt_Sample         = 0U;
 volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
@@ -290,6 +284,41 @@ volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
 // ----- ANALOG - All channels -----
 volatile    uint32_t    gADC_LSB[  ADC_CNT ];       // [ LSB ]
 volatile    float       gADC_Volt[ ADC_CNT ];       // [ V ]
+
+// ----- Sliding Mode Controller Structure -----
+typedef struct {
+    // Sliding surface weights for the 4 states
+    float weight_angle;
+    float weight_angle_rate;
+    float weight_pos;
+    float weight_speed;
+    
+    // Robust control parameters
+    float K;           // Switching gain
+    float phi;         // Boundary layer thickness (chatter reduction)
+
+    // Action value of Motor voltages Va (unclamped and clamped)
+    float CM_term_unclamped_V;
+    float CM_term_V;
+    float TI_term_V;
+} SMC_Controller_t;
+
+// ----- Sliding Mode Controller Structure -----
+#define WGHT_ANGL_DEF           (1.0f)  //
+#define WGHT_ANGL_RATE_DEF      (0.2f)  //
+#define WGHT_POS_DEF            (0.0f)  //
+#define WGHT_SPEED_DEF          (0.0f)  //
+#define K_DEF                   (10.0f) // Switching gain - the Hammer
+#define PHI_DEF                 (0.75f) // Boundary layer thickness
+volatile    SMC_Controller_t smc_controller = {
+    .weight_angle       = WGHT_ANGL_DEF,
+    .weight_angle_rate  = WGHT_ANGL_RATE_DEF,
+    .weight_pos         = WGHT_POS_DEF,
+    .weight_speed       = WGHT_SPEED_DEF,
+    .K                  = K_DEF,
+    .phi                = PHI_DEF
+};
+
 // ----- Define what a "WHEEL" is -----
 typedef struct {
     float   pos_m;              // Wheel Linear position (m)
@@ -402,7 +431,7 @@ typedef struct {
 #define TI_GAIN_DEF         (2.50f) // Turn - Proportional Default Gain SIDE LOOP   (WAS 1.0)
 #define KP_POS_GAIN_DEF     (0.00f) // Pos  - Proportional Default Gain OUTER LOOP  (WAS 0.4)
 #define KD_POS_GAIN_DEF     (0.00f) // Pos  - Derivative Default Gain OUTER LOOP    (WAS 0.4)
-// #define KI_GAIN_DEF     (0.00f)
+
 volatile Robot_t robot = {
     .gain = {
         .FF = FF_GAIN_DEF,              // [V]
@@ -615,9 +644,11 @@ void        IMU_Initialize( void );
 void        IMU_Calibrate( void );
 void        PID_Outer_Loop( void );
 void        PID_Inner_Loop( void );
+void        SMC_Inner_Loop( void );
 void        ADC12_Update( void );
 void        IMU_ProcessData ( void );
 
+void        Motor_Control( float argVoltLH, float argVoltRH );
 void        Motor0_RH_SetVolt( float argVoltM0 );
 void        Motor1_LH_SetVolt( float argVoltM1 );
 void        HW_Lay_Set_PWM(uint8_t argPhase,uint16_t argDuty);
@@ -659,6 +690,8 @@ void        WS2812B_All_LED(uint8_t ArgColor, uint8_t ArgBrightness);
 void        WS2812B_LED_Col(uint8_t led, uint8_t R, uint8_t G, uint8_t B);
 void        WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2, uint8_t argBrg1, uint8_t argBrg2);
 
+float       SMC_Saturate(float s, float boundary_layer);
+
 // *****************************************  *****************************************  *****************************************
 // *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****  *****   MAIN MAIN MAIN MAIN MAIN    *****
 // *****************************************  *****************************************  *****************************************
@@ -682,7 +715,10 @@ int main( void ) {
         // ----- 3. (A) OUTER LOOP -----
         PID_Outer_Loop();
         // ----- 4. (B) INNER LOOP -----
-        PID_Inner_Loop();
+        switch ( gController_Type ) {
+            case CONTROLLER_TYPE_PID: PID_Inner_Loop(); break;
+            case CONTROLLER_TYPE_SMC: SMC_Inner_Loop(); break;
+                             default: PID_Inner_Loop(); break; }
         // ----- 5. UART UPDATE -----
         UART0_Update();
         // ----- 6. BATTERY GAUGE -----
@@ -717,11 +753,11 @@ void TIMER_0_INST_IRQHandler()
         if ( gLED_Seq_Now & ( 1 << gCnt_Heart_Tick ) )
         {
             DL_GPIO_setPins( GPIO_PORT , GPIO_GRN4_PIN );
-            gCnt_Heart_LED = LED_HEART_ON_MS;
+            gCnt_Heart_LED = TIME_LED_ON_MS;
         }
         else {
             DL_GPIO_clearPins( GPIO_PORT , GPIO_GRN4_PIN );
-            gCnt_Heart_LED = LED_HEART_OFF_MS;
+            gCnt_Heart_LED = TIME_LED_OFF_MS;
         }        
 
         gCnt_Heart_Tick++;
@@ -1236,11 +1272,9 @@ STORE_TIMER6(7);
         robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
 
         // --- 41. Determine the Setpoint ---
-        if (robot.rc_cmd.is_connected){
-            // robot.control.SP_Pitch_rad = 0.0f;
-        } else {
+        if (!robot.rc_cmd.is_connected) // if not connected use the Position control
             robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
-        }
+            
         
         // --- 41. Smooth the Setpoint Transition - Leaky Integrator Filter ---
         // Higher alpha (0.99) = Slower, smoother convergence - can never reach the setpoint
@@ -1291,38 +1325,8 @@ STORE_TIMER6(7);
         robot.motor.left.volt_V  = robot.control.CMterm_V + robot.control.TIterm_V;
         robot.motor.right.volt_V = robot.control.CMterm_V - robot.control.TIterm_V;
         
-        // --------------------------
-        // ---- 499. MOTOR CONTROL ---
-        // --------------------------
-        if ( gFlg_Motor_EN && !(robot.power.is_low_power) )
-        {
-            // --- Positive Angle with Hysteresis ---
-            if ( robot.body.pitch_rad > +ANGLE_LIM_BODY_RAD + ANGLE_LIM_HYST_RAD )
-            {
-                // Motors OFF - Robot falling
-                Motor0_RH_SetVolt( 0.0f );
-                Motor1_LH_SetVolt( 0.0f );
-            } else
-                // --- Negative Angle with Hysteresis ---
-                if ( robot.body.pitch_rad < -ANGLE_LIM_BODY_RAD - ANGLE_LIM_HYST_RAD )
-                {
-                    // Motors OFF - Robot falling
-                    Motor0_RH_SetVolt( 0.0f );
-                    Motor1_LH_SetVolt( 0.0f );
-                } else
-                    // --- Angle in Range ---
-                    if ( ( robot.body.pitch_rad < +ANGLE_LIM_BODY_RAD ) &&
-                         ( robot.body.pitch_rad > -ANGLE_LIM_BODY_RAD )
-                        )            
-                    {
-                        // --- Output ---
-                        Motor0_RH_SetVolt( robot.motor.right.volt_V );
-                        Motor1_LH_SetVolt( robot.motor.left.volt_V );
-                    }
-        } else {
-            Motor0_RH_SetVolt( 0.0f );
-            Motor1_LH_SetVolt( 0.0f );
-        }
+        Motor_Control( robot.motor.left.volt_V , robot.motor.right.volt_V );
+
     }
 }
 
@@ -1895,11 +1899,25 @@ STORE_TIMER6( 9 );
         
         robot.control.SP_Pitch_rad = sp_pitch;
 
-        // Apply boosted gains
-        robot.gain.KP = KP_GAIN_DEF * loc_latch_L * loc_state3_L;
-        robot.gain.KD = KD_GAIN_DEF * loc_latch_R * loc_state3_R;
-        // new boosted Feed Forward term
-        robot.gain.FF = FF_GAIN_DEF * loc_throttle;
+        // Switch between PID and SMC
+        if ( loc_latch_L > 1.20f )
+            gController_Type = CONTROLLER_TYPE_SMC;
+        else
+            gController_Type = CONTROLLER_TYPE_PID;
+
+        // Apply boosted gains - PID
+        if ( gController_Type == CONTROLLER_TYPE_PID ) {
+            // robot.gain.KP = KP_GAIN_DEF * loc_latch_L * loc_state3_L;
+            // robot.gain.KD = KD_GAIN_DEF * loc_latch_R * loc_state3_R;
+            robot.gain.KP = KP_GAIN_DEF     * loc_state3_L;
+            robot.gain.KD = KD_GAIN_DEF     * loc_state3_R;
+            robot.gain.FF = FF_GAIN_DEF     * loc_throttle;
+        }
+        // Apply boosted gains - SMC
+        else if ( gController_Type == CONTROLLER_TYPE_SMC ) {
+            smc_controller.K    = K_DEF     * loc_state3_L;
+            smc_controller.phi  = PHI_DEF   * loc_state3_R;
+        }
     }
     else
     {
@@ -2048,8 +2066,45 @@ void CSFR_Parse_Data( void )
         robot.rc_cmd.ch[ j ] = RC_channels[ j ];
 }
 /*****************************
-*****   MOTOR VOLTAGE   *****
+*****   MOTOR FUNCTIONS  *****
 *****************************/
+void Motor_Control( float argVoltLH, float argVoltRH )
+{
+    // --------------------------
+    // ---- 499. MOTOR CONTROL ---
+    // --------------------------
+    if ( gFlg_Motor_EN && !(robot.power.is_low_power) )
+    {
+        // --- Positive Angle with Hysteresis ---
+        if ( robot.body.pitch_rad > +ANGLE_LIM_BODY_RAD + ANGLE_LIM_HYST_RAD )
+        {
+            // Motors OFF - Robot falling
+            Motor0_RH_SetVolt( 0.0f );
+            Motor1_LH_SetVolt( 0.0f );
+        } else
+            // --- Negative Angle with Hysteresis ---
+            if ( robot.body.pitch_rad < -ANGLE_LIM_BODY_RAD - ANGLE_LIM_HYST_RAD )
+            {
+                // Motors OFF - Robot falling
+                Motor0_RH_SetVolt( 0.0f );
+                Motor1_LH_SetVolt( 0.0f );
+            } else
+                // --- Angle in Range ---
+                if ( ( robot.body.pitch_rad < +ANGLE_LIM_BODY_RAD ) &&
+                        ( robot.body.pitch_rad > -ANGLE_LIM_BODY_RAD )
+                    )            
+                {
+                    // --- Output ---
+                    Motor0_RH_SetVolt( argVoltRH );
+                    Motor1_LH_SetVolt( argVoltLH );
+                    // Motor0_RH_SetVolt( robot.motor.right.volt_V );
+                    // Motor1_LH_SetVolt( robot.motor.left.volt_V );
+                }
+    } else {
+        Motor0_RH_SetVolt( 0.0f );
+        Motor1_LH_SetVolt( 0.0f );
+    }
+}
 void Motor0_RH_SetVolt( float argVoltM0 )
 {
     static int8_t m0_state = 0;   // -1 = reverse, 0 = stop, +1 = forward
@@ -2852,7 +2907,7 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
         WS2812B_LED_Col(i, R2, G2, B2);
 }
 
-void WS2812B_BattGauge_8LED(float voltage)
+void WS2812B_BattGauge_8LED(float arg_volt)
 {
     if ( gFlg_Batt_gauge) {
         gFlg_Batt_gauge = false;
@@ -2864,7 +2919,7 @@ void WS2812B_BattGauge_8LED(float voltage)
         const uint8_t LEDcount = 8;
 
         // 1. Calculate the 'Ideal' active level based on current voltage
-        float norm = (voltage - Vmin) / (Vmax - Vmin);
+        float norm = (arg_volt - Vmin) / (Vmax - Vmin);
         if (norm < 0.0f) norm = 0.0f;
         if (norm > 1.0f) norm = 1.0f;
         
@@ -2880,7 +2935,7 @@ void WS2812B_BattGauge_8LED(float voltage)
         float threshold_low  = Vmin + (volts_per_led * (last_active - 1)) - Hysteresis_V;
         float threshold_high = Vmin + (volts_per_led * last_active) + Hysteresis_V;
 
-        if (voltage < threshold_low || voltage > threshold_high) {
+        if (arg_volt < threshold_low || arg_volt > threshold_high) {
             last_active = current_target;
         }
 
@@ -2906,7 +2961,7 @@ void WS2812B_BattGauge_8LED(float voltage)
     }
 }
 
-void WS2812B_TiltGauge_8LED(float tilt_rad)
+void WS2812B_TiltGauge_8LED(float arg_tilt_rad)
 {
     if (gFlg_Tilt_gauge) {
         gFlg_Tilt_gauge = false;
@@ -2931,11 +2986,11 @@ void WS2812B_TiltGauge_8LED(float tilt_rad)
         // --- STANDARD TILT GAUGE MODE ---
 
         // 1. Clamp tilt using the symmetric limit
-        if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
-        if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
+        if (arg_tilt_rad < -TILT_LIMIT_RAD) arg_tilt_rad = -TILT_LIMIT_RAD;
+        if (arg_tilt_rad >  TILT_LIMIT_RAD) arg_tilt_rad =  TILT_LIMIT_RAD;
 
         // 2. Normalize tilt into 0.0 .. 1.0 range
-        float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
+        float norm = (arg_tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
 
         // 3. Map to "Left LED" index of the pair (0 to 6)
         uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
@@ -2958,41 +3013,67 @@ void WS2812B_TiltGauge_8LED(float tilt_rad)
     }
 }
 
-// void WS2812B_TiltGauge_8LED(float tilt_rad)
-// {
-//     if ( gFlg_Tilt_gauge) {
-//         gFlg_Tilt_gauge = false;
+void SMC_Inner_Loop( void )
+{
+    if (!mpu.status.is_initialized) return; // DON'T DRIVE MOTORS IF SENSOR IS DEAD
+    
+    if ( (gFlg_RUN_InnerLoop) && (gRobot_State == ROBO_STATE_BALA) )
+    {
+GET_DURATION(7);
+duration_us.inner_loop = dt[7];
+STORE_TIMER6(7);
+        gFlg_RUN_InnerLoop = false;
+
+        // --- 1. Determine the Setpoint ---
+        if (!robot.rc_cmd.is_connected)
+            robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
+
+        // --- 1. Calculate errors for all 4 states ---
+        float err_angle      = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
+        // float err_angle      = 0.0f - robot.body.pitch_rad;
+        float err_angle_rate = 0.0f - robot.body.rateY_rads;
+        float err_pos        = 0.0f - robot.body.pos_m;
+        float err_speed      = 0.0f - robot.body.speed_ms;
+
+        // --- 2. Define the composite sliding surface (s) using dot notation ---
+        float s =   (smc_controller.weight_angle        * err_angle) + 
+                    (smc_controller.weight_angle_rate   * err_angle_rate) + 
+                    (smc_controller.weight_pos          * err_pos) + 
+                    (smc_controller.weight_speed        * err_speed);
+
+        // --- 3. Calculate the switching control law (u_sw) ---
+        float u_total = smc_controller.K * SMC_Saturate(s, smc_controller.phi);
+
+        // --- 4. Feed Forward Term "Direct Drive" (FFgain * CMD) ---
+        robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
+
+        u_total = u_total + robot.control.FFterm_V;
+
+        smc_controller.CM_term_unclamped_V = u_total;
+
+        // --- 4. Motor Voltage Limit ---
+        if ( u_total > VOLT_MOTOR_LIM_HI ) u_total = VOLT_MOTOR_LIM_HI;
+        if ( u_total < -VOLT_MOTOR_LIM_HI ) u_total = -VOLT_MOTOR_LIM_HI;
+
+        smc_controller.CM_term_V = u_total; // just to see it in Watch window
+
+        // --- 48. Calculate TURN term ---
+        smc_controller.TI_term_V  = robot.gain.TI * robot.rc_cmd.roll;
         
-//         const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
-//         const uint8_t LED_COUNT    = 8;
-//         const uint8_t LED_OFFSET   = 8; 
+        // --- 49. Motor mixing ---
+        // robot.motor.left.volt_V  = robot.control.CMterm_V + robot.control.TIterm_V;
+        // robot.motor.right.volt_V = robot.control.CMterm_V - robot.control.TIterm_V;
+        
+        Motor_Control( smc_controller.CM_term_V + smc_controller.TI_term_V ,
+                       smc_controller.CM_term_V - smc_controller.TI_term_V );
+        
+    }
+}
 
-//         // 1. Clamp tilt using the symmetric limit
-//         if (tilt_rad < -TILT_LIMIT_RAD) tilt_rad = -TILT_LIMIT_RAD;
-//         if (tilt_rad >  TILT_LIMIT_RAD) tilt_rad =  TILT_LIMIT_RAD;
-
-//         // 2. Normalize tilt into 0.0 .. 1.0 range
-//         // (tilt + limit) / (2 * limit)
-//         float norm = (tilt_rad + TILT_LIMIT_RAD) / (2.0f * TILT_LIMIT_RAD);
-
-//         // 3. Map to "Left LED" index of the pair (0 to 6)
-//         // We use 6.0f because idxA + 1 must not exceed 7 (total 8 LEDs)
-//         uint8_t idxA = (uint8_t)(norm * 6.0f) + LED_OFFSET;
-//         uint8_t idxB = idxA + 1;
-
-//         // 4. Update the LED strip
-//         for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
-//         {
-//             if (i == idxA || i == idxB)
-//             {
-//                 // Active Tilt "Needle" - Red
-//                 WS2812B_LED_Col(i, 0x0F, 0x00, 0x00); 
-//             }
-//             else
-//             {
-//                 // Background / Off
-//                 WS2812B_LED_Col(i, 0x00, 0x00, 0x00);
-//             }
-//         }
-//     }
-// }
+// Saturation function to smooth out the control signal near the sliding surface
+float SMC_Saturate(float arg_s, float arg_boundary_layer)
+{
+    if (arg_s > arg_boundary_layer) return 1.0;
+    if (arg_s < -arg_boundary_layer) return -1.0;
+    return arg_s / arg_boundary_layer;
+}
