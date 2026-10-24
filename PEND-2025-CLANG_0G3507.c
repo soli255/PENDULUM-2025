@@ -4,10 +4,11 @@
  * HARDWARE SPECIFICATIONS:
  *   - 2xPOLOLU 4753 (50:1 Metal Gearmotor 37Dx70Lmm/12V/64CPR)
  *   - MSPM0G3507@80MHz/12.5ns
- * BAUD RATE: 2.0Mbps
+ * BAUD RATE:   2.00 Mbps (8bit, 1stp, no parity) - UART0 - PC communication
+ *              0.42 Mbps (8bit, 1stp, no parity) - UART1 - CrossFire communication
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-09-28 09:03:13
+ * LAST MODIFIED: 2026-10-24 07:38:17
  **********************************************************************/
 
 /*******************************************************************************
@@ -17,16 +18,18 @@
  * --------------|---------------------|---------|----------|-------------------
  * Current Loop  | Motor Current       |  400 us | 2.50 kHz | Field/Torque (Unused)
  * Inner Loop    | Tilt/Balance Ctrl   |  800 us | 1.25 kHz | Angle & Gyro Rate
- * Command Stream| CRSF/ELRS Receiver  |    4 ms |  250 Hz  | Direct Event ISR
+ * Command       | CRSF/ELRS Receiver  |    4 ms |  250 Hz  | Direct Event ISR
  * Outer Loop    | Position / Traject  |   10 ms |  100 Hz  | Encoder & Velocity
- * Telemetry     | PC Diagnostic UART  |   50 ms |   20 Hz  | Telemetry string
+ * Telemetry     | PC Diagnostic       |   50 ms |   20 Hz  | PC/SW Grapher or GUI
+ * Telemetry     | CRSF Diagnostic     |  250 ms |    4 Hz  | VBAT telemetry
  ******************************************************************************/
-
-/* MSPM0G3507 MCU PIN MAPPING: PORT A & B COMPACT VIEW
+/*******************************************************************************
+ * MSPM0G3507 MCU PIN MAPPING: PORT A & B COMPACT VIEW
+  *******************************************************************************
  * PORT A (LEFT)                           | PORT B (RIGHT)
  * ----------------------------------------|-----------------------------------------
- * PA0  | N.C.      | Open Drain           | PB0  | UART0_TX  | MCU Debug TX
- * PA1  | N.C.      | Open Drain           | PB1  | UART0_RX  | MCU Debug RX
+ * PA0  | N.C.      | Open Drain           | PB0  | UART0_TX  | PC Comm TX
+ * PA1  | N.C.      | Open Drain           | PB1  | UART0_RX  | PC Comm RX
  * PA2  | N.C.      |                      | PB2  | TIMA0_C3  | PWM3 Phase D
  * PA3  | TIMA0_C1  | PWM1 Phase A         | PB3  | TIMA0_C3N | nPWM3 (Comp)
  * PA4  | TIMA0_C1N | nPWM1 (Comp)         | PB4  | UART1_TX  | CrossFire TX
@@ -60,8 +63,7 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - PD and SMC can be switched by remote control
-// - Sliding Mode Controller added and tuned (first loop)
+// - CSFR telemetry up-stream to Pocket Radio
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -101,6 +103,12 @@
 #define     TIME_FAIL_SAFE_MS       (1499U)         // No command received
 #define     TIME_BATT_GAU_MS        (247U)          // 4Hz update data rate for battery gauge WS2812B display
 #define     TIME_TILT_GAU_MS        (41U)           // 25Hz update data rate for tilt gauge WS2812B display
+#define     TIME_SEND_TELE_MS       (251U)          // 4Hz Battery Telemetry send back to Radio (upstream)
+
+// CRSF Protocol - https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#broadcast-frame-types
+#define     CRSF_SYNC_BYTE          (0xC8)          // Serial Sync Byte - #1 byte of the message
+#define     CRSF_FRAME_ID_BATTERY   (0x08)          // Frame type - Battery Sensor
+#define     CRSF_FRAME_ID_16_CHAN   (0x16)          // Frame type - RC Channels Packed Payload
 
 #define     CRSF_MSG_HEAD_SIZE      (3U)            // 0xC8 SYNC, 0x18 LEN (TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
 #define     CRSF_MSG_DATA_SIZE      (22U)           // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
@@ -118,6 +126,7 @@
 #define     VOLT_MOTOR_LIM_LO       (4.00f)         // Action value limit for Side Loop
 #define     VOLT_MOTOR_MIN          (0.25f)         // Motor voltage minimum value
 #define     VOLT_MOTOR_HYST         (0.10f)         // Small hysteresis to prevent oscillations
+#define     VOLT_BATTERY_MAX        (12.6f)         // Li-Pol High voltage - 4.2V per cell
 #define     VOLT_BATTERY_MIN        (10.2f)         // Li-Pol low voltage - 3.4V per cell
 #define     VOLT_BATTERY_DEF        (11.3f)         // Li-Pol default voltage - 3.75V per cell
 #define     VOLT_ADC_REF            (3.60f)         // ADC reference voltage
@@ -128,12 +137,12 @@
 #define     MAX_CURRENT_STEP_A      (0.050f)        // Max allowed change per 400us step (30mA) during Motor Current Measurement
 
 // POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
-#define     MOTOR_GEAR_RATIO        (50.0f)     // gear ratio
-#define     IMPULSES_PER_REVOLUTION (64.0f)     // 64 counts per revolution (quadrature)
-#define     WHEEL_DIAMETER_M        (0.125f)    // 125mm
-#define     WHEEL_RADIUS_M          (WHEEL_DIAMETER_M/2.0f)
-#define     RAD_PER_TICK            (2.0f*3.14159f/(IMPULSES_PER_REVOLUTION*MOTOR_GEAR_RATIO))
-#define     WHEEL_TRACK_M           (0.21f)     // 210mm - wheels separation distance
+#define     MOTOR_GEAR_RATIO        (50.0f)         // Motor gear ratio (-)
+#define     MOTOR_CPR               (64.0f)         // Motor encoder 64 Counts Per Revolution (quadrature) (-)
+#define     MOTOR_RAD_PER_TICK      (2.0f*3.14159f/(MOTOR_CPR*MOTOR_GEAR_RATIO)) // Motor Radian per Encoder Tick (rad/tick)
+#define     ROBOT_WHEEL_DIA_M       (0.125f)        // Juggernaut Wheel Diameter - 125mm (m)
+#define     ROBOT_WHEEL_RAD_M       (0.0625f)       // Juggernaut Wheel Radius - 62.5mm (m)
+#define     ROBOT_WHEEL_SOD_M       (0.21f)         // 210mm - wheels separation distance
 
 #define     ROBO_STATE_INIT         (0U)        // MPU not initiated or found
 #define     ROBO_STATE_BALA         (1U)        //
@@ -235,7 +244,9 @@ volatile    bool        gFlg_RUN_InnerLoop  = false;     // Flag signal to run i
 volatile    bool        gFlg_Motor_EN       = false;     // Flag signal to enable motors
 volatile    bool        gFlg_Read_CRSF      = false;     // Flag signal to read RC commands
 volatile    bool        gFlg_Batt_gauge     = false;     // Flag signal to update WS2812 battery gauge display
-volatile    bool        gFlg_Tilt_gauge     = false;     // Flag signal to update WS2812 tilt angle display
+volatile    bool        gFlg_Tilt_gauge     = false;        // Flag signal to update WS2812 tilt angle display
+volatile    bool        gFlg_Send_tele      = false;        // Battery voltage telemetry
+volatile    bool        gFlg_Send_teleLatch = false;
 // ----- COUNTERS -----
 volatile    uint32_t    gCnt_Heart_LED      = TIME_LED_ON_MS;
 volatile    uint8_t     gCnt_Heart_Tick     = 0U;
@@ -247,6 +258,8 @@ volatile    uint32_t    gCnt_Identify       = 0U;
 volatile    uint32_t    gCnt_Sample         = 0U;
 volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
 volatile    uint32_t    gCnt_Tilt_gauge     = TIME_TILT_GAU_MS;
+volatile    uint32_t    gCnt_Send_tele      = TIME_SEND_TELE_MS;
+volatile    uint32_t    gCnt_Tele_sended    = 0U;
 // ----- ERROR COUNTERS -----
 volatile    uint32_t    er_ct[ 24 ];
 volatile    uint32_t    ab_ct[ 24 ]; 
@@ -285,17 +298,31 @@ volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
 volatile    uint32_t    gADC_LSB[  ADC_CNT ];       // [ LSB ]
 volatile    float       gADC_Volt[ ADC_CNT ];       // [ V ]
 
+// ============================================================================
+// ----- SLIDING MODE CONTROLLER (SMC) PARAMETERS & INITIALIZATION -----------
+// ============================================================================
+
+// --- Sliding Surface Hyperplane Weights (s = sum(lambda_i * error_i)) ---
+#define SMC_LAMBDA_ANGLE_DEF      (1.0f)   // Pitch stiffness (primary restoring authority)
+#define SMC_LAMBDA_RATE_DEF       (0.2f)   // Pitch damping (phase lead to counter 50:1 gear lag)
+#define SMC_LAMBDA_POS_DEF        (0.0f)   // Position weight (0.0f for bench; -0.05f for floor drift)
+#define SMC_LAMBDA_SPEED_DEF      (0.0f)   // Speed weight (0.0f for bench; -0.08f to damp runaway)
+
+// --- Robust Control & Boundary Parameters ---
+#define SMC_K_DEF                 (10.0f)  // "The Hammer"  - Max switching gain / motor drive effort (V)
+#define SMC_PHI_DEF               (0.75f)  // "The Cushion" - Boundary layer thickness (eliminates 5-10Hz gear chatter)
+
 // ----- Sliding Mode Controller Structure -----
 typedef struct {
-    // Sliding surface weights for the 4 states
-    float weight_angle;
-    float weight_angle_rate;
-    float weight_pos;
-    float weight_speed;
-    
-    // Robust control parameters
-    float K;           // Switching gain
-    float phi;         // Boundary layer thickness (chatter reduction)
+    // Hyperplane weights (surface slope vector)
+    float lambda_angle;       // Pitch error gain
+    float lambda_angle_rate;  // Pitch rate error gain
+    float lambda_pos;         // Body position error gain
+    float lambda_speed;       // Body speed error gain
+
+    // Robust switching law parameters
+    float K;                  // Switching gain (max drive effort)
+    float phi;                // Saturation boundary layer (chatter filter)
 
     // Action value of Motor voltages Va (unclamped and clamped)
     float CM_term_unclamped_V;
@@ -303,20 +330,17 @@ typedef struct {
     float TI_term_V;
 } SMC_Controller_t;
 
-// ----- Sliding Mode Controller Structure -----
-#define WGHT_ANGL_DEF           (1.0f)  //
-#define WGHT_ANGL_RATE_DEF      (0.2f)  //
-#define WGHT_POS_DEF            (0.0f)  //
-#define WGHT_SPEED_DEF          (0.0f)  //
-#define K_DEF                   (10.0f) // Switching gain - the Hammer
-#define PHI_DEF                 (0.75f) // Boundary layer thickness
-volatile    SMC_Controller_t smc_controller = {
-    .weight_angle       = WGHT_ANGL_DEF,
-    .weight_angle_rate  = WGHT_ANGL_RATE_DEF,
-    .weight_pos         = WGHT_POS_DEF,
-    .weight_speed       = WGHT_SPEED_DEF,
-    .K                  = K_DEF,
-    .phi                = PHI_DEF
+// ----- Global Controller Instance -----
+volatile SMC_Controller_t smc_controller = {
+    .lambda_angle           = SMC_LAMBDA_ANGLE_DEF,
+    .lambda_angle_rate      = SMC_LAMBDA_RATE_DEF,
+    .lambda_pos             = SMC_LAMBDA_POS_DEF,
+    .lambda_speed           = SMC_LAMBDA_SPEED_DEF,
+    .K                      = SMC_K_DEF,
+    .phi                    = SMC_PHI_DEF,
+    .CM_term_unclamped_V    = 0.0f,
+    .CM_term_V              = 0.0f,
+    .TI_term_V              = 0.0f
 };
 
 // ----- Define what a "WHEEL" is -----
@@ -339,9 +363,11 @@ typedef struct {
 } motor_t;
 // ----- Define what a "POWER" is -----
 typedef struct {
-    float batt_volt;       // Battery filtered voltage (V)
-    bool  is_low_power;    // Critical low voltage flag
+    float batt_volt_V;      // Battery filtered voltage (V)
+    float batt_gauge_ptc;   // Battery gauge in percentage (%)
+    bool  is_low_power;     // Critical low voltage flag
 } power_t;
+
 // *****************************************  *****************************************  *****************************************
 // *****    Define what a "ROBOT" is   *****  *****   Define what a "ROBOT" is    *****  *****   Define what a "ROBOT" is    *****
 // *****************************************  *****************************************  *****************************************
@@ -357,21 +383,20 @@ typedef struct {
         // Default Gains see Below \/
     } gain;
     // --- 20. POWER (The "Health") ---
-    struct {
-        float   batt_volt;
-        bool    is_low_power;
-    } power;
+    power_t power;
+
     // --- 30. WHEELS (The "Legs") ---
     struct {
         wheel_t left;
         wheel_t right;
-        // float   width;           // Track width (distance between wheels)
     } wheel;
+
     // --- 40. MOTORS (The "Engine") ---
     struct {
         motor_t left;
         motor_t right;
     } motor;
+    
     // --- 50. BODY (The "Robot") ---
     struct {
         float   accX_g;             // Robot Body Acceleration (g)  - IMU measured
@@ -442,7 +467,7 @@ volatile Robot_t robot = {
         .KD_Pos = KD_POS_GAIN_DEF       // [V/m/s]
     },
     .power = {
-        .batt_volt = VOLT_BATTERY_DEF,  // strong filter used for battery voltage
+        .batt_volt_V = VOLT_BATTERY_DEF,  // strong filter used for battery voltage
         .is_low_power = false
     },
     .control = {
@@ -499,6 +524,9 @@ volatile    uint8_t     gUART0_TXbytes = 0;
 #define     UART1_RX_BUFFER_SIZE (1U<<RX1_BUFF_N)   // 32
 volatile    uint8_t     gUART1_RXbuffer[ UART1_RX_BUFFER_SIZE ];
 volatile    uint8_t     gUART1_RXbuffer_index = 0;
+volatile    uint8_t     gUART1_message[ UART1_RX_BUFFER_SIZE ];
+volatile    uint8_t     gUART1_MessageLength = 0;
+volatile    uint8_t     gUART1_TXbytes = 0;
 volatile    bool        gUART1_frame_ready = false; // CSFR frame is ready (received)
 // volatile    uint8_t     UART1_TX_counter = 0;
 // Cross Fire Counters
@@ -661,11 +689,13 @@ uint16_t    UART0_Send_Tele(uint8_t argCount );
 
 int32_t     Filter_Median3(int32_t a, int32_t b, int32_t c);
 
-void        CSFR_Update ( void );
-uint8_t     CSFR_Get_CRC8( void );
-bool        CSFR_Extract_Data( void );
-void        CSFR_Parse_Data( void );
-uint16_t    CSFR_Reverse11( uint16_t arg_data_for_rev );
+void        CRSF_Update ( void );
+uint8_t     CRSF_Get_CRC8( uint8_t argTypeID, volatile uint8_t *argData, uint8_t argLength );
+// uint8_t     CSFR_Get_CRC8( void );
+bool        CRSF_Extract_Data( void );
+void        CRSF_Parse_Data( void );
+uint16_t    CRSF_Reverse11( uint16_t arg_data_for_rev );
+void        CRSF_Send_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct);
 
 void        Wheel_GetSpeed_SG(void);
 
@@ -722,7 +752,7 @@ int main( void ) {
         // ----- 5. UART UPDATE -----
         UART0_Update();
         // ----- 6. BATTERY GAUGE -----
-        WS2812B_BattGauge_8LED( robot.power.batt_volt );
+        WS2812B_BattGauge_8LED( robot.power.batt_volt_V );
         // ----- 7. TILT DISPLAY -----
         WS2812B_TiltGauge_8LED( robot.body.pitch_rad );
         // ----- 8. DURATION -----
@@ -731,7 +761,15 @@ int main( void ) {
         // ----- 9. ANALOG MEASUREMENT -----
         ADC12_Update();
         // ----- 10. CROSS FIRE DETECTOR -----
-        CSFR_Update();
+        CRSF_Update();
+        // ----- 11. SEND BATT TELEMETRY -----
+        if ( gFlg_Send_tele ){
+            gFlg_Send_tele = false;
+
+            robot.power.batt_gauge_ptc = 100.0f * ( robot.power.batt_volt_V - VOLT_BATTERY_MIN ) / ( VOLT_BATTERY_MAX - VOLT_BATTERY_MIN);
+
+            CRSF_Send_Telemetry( robot.power.batt_volt_V, 0.0f, 0U, robot.power.batt_gauge_ptc);
+        }
     }
 }
 
@@ -807,6 +845,12 @@ void TIMER_0_INST_IRQHandler()
     {
         gCnt_Tilt_gauge = TIME_TILT_GAU_MS;
         gFlg_Tilt_gauge = true;
+    }
+
+    if ( --gCnt_Send_tele == 0 )
+    {
+        gCnt_Send_tele = TIME_SEND_TELE_MS;
+        gFlg_Send_tele = true;
     }
 
     // ----- MPU - READ DATA -----
@@ -976,6 +1020,15 @@ void UART_1_INST_IRQHandler( void )
             break;
 
         case DL_UART_MAIN_IIDX_TX:
+            //transmit byte
+            DL_UART_Main_transmitData ( UART_1_INST , gUART1_message[ gUART1_TXbytes++ ] );
+            // Disable transmit interrupt if no more bytes
+            if ( gUART1_TXbytes == gUART1_MessageLength )
+            {
+                DL_UART_Main_disableInterrupt( UART_1_INST , DL_UART_MAIN_INTERRUPT_TX );
+                gUART1_TXbytes = 0;
+                gCnt_Tele_sended++;
+            }
             break;
 
         default:
@@ -1350,7 +1403,7 @@ STORE_TIMER6(8);
         // --- 32. Calculate ROBOT BODY Speed --- 
         robot.body.speed_ms = Robot_GetSpeed_SG();      // Savitzky-Golay Derivative Filter
         // --- 33. Calculate ROBOT TURN Angle ---
-        robot.body.turn_rad = (robot.wheel.right.pos_m - robot.wheel.left.pos_m) / WHEEL_TRACK_M;
+        robot.body.turn_rad = (robot.wheel.right.pos_m - robot.wheel.left.pos_m) / ROBOT_WHEEL_SOD_M;
         // --- 34. Calculate ROBOT TURN Angle rate ---
         robot.body.turn_rate_rads = Robot_GetTurnRate_SG();    // Savitzky-Golay Derivative Filter
         // --- 35. Position Controller ---
@@ -1830,11 +1883,8 @@ void UART0_ClearBuff( void )
     gUART0_RXbytes = 0;
 }
 
-void CSFR_Update(void)
+void CRSF_Update( void )
 {
-    // if (!gFlg_Read_CRSF) return; - time based eliminated
-    // gFlg_Read_CRSF = false;
-
     if (!gUART1_frame_ready) return;
     gUART1_frame_ready = false;
 
@@ -1843,9 +1893,9 @@ duration_us.csfr = dt[9];
 STORE_TIMER6( 9 );
 
     // 1. SNAPSHOT: Extract and Parse into local/intermediate buffers
-    if (CSFR_Extract_Data() && robot.rc_cmd.is_connected)
+    if (CRSF_Extract_Data() && robot.rc_cmd.is_connected)
     {
-        CSFR_Parse_Data();
+        CRSF_Parse_Data();
 
         // 2. PROCESS: Use local variables for math to keep the pipeline clean
         
@@ -1915,8 +1965,8 @@ STORE_TIMER6( 9 );
         }
         // Apply boosted gains - SMC
         else if ( gController_Type == CONTROLLER_TYPE_SMC ) {
-            smc_controller.K    = K_DEF     * loc_state3_L;
-            smc_controller.phi  = PHI_DEF   * loc_state3_R;
+            smc_controller.K    = SMC_K_DEF     * loc_state3_L;
+            smc_controller.phi  = SMC_PHI_DEF   * loc_state3_R;
         }
     }
     else
@@ -1928,66 +1978,34 @@ STORE_TIMER6( 9 );
     }
 }
 
-uint8_t CSFR_Get_CRC8( void )
+uint8_t CRSF_Get_CRC8( uint8_t argTypeID, volatile uint8_t *argData, uint8_t argLength )
 {
     uint8_t crc = 0;
 
-    crc = crc8tab[ crc ^ 0x16 ];
+    crc = crc8tab[ crc ^ argTypeID ];
 
-    for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
-        crc = crc8tab[ crc ^ gCSFR_Data_RX[ i ] ];
+    for ( uint8_t i = 0 ; i < argLength ; i++ )
+        crc = crc8tab[ crc ^ argData[ i ] ];
     return crc;
 }    
 
-// uint8_t compute_crc8( void )
-// {
-//     uint8_t crc = 0;
-
-//     crc ^= 0x16; // XOR with fitst byte
-
-//     for ( uint8_t j = 0 ; j < 8 ; j++ )
-//     {
-//         if ( crc & 0x80 )
-//         {
-//             crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
-//         } else {
-//             crc <<= 1;
-//         }
-//     }
-
-//     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
-//     {
-//         crc ^= CSFR_Data_RX[ i ]; // XOR with current byte
-
-//         for ( uint8_t j = 0 ; j < 8 ; j++ )
-//         {
-//             if ( crc & 0x80 )
-//             {
-//                 crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
-//             } else {
-//                 crc <<= 1;
-//             }
-//         }
-//     }
-//     return crc;
-// }
-
 // Function to extract data following the header
-bool CSFR_Extract_Data( void ) 
+bool CRSF_Extract_Data( void ) 
 {
     // Define header sequence - Sync Byte (Flight Controller), Bytes count, 16 RC channels
     // 0xC8 - Flight Controller
     // 0x18 - Payload Length = Frame ID (1B) + Data (22B) + CRC byte (1B) = 24B -> 0x18
     // 0x16 - Frame ID - RC channels
     uint8_t header[ CRSF_MSG_HEAD_SIZE ] = { 0xC8 , 0x18 , 0x16 };
+    // uint8_t header[ CRSF_MSG_HEAD_SIZE ] = { CRSF_SYNC_BYTE , 0x18 , CRSF_FRAME_ID_16_CHAN };
 
     // Search for header in the buffer
     for ( int i = 0 ; i < UART1_RX_BUFFER_SIZE ; i++ )
     {
         // Check for header match
-        if ( gUART1_RXbuffer[  i ] == header[ 0 ] &&
-            gUART1_RXbuffer[ ( i + 1 ) % UART1_RX_BUFFER_SIZE ] == header[ 1 ] &&
-            gUART1_RXbuffer[ ( i + 2 ) % UART1_RX_BUFFER_SIZE ] == header[ 2 ] )
+        if (    gUART1_RXbuffer[ i ]                                == header[ 0 ] &&
+                gUART1_RXbuffer[ ( i + 1 ) % UART1_RX_BUFFER_SIZE ] == header[ 1 ] &&
+                gUART1_RXbuffer[ ( i + 2 ) % UART1_RX_BUFFER_SIZE ] == header[ 2 ] )
         {
             gCSFR_Header_match_cnt++;
             // run Fail Safe Timer
@@ -2002,7 +2020,8 @@ bool CSFR_Extract_Data( void )
             for ( int k = 0 ; k < UART1_RX_BUFFER_SIZE ; k++ )
                 gUART1_RXbuffer[ k ] = 0x00;
 
-            gCSFR_CRC_Calculated = CSFR_Get_CRC8();
+            gCSFR_CRC_Calculated = CRSF_Get_CRC8( CRSF_FRAME_ID_16_CHAN, &gCSFR_Data_RX[0], CRSF_MSG_DATA_SIZE );
+            // gCSFR_CRC_Calculated = CSFR_Get_CRC8();
 
             if ( gCSFR_CRC_Calculated == gCSFR_Data_RX[ 22 ] )   // CRC match?
             {
@@ -2019,7 +2038,7 @@ bool CSFR_Extract_Data( void )
     return false; // Header not found or CRC error
 }
 
-uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev )
+uint16_t CRSF_Reverse11( uint16_t arg_data_for_rev )
 {
     uint16_t reversed11 = 0;
     // reverse bits in each channel
@@ -2031,7 +2050,7 @@ uint16_t CSFR_Reverse11( uint16_t arg_data_for_rev )
     return reversed11;
 }
 
-void CSFR_Parse_Data( void )
+void CRSF_Parse_Data( void )
 {
     uint8_t reversed = 0;
     
@@ -2049,22 +2068,59 @@ void CSFR_Parse_Data( void )
         
     }
     
-    RC_channels[ 0 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  0 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[  1 ] >> 5 ) );
-    RC_channels[ 1 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  1 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[  2 ] >> 2 ) );
-    RC_channels[ 2 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  2 ] & 0x3F ) << 9 ) | ( gCSFR_Data_Reversed[  3 ] << 1 ) | ( gCSFR_Data_Reversed[ 4 ] >> 7 ) );
-    RC_channels[ 3 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  4 ] & 0x7F ) << 4 ) | ( gCSFR_Data_Reversed[  5 ] >> 4 ) );
+    RC_channels[ 0 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  0 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[  1 ] >> 5 ) );
+    RC_channels[ 1 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  1 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[  2 ] >> 2 ) );
+    RC_channels[ 2 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  2 ] & 0x3F ) << 9 ) | ( gCSFR_Data_Reversed[  3 ] << 1 ) | ( gCSFR_Data_Reversed[ 4 ] >> 7 ) );
+    RC_channels[ 3 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  4 ] & 0x7F ) << 4 ) | ( gCSFR_Data_Reversed[  5 ] >> 4 ) );
     
-    RC_channels[ 4 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  5 ] & 0x0F ) << 7 ) | ( gCSFR_Data_Reversed[  6 ] >> 1 ) );
-    RC_channels[ 5 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  6 ] & 0x01 ) << 10 )| ( gCSFR_Data_Reversed[  7 ] << 2 ) | ( gCSFR_Data_Reversed[ 8 ] >> 6 ) );
-    RC_channels[ 6 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  8 ] & 0x3F ) << 5 ) | ( gCSFR_Data_Reversed[  9 ] >> 3 ) );
-    RC_channels[ 7 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[  9 ] & 0x07 ) << 8 ) | ( gCSFR_Data_Reversed[ 10 ] >> 0 ) );
+    RC_channels[ 4 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  5 ] & 0x0F ) << 7 ) | ( gCSFR_Data_Reversed[  6 ] >> 1 ) );
+    RC_channels[ 5 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  6 ] & 0x01 ) << 10 )| ( gCSFR_Data_Reversed[  7 ] << 2 ) | ( gCSFR_Data_Reversed[ 8 ] >> 6 ) );
+    RC_channels[ 6 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  8 ] & 0x3F ) << 5 ) | ( gCSFR_Data_Reversed[  9 ] >> 3 ) );
+    RC_channels[ 7 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  9 ] & 0x07 ) << 8 ) | ( gCSFR_Data_Reversed[ 10 ] >> 0 ) );
 
-    RC_channels[ 8 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[ 11 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[ 12 ] >> 5 ) );
-    RC_channels[ 9 ] = CSFR_Reverse11( ( ( gCSFR_Data_Reversed[ 12 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[ 13 ] >> 2 ) );
+    RC_channels[ 8 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[ 11 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[ 12 ] >> 5 ) );
+    RC_channels[ 9 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[ 12 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[ 13 ] >> 2 ) );
 
     for ( uint8_t j = 0 ; j < 10 ; j++ )
         robot.rc_cmd.ch[ j ] = RC_channels[ j ];
 }
+
+void CRSF_Send_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct)
+{
+    // uint8_t packet[12];
+
+    // Přepočty na CRSF formát
+    uint16_t v_dec = (uint16_t)(argBatt_V * 10.0f);   // 12.6V -> 126
+    uint16_t i_dec = (uint16_t)(argBatt_A * 10.0f);   // 1.5A  -> 15
+    
+    gUART1_message[0] = CRSF_SYNC_BYTE;         // 0xC8
+    gUART1_message[1] = 0x0A;                   // Délka od TYPE po CRC (1 + 8 + 1)
+    gUART1_message[2] = CRSF_FRAME_ID_BATTERY;  // 0x08
+
+    // Big-Endian zápis hodnot:
+    // Voltage (uint16_t)
+    gUART1_message[3] = (v_dec >> 8) & 0xFF;
+    gUART1_message[4] = v_dec & 0xFF;
+
+    // Current (uint16_t)
+    gUART1_message[5] = (i_dec >> 8) & 0xFF;
+    gUART1_message[6] = i_dec & 0xFF;
+
+    // Capacity mAh (uint24_t - 3 bajty)
+    gUART1_message[7] = (argCapacity_mAh >> 16) & 0xFF;
+    gUART1_message[8] = (argCapacity_mAh >> 8) & 0xFF;
+    gUART1_message[9] = argCapacity_mAh & 0xFF;
+
+    // Remaining % (uint8_t)
+    gUART1_message[10] = argFuelGauge_pct;
+
+    // CRC8 se počítá pouze z TYPE (bajt 2) až PAYLOAD (bajt 10) -> celkem 9 bajtů
+    gUART1_message[11] = CRSF_Get_CRC8( CRSF_FRAME_ID_BATTERY, &gUART1_message[3], 8);
+
+    gUART1_MessageLength = 12;
+    DL_UART_Main_enableInterrupt( UART_1_INST, DL_UART_MAIN_INTERRUPT_TX );
+}
+
 /*****************************
 *****   MOTOR FUNCTIONS  *****
 *****************************/
@@ -2135,13 +2191,13 @@ void Motor0_RH_SetVolt( float argVoltM0 )
         // --- Apply state ---
         if (m0_state == +1)
         {
-            pwm_uint_value_M0 = (uint16_t)(100.0f * argVoltM0 / robot.power.batt_volt);
+            pwm_uint_value_M0 = (uint16_t)(100.0f * argVoltM0 / robot.power.batt_volt_V);
             HW_Lay_Set_PWM(PHASE_A, 0U);
             HW_Lay_Set_PWM(PHASE_B, pwm_uint_value_M0);
         }
         else if (m0_state == -1)
         {
-            pwm_uint_value_M0 = (uint16_t)(-100.0f * argVoltM0 / robot.power.batt_volt);
+            pwm_uint_value_M0 = (uint16_t)(-100.0f * argVoltM0 / robot.power.batt_volt_V);
             HW_Lay_Set_PWM(PHASE_A, pwm_uint_value_M0);
             HW_Lay_Set_PWM(PHASE_B, 0U);
         }
@@ -2166,7 +2222,7 @@ void Motor1_LH_SetVolt( float argVoltM1 )
     uint16_t pwm_uint_value_M1 = 0U;
 
     // --- Battery OK? ---
-    if (robot.power.batt_volt > VOLT_BATTERY_MIN)
+    if (robot.power.batt_volt_V > VOLT_BATTERY_MIN)
     {
         // --- Hysteresis decision ---
         // Forward RUN threshold
@@ -2189,13 +2245,13 @@ void Motor1_LH_SetVolt( float argVoltM1 )
         // --- Apply state ---
         if (m1_state == +1)
         {
-            pwm_uint_value_M1 = (uint16_t)(100.0f * argVoltM1 / robot.power.batt_volt);
+            pwm_uint_value_M1 = (uint16_t)(100.0f * argVoltM1 / robot.power.batt_volt_V);
             HW_Lay_Set_PWM(PHASE_C, pwm_uint_value_M1);
             HW_Lay_Set_PWM(PHASE_D, 0U);
         }
         else if (m1_state == -1)
         {
-            pwm_uint_value_M1 = (uint16_t)(-100.0f * argVoltM1 / robot.power.batt_volt);
+            pwm_uint_value_M1 = (uint16_t)(-100.0f * argVoltM1 / robot.power.batt_volt_V);
             HW_Lay_Set_PWM(PHASE_C, 0U);
             HW_Lay_Set_PWM(PHASE_D, pwm_uint_value_M1);
         }
@@ -2669,8 +2725,8 @@ void Robot_GetWheelPhysics(volatile motor_t *argMotor, volatile wheel_t *argWhee
     wheel_t W_temp = *argWheel; 
 
     // 2. Kinematics: Update Current Positions
-    M_temp.theta_rad = (float)M_temp.imp * RAD_PER_TICK;
-    W_temp.pos_m     = M_temp.theta_rad * WHEEL_RADIUS_M;
+    M_temp.theta_rad = (float)M_temp.imp * MOTOR_RAD_PER_TICK;
+    W_temp.pos_m     = M_temp.theta_rad * ROBOT_WHEEL_RAD_M;
 
     // 3. History Shift: Update both Linear and Angular buffers
     for(int i = 0; i < 4; i++) {
@@ -2803,18 +2859,18 @@ void    Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB
 
     // 3. Process: Exponential Moving Average (EMA)
     // Smooths out voltage ripple during motor transients
-    temp.batt_volt = (gBATT_EMA_Coef * instBattVolt) + 
-                     ((1.0f - gBATT_EMA_Coef) * temp.batt_volt);
+    temp.batt_volt_V = (gBATT_EMA_Coef * instBattVolt) + 
+                     ((1.0f - gBATT_EMA_Coef) * temp.batt_volt_V);
 
     // 4. Protection: Low Power Detection with Hysteresis
     // Prevents "flickering" near the threshold
     float thresholdHigh = VOLT_BATTERY_MIN + 0.15f;
     float thresholdLow  = VOLT_BATTERY_MIN;
 
-    if (temp.batt_volt < thresholdLow) {
+    if (temp.batt_volt_V < thresholdLow) {
         temp.is_low_power = true;
     } 
-    else if (temp.batt_volt > thresholdHigh) {
+    else if (temp.batt_volt_V > thresholdHigh) {
         temp.is_low_power = false;
     }
     // Note: If voltage is between Low and High, it keeps its previous state
@@ -3036,10 +3092,10 @@ STORE_TIMER6(7);
         float err_speed      = 0.0f - robot.body.speed_ms;
 
         // --- 2. Define the composite sliding surface (s) using dot notation ---
-        float s =   (smc_controller.weight_angle        * err_angle) + 
-                    (smc_controller.weight_angle_rate   * err_angle_rate) + 
-                    (smc_controller.weight_pos          * err_pos) + 
-                    (smc_controller.weight_speed        * err_speed);
+        float s =   (smc_controller.lambda_angle        * err_angle) + 
+                    (smc_controller.lambda_angle_rate   * err_angle_rate) + 
+                    (smc_controller.lambda_pos          * err_pos) + 
+                    (smc_controller.lambda_speed        * err_speed);
 
         // --- 3. Calculate the switching control law (u_sw) ---
         float u_total = smc_controller.K * SMC_Saturate(s, smc_controller.phi);
@@ -3077,3 +3133,47 @@ float SMC_Saturate(float arg_s, float arg_boundary_layer)
     if (arg_s < -arg_boundary_layer) return -1.0;
     return arg_s / arg_boundary_layer;
 }
+
+// uint8_t CSFR_Get_CRC8( void )
+// {
+//     uint8_t crc = 0;
+
+//     crc = crc8tab[ crc ^ 0x16 ];
+
+//     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
+//         crc = crc8tab[ crc ^ gCSFR_Data_RX[ i ] ];
+//     return crc;
+// }    
+
+// uint8_t compute_crc8( void )
+// {
+//     uint8_t crc = 0;
+
+//     crc ^= 0x16; // XOR with fitst byte
+
+//     for ( uint8_t j = 0 ; j < 8 ; j++ )
+//     {
+//         if ( crc & 0x80 )
+//         {
+//             crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
+//         } else {
+//             crc <<= 1;
+//         }
+//     }
+
+//     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
+//     {
+//         crc ^= CSFR_Data_RX[ i ]; // XOR with current byte
+
+//         for ( uint8_t j = 0 ; j < 8 ; j++ )
+//         {
+//             if ( crc & 0x80 )
+//             {
+//                 crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
+//             } else {
+//                 crc <<= 1;
+//             }
+//         }
+//     }
+//     return crc;
+// }
