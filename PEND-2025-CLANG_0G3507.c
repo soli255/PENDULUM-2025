@@ -8,7 +8,7 @@
  *              0.42 Mbps (8bit, 1stp, no parity) - UART1 - CrossFire communication
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-10-24 07:38:17
+ * LAST MODIFIED: 2026-10-26 13:58:17
  **********************************************************************/
 
 /*******************************************************************************
@@ -63,7 +63,7 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - CSFR telemetry up-stream to Pocket Radio
+// - Minor updates as Variable correct names or obsolete variables removed
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -83,6 +83,7 @@
 /* _iq1     | 31       | 1         | -1073741824       | 1073741823.500000 | 0.500000000   */
 // https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
 
+// ----- LED Sequence ----
 #define     LED_SEQUENCE_0          (0b111111)      // long  blink
 #define     LED_SEQUENCE_1          (0b111)         // one   blink
 #define     LED_SEQUENCE_2          (0b111000111)   // two   blink
@@ -91,37 +92,26 @@
 #define     LED_SEQUENCE_5          (0b101010101)   // five blink
 #define     LED_SEQUENCE_6          (0b10101010101) // six blink
 #define     LED_TICK_COUNT          (15U)           // LED heartbeat period
-// co-prime numbers are used to avoid harmonics in timebased routines
-#define     TIME_LED_ON_MS          (97U)           // LED heartbeat turn on
-#define     TIME_LED_OFF_MS         (101U)          // LED heartbeat turn off
-#define     TIME_SEND_DATA_MS       (49U)           // 20Hz send data rate
-#define     TIME_MOTOR_OMEGA_MS     (10U)           // rate to calculate impulses to determine motor speed
-#define     TIME_MOTOR_OMEGA_S      (0.01f)         // in seconds
-#define     TIME_MPU_DELAY_MS       (249U)          // delay before MPU is initiated
+// ----- Timebase ----
 #define     TIME_MPU_READ_SEC       (0.0008f)       // reading rate of MPU in seconds - Main Sample Period - Inner Loop
 #define     iqTIME_MPU_READ_S    _IQ(0.0008f)       // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
-#define     TIME_FAIL_SAFE_MS       (1499U)         // No command received
-#define     TIME_BATT_GAU_MS        (247U)          // 4Hz update data rate for battery gauge WS2812B display
+#define     TIME_MOTOR_OMEGA_MS     (10U)           // rate to calculate impulses to determine motor speed
+#define     TIME_MOTOR_OMEGA_S      (0.01f)         // in seconds
+// co-prime numbers are used to avoid harmonics in timebased routines
 #define     TIME_TILT_GAU_MS        (41U)           // 25Hz update data rate for tilt gauge WS2812B display
-#define     TIME_SEND_TELE_MS       (251U)          // 4Hz Battery Telemetry send back to Radio (upstream)
-
-// CRSF Protocol - https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#broadcast-frame-types
-#define     CRSF_SYNC_BYTE          (0xC8)          // Serial Sync Byte - #1 byte of the message
-#define     CRSF_FRAME_ID_BATTERY   (0x08)          // Frame type - Battery Sensor
-#define     CRSF_FRAME_ID_16_CHAN   (0x16)          // Frame type - RC Channels Packed Payload
-
-#define     CRSF_MSG_HEAD_SIZE      (3U)            // 0xC8 SYNC, 0x18 LEN (TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
-#define     CRSF_MSG_DATA_SIZE      (22U)           // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
-#define     CRSF_MSG_CRC_SIZE       (1U)            // CRC-8 0xD5
-#define     CRSF_MESSAGE_SIZE       (CRSF_MSG_HEAD_SIZE+CRSF_MSG_DATA_SIZE+CRSF_MSG_CRC_SIZE)
-#define     CRSF_CHANNEL_COUNT      (16U)           // Standart 16-chan, but Radiomaster Pocket use 10chans
-#define     CRSF_CRC_POLY           (0xD5)          // 0xD5 gives better burst‑error detection for short frames
-
+#define     TIME_SEND_DATA_MS       (51U)           // 20Hz send data rate
+#define     TIME_LED_ON_MS          (97U)           // LED heartbeat turn on
+#define     TIME_LED_OFF_MS         (101U)          // LED heartbeat turn off
+#define     TIME_BATT_GAU_MS        (249U)          // 4Hz update data rate for battery gauge WS2812B display
+#define     TIME_MPU_DELAY_MS       (251U)          // delay before MPU is initiated
+#define     TIME_SEND_TELE_MS       (253U)          // 4Hz Battery Telemetry send back to Radio (upstream)
+#define     TIME_FAIL_SAFE_MS       (1501U)         // No command received
+// ----- Angles Limits ----
 #define     ANGLE_LIM_BODY_RAD      (0.60f)         // Angle limit - beyond Controller is OFF   - 0.60rad = 36deg
 #define     ANGLE_LIM_HYST_RAD      (0.20f)         // Angle hysteresis - preventing oscilations- 0.20rad = 12deg
 #define     ANGLE_P_ZONE_RAD        (0.20f)         // Region to boost P terms                  - 0.20rad = 12deg
 #define     ANGLE_SP_PITCH_RAD      (0.05f)         // Set Point limit for position controller  - 0.05rad = 3deg
-
+// ----- Voltages ----
 #define     VOLT_MOTOR_LIM_HI       (8.00f)         // Action value limit for Inner Loop
 #define     VOLT_MOTOR_LIM_LO       (4.00f)         // Action value limit for Side Loop
 #define     VOLT_MOTOR_MIN          (0.25f)         // Motor voltage minimum value
@@ -133,10 +123,10 @@
 #define     VOLT_SCHTKY_DROP        (0.15f)         // Input rectifier drop
 #define     VOLT_DIVIDER_RATIO      (11.0f)         // (47k + 4.7k) / 4.7k - Batt Voltage divider ratio
 #define     ADC_CNT                 (5U)            // 5 channel used: VS1(Battery), Current M0, Current M1 , Temp M0, Temp M1     
-
-#define     MAX_CURRENT_STEP_A      (0.050f)        // Max allowed change per 400us step (30mA) during Motor Current Measurement
-
-// POLOLU MOTOR 4753 ( 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder )
+// ----- Currents Limits ----
+#define     MAX_CURRENT_STEP_A      (0.050f)        // Max allowed change per 400us step (50mA) during Motor Current Measurement
+// ----- POLOLU MOTOR 4753 -----
+// 50:1 Metal Gearmotor 37Dx70L mm 12V 200RPM with 64 CPR Encoder
 #define     MOTOR_GEAR_RATIO        (50.0f)         // Motor gear ratio (-)
 #define     MOTOR_CPR               (64.0f)         // Motor encoder 64 Counts Per Revolution (quadrature) (-)
 #define     MOTOR_RAD_PER_TICK      (2.0f*3.14159f/(MOTOR_CPR*MOTOR_GEAR_RATIO)) // Motor Radian per Encoder Tick (rad/tick)
@@ -144,19 +134,19 @@
 #define     ROBOT_WHEEL_RAD_M       (0.0625f)       // Juggernaut Wheel Radius - 62.5mm (m)
 #define     ROBOT_WHEEL_SOD_M       (0.21f)         // 210mm - wheels separation distance
 
-#define     ROBO_STATE_INIT         (0U)        // MPU not initiated or found
-#define     ROBO_STATE_BALA         (1U)        //
-#define     ROBO_STATE_CALIB        (2U)        //
-#define     ROBO_STATE_IDENT        (3U)        //
-#define     ROBO_STATE_NOK          (4U)        //
+#define     ROBO_STATE_INIT         (0U)            // MPU not initiated or found
+#define     ROBO_STATE_BALA         (1U)            //
+#define     ROBO_STATE_CALIB        (2U)            //
+#define     ROBO_STATE_IDENT        (3U)            //
+#define     ROBO_STATE_NOK          (4U)            //
 
-#define     CONTROLLER_TYPE_PID     (0U)
-#define     CONTROLLER_TYPE_SMC     (1U)
-#define     CONTROLLER_TYPE_LQR     (2U)
+#define     CONTROLLER_TYPE_PID     (0U)            // Generic (Original) Controller
+#define     CONTROLLER_TYPE_SMC     (1U)            // Current (under test) Controller
+#define     CONTROLLER_TYPE_LQR     (2U)            // Future Expansion Controller
 
-#define     ALFA_CF_COEF            (0.03f)             // Complementary filter coefficient - Acc Gyro
-#define     iqALPHA              _IQ(ALFA_CF_COEF)      // Alpha
-#define     iqONE_NEG_ALPHA      _IQ(1.0f-ALFA_CF_COEF) // 1-Alpha
+// #define     UAV_CF_ALPHA            (0.03f)             // Complementary filter coefficient - Acc Gyro
+// #define     iqUAV_CF_ALPHA       _IQ(UAV_CF_ALPHA)      // Alpha
+// #define     iqONE_NEG_ALPHA      _IQ(1.0f-UAV_CF_ALPHA) // 1-Alpha
 
 #define     PWM_MAX_DUTY            (90U)       // [ % ] -> 0.90*12V => 10.8V
 #define     PWM_MIN_DUTY            (2U)        // [ % ] -> 0.02*12V => 0.24V
@@ -227,7 +217,7 @@ volatile uint8_t crc8tab[256] = {
     0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
     0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
 
-volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_1;
+volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_0;
 volatile    uint8_t     gRobot_State        = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_State_1      = ROBO_STATE_BALA;
 volatile    uint8_t     gController_Type    = CONTROLLER_TYPE_PID;  // Default state use PID
@@ -235,22 +225,45 @@ volatile    uint8_t     gController_Type    = CONTROLLER_TYPE_PID;  // Default s
 volatile    uint8_t     gRobot_Ident_State = 0U;
 
 // ----- FLAGS -----
-volatile    bool        gFlg_Read_MPU       = false;     // Flag signal to read MPU6050
-volatile    bool        gFlg_ADC[ADC_CNT]   = { false }; // Flag signal to read ADCs
-volatile    bool        gFlg_Log_Enable     = true;     // Flag signal to enable sending data via UART
-volatile    bool        gFlg_Send_UART      = false;     // Flag signal to send data via UART now
-volatile    bool        gFlg_RUN_OuterLoop  = false;     // Flag signal to run outer loop
-volatile    bool        gFlg_RUN_InnerLoop  = false;     // Flag signal to run inner loop
-volatile    bool        gFlg_Motor_EN       = false;     // Flag signal to enable motors
-volatile    bool        gFlg_Read_CRSF      = false;     // Flag signal to read RC commands
-volatile    bool        gFlg_Batt_gauge     = false;     // Flag signal to update WS2812 battery gauge display
+volatile    bool        gFlg_Log_Enable     = true;         // Flag signal to enable sending data via UART
+volatile    bool        gFlg_Send_UART      = false;        // Flag signal to send data via UART now
+volatile    bool        gFlg_RUN_OuterLoop  = false;        // Flag signal to run outer loop
+volatile    bool        gFlg_RUN_InnerLoop  = false;        // Flag signal to run inner loop
+volatile    bool        gFlg_Motor_EN       = false;        // Flag signal to enable motors
+volatile    bool        gFlg_Read_CRSF      = false;        // Flag signal to read RC commands
+volatile    bool        gFlg_Batt_gauge     = false;        // Flag signal to update WS2812 battery gauge display
 volatile    bool        gFlg_Tilt_gauge     = false;        // Flag signal to update WS2812 tilt angle display
 volatile    bool        gFlg_Send_tele      = false;        // Battery voltage telemetry
-volatile    bool        gFlg_Send_teleLatch = false;
+// volatile    bool        gFlg_Send_teleLatch = false;
+// typedef struct Flags_t {
+//     bool    Read_MPU;       // Flag signal to read MPU6050
+//     bool    ADC[ADC_CNT];   // Flag signal to read ADCs
+//     bool    Log_Enable;     // Flag signal to enable sending data via UART
+//     bool    Send_UART;      // Flag signal to send data via UART now
+//     bool    RUN_OuterLoop;  // Flag signal to run outer loop
+//     bool    RUN_InnerLoop;  // Flag signal to run inner loop
+//     bool    Motor_EN;       // Flag signal to enable motors
+//     bool    Read_CRSF;      // Flag signal to read RC commands
+//     bool    Batt_gauge;     // Flag signal to update WS2812 battery gauge display
+//     bool    Tilt_gauge;     // Flag signal to update WS2812 tilt angle display
+// } Flags_t;
+
+// volatile    Flags_t     gFlg = {
+//     .Read_MPU       = false,
+//     .ADC            = { false },
+//     .Log_Enable     = true,
+//     .Send_UART      = false,
+//     .RUN_OuterLoop  = false,
+//     .RUN_InnerLoop  = false,
+//     .Motor_EN       = false,
+//     .Read_CRSF      = false,
+//     .Batt_gauge     = false,
+//     .Tilt_gauge     = false
+// };
+
 // ----- COUNTERS -----
 volatile    uint32_t    gCnt_Heart_LED      = TIME_LED_ON_MS;
 volatile    uint8_t     gCnt_Heart_Tick     = 0U;
-volatile    uint32_t    gCnt_MPU_Delay      = TIME_MPU_DELAY_MS;
 volatile    uint32_t    gCnt_UART_Send      = TIME_SEND_DATA_MS;
 volatile    uint32_t    gCnt_OuterLoop      = TIME_MOTOR_OMEGA_MS;
 volatile    uint32_t    gCnt_Fail_Safe      = TIME_FAIL_SAFE_MS;
@@ -260,13 +273,14 @@ volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
 volatile    uint32_t    gCnt_Tilt_gauge     = TIME_TILT_GAU_MS;
 volatile    uint32_t    gCnt_Send_tele      = TIME_SEND_TELE_MS;
 volatile    uint32_t    gCnt_Tele_sended    = 0U;
+
 // ----- ERROR COUNTERS -----
-volatile    uint32_t    er_ct[ 24 ];
-volatile    uint32_t    ab_ct[ 24 ]; 
-volatile    uint32_t    ab_wr_ct[ 4 ];  // I2C duration in CPU_tics only for MPU_Write_Rer();
-volatile    uint32_t    ab_rl_ct[ 9 ];  // I2C duration in CPU_tics only for MPU_Read_Len();
-// ----- DURATION TIMERS -----
-typedef struct {
+// volatile    uint32_t    er_ct[ 24 ];
+// volatile    uint32_t    ab_ct[ 24 ]; 
+volatile    uint32_t    i2c_wr_ct[ 4 ];  // I2C duration in CPU_tics only for MPU_Write_Rer();
+volatile    uint32_t    i2c_rl_ct[ 9 ];  // I2C duration in CPU_tics only for MPU_Read_Len();
+// ----- usec DURATION TIMERS -----
+typedef struct dt_t{
     uint32_t quad_isr;      // dt 0: quadrature ISR
     uint32_t mpu_read;      // dt 1: I2C/SPI overhead
     uint32_t uav_physics;   // dt 2 & 3: Scaling, G-calc, Rad/s
@@ -275,7 +289,7 @@ typedef struct {
     uint32_t uart_comms;    // dt 6: Buffer filling and TX
     uint32_t inner_loop;    // dt 7: Tilt control
     uint32_t outer_loop;    // dt 8: Position control
-    uint32_t csfr;          // dt 9: Commands
+    uint32_t crsf;          // dt 9: Commands
     uint32_t adc_m0;        // dt 10: ADC M0 sample time
     uint32_t adc_m1;        // dt 11: ADC M1 sample time
     uint32_t total_loop;    // total sum - The heartbeat of your UAV
@@ -283,18 +297,19 @@ typedef struct {
 // Global or module-level instance
 dt_t duration_us;
 // end of new structure
-#define     MAX_TIMERS  (12U)   // number of timers WAS 10
-volatile    uint16_t    dt[ MAX_TIMERS ];    // delta time in us
-volatile    uint16_t    dt_over[ MAX_TIMERS ];// delta time over some limit buffer in us - histogram
-volatile    uint16_t    t0[ MAX_TIMERS ];    // save timer value
+#define     MAX_TIMERS  (12U)                       // number of timers WAS 10
+volatile    uint16_t    dt[ MAX_TIMERS ];           // delta time in us
+volatile    uint16_t    t0[ MAX_TIMERS ];           // save timer value
+// volatile    uint16_t    dt_over[ MAX_TIMERS ];      // delta time over some limit buffer in us - histogram
 #define     STORE_TIMER6(i) ( t0[i] = (uint16_t)DL_TimerG_getTimerCount( TIMER_6_INST ) )
 #define     GET_DURATION(i) ( dt[i] = (uint16_t)(DL_TimerG_getTimerCount( TIMER_6_INST ) - t0[i]) )
 // ----- ANALOG - EMA COEF -----
-#define     BATT_VOLT_EMA_ALPHA     (0.01f)         // Exponential Moving Average coef - Battery voltage
-#define     MOTOR_CURR_EMA_ALPHA    (0.01f)         // Exponential Moving Average coef - Motor Current - WAS 0.01
-volatile    float       gBATT_EMA_Coef   = BATT_VOLT_EMA_ALPHA;
-volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
+// #define     BATT_VOLT_EMA_ALPHA     (0.01f)         // Exponential Moving Average coef - Battery voltage
+// #define     MOTOR_CURR_EMA_ALPHA    (0.01f)         // Exponential Moving Average coef - Motor Current - WAS 0.01
+// volatile    float       gBATT_EMA_Coef   = BATT_VOLT_EMA_ALPHA;
+// volatile    float       gCURR_EMA_Coef   = MOTOR_CURR_EMA_ALPHA;
 // ----- ANALOG - All channels -----
+volatile    bool        gADC_flg[  ADC_CNT ]   = { false };    // Flag signal to read ADCs
 volatile    uint32_t    gADC_LSB[  ADC_CNT ];       // [ LSB ]
 volatile    float       gADC_Volt[ ADC_CNT ];       // [ V ]
 
@@ -313,7 +328,7 @@ volatile    float       gADC_Volt[ ADC_CNT ];       // [ V ]
 #define SMC_PHI_DEF               (0.75f)  // "The Cushion" - Boundary layer thickness (eliminates 5-10Hz gear chatter)
 
 // ----- Sliding Mode Controller Structure -----
-typedef struct {
+typedef struct SMC_Controller_t {
     // Hyperplane weights (surface slope vector)
     float lambda_angle;       // Pitch error gain
     float lambda_angle_rate;  // Pitch rate error gain
@@ -344,43 +359,44 @@ volatile SMC_Controller_t smc_controller = {
 };
 
 // ----- Define what a "WHEEL" is -----
-typedef struct {
-    float   pos_m;              // Wheel Linear position (m)
-    float   pos_hist_m[5];      // Wheel Linear position history (m) - for SG derivative filter
-    float   speed_ms;           // Wheel Linear speed (m/s)
+typedef struct wheel_t {
+    float       pos_m;              // Wheel Linear position (m)
+    float       pos_hist_m[5];      // Wheel Linear position history (m) - for SG derivative filter
+    float       speed_ms;           // Wheel Linear speed (m/s)
 } wheel_t;
 // ----- Define what a "MOTOR" is -----
-typedef struct {
-    int32_t imp;                // Motor Encoder impulses (-)
-    float   theta_rad;          // Motor Angle (rad)
-    float   theta_hist_rad[5];  // Motor Angle history (rad) - for SG derivative filter
-    float   omega_rads;         // Motor Angular velocity (rad/s)
-    float   curr_ema_A;         // Motor Current (A) - Exponential Moving Average filter
-    float   curr_med3_A;        // Motor Current (A) - Median filter - Almost raw data
-    float   curr_med5_A;        // Motor Current (A) - Median filter - Almost raw data
-    float   curr_hist_A[5];     // Motor Current history (A) - for Median filter
-    float   volt_V;             // Motor Voltage (V)
+typedef struct motor_t {
+    int32_t     imp;                // Motor Encoder impulses (-)
+    float       theta_rad;          // Motor Angle (rad)
+    float       theta_hist_rad[5];  // Motor Angle history (rad) - for SG derivative filter
+    float       omega_rads;         // Motor Angular velocity (rad/s)
+    float       curr_ema_A;         // Motor Current (A) - Exponential Moving Average filter
+    float       curr_med3_A;        // Motor Current (A) - Median filter - Almost raw data
+    float       curr_med5_A;        // Motor Current (A) - Median filter - Almost raw data
+    float       curr_hist_A[5];     // Motor Current history (A) - for Median filter
+    float       volt_V;             // Motor Voltage (V)
 } motor_t;
 // ----- Define what a "POWER" is -----
-typedef struct {
-    float batt_volt_V;      // Battery filtered voltage (V)
-    float batt_gauge_ptc;   // Battery gauge in percentage (%)
-    bool  is_low_power;     // Critical low voltage flag
+typedef struct power_t {
+    float       batt_volt_V;        // Battery filtered voltage (V)
+    float       batt_curr_A;        // Battery current (A)
+    uint16_t    batt_cap_mAh;       // Battery fuel used (mAh)
+    float       batt_gauge_ptc;     // Battery gauge in percentage (%)
+    bool        is_low_power;       // Critical low voltage flag
 } power_t;
 
 // *****************************************  *****************************************  *****************************************
 // *****    Define what a "ROBOT" is   *****  *****   Define what a "ROBOT" is    *****  *****   Define what a "ROBOT" is    *****
 // *****************************************  *****************************************  *****************************************
-typedef struct {
+typedef struct Robot_t {
     // --- 10. GAINS (The "DNA") ---
     struct {
-        float   FF;         // Angle Feed Forward gain     - DIRECT DRIVE
-        float   KP;         // Angle Proportional gain     - SPRING
-        float   KD;         // Angle Gyro derivative gain  - DAMPER
-        float   TI;         // Angle Combined turning gain - YAW
-        float   KP_Pos;     // Robot Position Proportional gain
-        float   KD_Pos;     // Robot Speed Proportional gain
-        // Default Gains see Below \/
+        float   FF;             // Angle Feed Forward gain     - DIRECT DRIVE
+        float   KP;             // Angle Proportional gain     - SPRING
+        float   KD;             // Angle Gyro derivative gain  - DAMPER
+        float   TI;             // Angle Combined turning gain - YAW
+        float   KP_Pos;         // Robot Position Proportional gain
+        float   KD_Pos;         // Robot Speed Proportional gain
     } gain;
     // --- 20. POWER (The "Health") ---
     power_t power;
@@ -434,7 +450,8 @@ typedef struct {
     } control;
     // --- 70. RC (The "Remote Control") ---
     struct {
-        uint16_t ch[16U];           // Raw 11-bit values
+        // --- Raw RC Data ---
+        uint16_t ch[16U];           // [0 .. 2047]   - Raw 11-bit values
         // --- Primary Sticks (Normalized) ---
         float roll;                 // [-1.00, 1.00] - Roll stick input
         float pitch;                // [-1.00, 1.00] - Pitch stick input
@@ -445,26 +462,26 @@ typedef struct {
         float state3_L;             // [-1.00, 1.00] - State 3 switch input
         float state3_R;             // [-1.00, 1.00] - State 3 switch input
         float latch_R;              // [-1.00, 1.00] - Latch switch input
-        float button_L;             // [-1.00, 1.00] - Button switch input
+        float button_L;             // [-1.00, 1.00] - Momentary switch input
         bool is_connected;          // Failsafe flag
     } rc_cmd;
 } Robot_t;
 // ----- Robot Defaults -----
-#define FF_GAIN_DEF         (2.50f) // Tilt - Feed Forward Default Gain             (WAS 1.0)
-#define KP_GAIN_DEF         (10.0f) // Tilt - Proportional Default Gain INNER LOOP  (WAS 9.0)
-#define KD_GAIN_DEF         (2.00f) // Tilt - Derivative Default Gain INNER LOOP    (WAS 1.5)
-#define TI_GAIN_DEF         (2.50f) // Turn - Proportional Default Gain SIDE LOOP   (WAS 1.0)
-#define KP_POS_GAIN_DEF     (0.00f) // Pos  - Proportional Default Gain OUTER LOOP  (WAS 0.4)
-#define KD_POS_GAIN_DEF     (0.00f) // Pos  - Derivative Default Gain OUTER LOOP    (WAS 0.4)
+#define PID_FF_GAIN_DEF         (2.50f)     // Tilt - Feed Forward Default Gain             (WAS 1.0)
+#define PID_KP_GAIN_DEF         (10.0f)     // Tilt - Proportional Default Gain INNER LOOP  (WAS 9.0)
+#define PID_KD_GAIN_DEF         (2.00f)     // Tilt - Derivative Default Gain INNER LOOP    (WAS 1.5)
+#define PID_TI_GAIN_DEF         (2.50f)     // Turn - Proportional Default Gain SIDE LOOP   (WAS 1.0)
+#define PID_KP_POS_GAIN_DEF     (0.00f)     // Pos  - Proportional Default Gain OUTER LOOP  (WAS 0.4)
+#define PID_KD_POS_GAIN_DEF     (0.00f)     // Pos  - Derivative Default Gain OUTER LOOP    (WAS 0.4)
 
 volatile Robot_t robot = {
     .gain = {
-        .FF = FF_GAIN_DEF,              // [V]
-        .KP = KP_GAIN_DEF,              // [V/rad]
-        .KD = KD_GAIN_DEF,              // [Vs/rad]
-        .TI = TI_GAIN_DEF,              // [V]
-        .KP_Pos = KP_POS_GAIN_DEF,      // [V/m]
-        .KD_Pos = KD_POS_GAIN_DEF       // [V/m/s]
+        .FF = PID_FF_GAIN_DEF,              // [V]
+        .KP = PID_KP_GAIN_DEF,              // [V/rad]
+        .KD = PID_KD_GAIN_DEF,              // [Vs/rad]
+        .TI = PID_TI_GAIN_DEF,              // [V]
+        .KP_Pos = PID_KP_POS_GAIN_DEF,      // [V/m]
+        .KD_Pos = PID_KD_POS_GAIN_DEF       // [V/m/s]
     },
     .power = {
         .batt_volt_V = VOLT_BATTERY_DEF,  // strong filter used for battery voltage
@@ -478,67 +495,69 @@ volatile Robot_t robot = {
     }
 };
 // ----- Define what a "ENCODER" is -----
-typedef struct {
+typedef struct QuadPrevState_t {
     volatile bool A;
     volatile bool B;
     volatile bool C;
     volatile bool D;
-} QuadPrevState;
+} QuadPrevState_t;
 // ----- Quad Encoder Defaults -----
-static QuadPrevState quad0 = {
+static QuadPrevState_t quad0 = {
     .A = false,
     .B = false,
     .C = false,
     .D = false
 };
 
-// ***** UART0 - Communication to PC *****
-// RX
-#define     RX0_BUFF_N  (4U) 
-#define     UART0_RX_BUFFER_SIZE (1U<<RX0_BUFF_N)
-volatile    uint8_t     gUART0_RXbuffer[ UART0_RX_BUFFER_SIZE ];         // Buffer size in 2^N size (1,2,4,8,16,32,64,...)
-volatile    uint8_t     gUART0_RXbytes = 0U;                              // Buffer counter
-volatile    bool        gFlg_UART0_terminator_detected = false;
-volatile    bool        UART0_command_detected = false;
+// ***** UART0 - Communication to/from PC *****
+// --- RX - Used for TEXT commands ---
+#define     RX0_BUFF_N      (4U)                            // 4 -> 2^4 = 16
+#define     RX0_BUFF_SIZE   (1U<<RX0_BUFF_N)                // Buffer size in 2^N size (1,2,4,8,16,32,64,...)
+volatile    uint8_t         gRX0_buffer[ RX0_BUFF_SIZE ];   // RX Buffer
+volatile    uint8_t         gRX0_idx = 0U;                  // RX Buffer counter (index)
+volatile    bool            gRX0_flg_eol = false;           // RX Message End of Line flag (CR+LF) (data ready)
+// --- TX - Used for Serial Monitor APP or Custom GUI ---
+#define     TX0_SIG_CNT     (28U)                           // Count of Signals that will be sended over UART
+#define     TX0_SIG_RNG     (7U)                            // Signals -99999 to +99999 range (5 characters + sign) + coma separator
+volatile    int32_t         gTX0_signal[ TX0_SIG_CNT ];     // Signals are stored in field to use for-cycle
+volatile    uint8_t         gTX0_buffer[ TX0_SIG_CNT * TX0_SIG_RNG + 1 ];   // TX Buffer (Signals + separators + terminator)
+volatile    uint8_t         gTX0_size = 0;                  // TX Buffer size - store number of actual bytes
+volatile    uint8_t         gTX0_idx = 0;                   // TX Buffer counter (index)
 
-volatile    int16_t     P_Gain_received = 0;    // P gain
-volatile    int16_t     I_Gain_received = 0;    // I gain
-volatile    int16_t     D_Gain_received = 0;    // D gain
-volatile    int16_t     C_Gain_received = 0;    // LH-RH Compensation gain
-volatile    int16_t     N_Gain_received = 0;    // N coef for D filter
-volatile    int16_t     G_Gain_received = 0;    // damping from Gyro
-volatile    int16_t     A_Filt_received = 0;    // Alpha coef. for MPU (complementary filter)
-volatile    int16_t     B_Filt_received = 0;    // Beta  coef. for Battery Voltage
-volatile    int16_t     Z_Filt_received = 0;    // Zeta  coef. for Motor Current
-volatile    int16_t     Y_Offs_received = 0;    // Y (PITCH) offset received
-// TX
-#define     SIGNAL_CNT  (28U)                                           // count of Signals that will be sended over UART
-#define     SIGNAL_RNG  (7U)                                            // Signals -99999 to +99999 range (6 characters max) + coma separator
-volatile    int32_t     UART0_Tele_Sig[ SIGNAL_CNT ];                    // Signals are stored in fiel to use for-cycle - now global
-volatile    uint8_t     gUART0_message[ SIGNAL_CNT * SIGNAL_RNG + 1 ];   // array with message (Signals + separators + terminator) - max. size
-volatile    uint8_t     gUART0_MessageLength = 0;
-volatile    uint8_t     gUART0_TXbytes = 0;
+// ***** UART1 - Radio Control via CRSF *****
+// --- RX - 16ch CRSF ---
+#define     RX1_BUFF_N      (5U)                            // 5 -> 2^5 -> 32 (as CRSF message is 26bytes long for 16channels)
+#define     RX1_BUFF_SIZE   (1U<<RX1_BUFF_N)                // Buffer size in 2^N size (1,2,4,8,16,32,64,...)
+volatile    uint8_t         gRX1_buffer[ RX1_BUFF_SIZE ];
+volatile    uint8_t         gRX1_idx = 0;
+// --- TX - Telemetry CRSF ---
+volatile    uint8_t         gTX1_buffer[ RX1_BUFF_SIZE ];
+volatile    uint8_t         gTX1_size = 0;
+volatile    uint8_t         gTX1_idx = 0;
 
-// ***** UART1 - Radio Control *****
-#define     RX1_BUFF_N  (5U)    // 5 -> 2^5 -> 32
-#define     UART1_RX_BUFFER_SIZE (1U<<RX1_BUFF_N)   // 32
-volatile    uint8_t     gUART1_RXbuffer[ UART1_RX_BUFFER_SIZE ];
-volatile    uint8_t     gUART1_RXbuffer_index = 0;
-volatile    uint8_t     gUART1_message[ UART1_RX_BUFFER_SIZE ];
-volatile    uint8_t     gUART1_MessageLength = 0;
-volatile    uint8_t     gUART1_TXbytes = 0;
-volatile    bool        gUART1_frame_ready = false; // CSFR frame is ready (received)
-// volatile    uint8_t     UART1_TX_counter = 0;
-// Cross Fire Counters
-volatile    uint32_t    gCSFR_Header_match_cnt = 0;
-volatile    uint32_t    gCSFR_CRC_match_cnt = 0;
-volatile    uint32_t    gCSFR_CRC_error_cnt = 0;
+// ***** Cross Fire Radio System *****
+// CRSF Protocol - https://github.com/tbs-fpv/tbs-crsf-spec/blob/main/crsf.md#broadcast-frame-types
+#define     CRSF_SYNC_BYTE          (0xC8)          // Serial Sync Byte - #1 byte of the message
+#define     CRSF_FRAME_ID_BATTERY   (0x08)          // Frame type - Battery Sensor
+#define     CRSF_FRAME_ID_16_CHAN   (0x16)          // Frame type - RC Channels Packed Payload
 
-volatile    uint8_t     gCSFR_Data_RX[ CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ];
-volatile    uint8_t     gCSFR_Data_Reversed[ CRSF_MSG_DATA_SIZE ];
-// volatile    uint8_t     CSFR_CRC_Received = 0;
-volatile    uint8_t     gCSFR_CRC_Calculated = 0;
-volatile    uint16_t    RC_channels[ CRSF_CHANNEL_COUNT ];
+#define     CRSF_MSG_HEAD_SIZE      (3U)            // 0xC8 SYNC, 0x18 LEN (TYPE+PAYLOAD+CRC=24B), 0x16 TYPE (16 RC chans)
+#define     CRSF_MSG_16CH_SIZE      (22U)           // PAYLOAD: 22*8bit = 176bit => 176bit/16chan = 11bit resolution per RC channel
+#define     CRSF_MSG_CRC_SIZE       (1U)            // CRC-8 0xD5
+#define     CRSF_MESSAGE_SIZE       (CRSF_MSG_HEAD_SIZE+CRSF_MSG_16CH_SIZE+CRSF_MSG_CRC_SIZE)
+#define     CRSF_CHANNEL_COUNT      (16U)           // Standart 16-chan, but Radiomaster Pocket use 10chans
+#define     CRSF_CRC_POLY           (0xD5)          // 0xD5 gives better burst‑error detection for short frames
+
+volatile    bool            gCRSF_RX_flg_eol = false;       // CRSF Frame is received and ready to be processed
+volatile    uint32_t        gCSFR_Header_match_cnt = 0;     // Count of header matches
+volatile    uint32_t        gCSFR_CRC_match_cnt = 0;        // Count of CRC matches
+volatile    uint32_t        gCSFR_CRC_error_cnt = 0;        // Count of CRC errors
+
+volatile    uint8_t         gCSFR_RX_DataCRC[ CRSF_MSG_16CH_SIZE + CRSF_MSG_CRC_SIZE ]; // Data (22B) + CRC (1B)
+// volatile    uint16_t        gCRSF_RC_chann[ CRSF_CHANNEL_COUNT ];   // Extracted RC channels (0-1023)
+
+// volatile    uint8_t         CSFR_Data_Reversed[ CRSF_MSG_16CH_SIZE ];
+// volatile    uint8_t         CSFR_CRC_Calculated = 0;
 
 // ***** I2C1 - GYRO ACCELEROMETER *****
 #define     I2C_TX_MAX_PACKET_SIZE (16U)
@@ -562,12 +581,15 @@ enum I2cControllerStatus
     I2C_STATUS_ERROR,
 } gI2cControllerStatus;
 
-// ----- MPU-6050 -----
+// ***** IMU - GYRO ACCELEROMETER - MPU-6050 *****
 //MPU physical AD0 = 0
 #define     MPU_ADDRESS ( 0b1101000 )  // MPU slave address in 7bit format
 
-// --- new structures ---
-typedef struct {
+// volatile    uint32_t    gCnt_MPU_Delay      = TIME_MPU_DELAY_MS;
+// volatile    bool        gFlg_Read_MPU       = false;        // Flag signal to read MPU6050
+
+// --- MPU structure ---
+typedef struct mpu_t {
     // --- 1. CONFIG (Acc and Gyro Fullscale Range setup) ---
     struct {
         uint8_t accel_afs_sel;  // 0=2g , 1=4g , 2=8g , 3=16g
@@ -577,19 +599,21 @@ typedef struct {
     } cfg;
     // --- 2. STATUS & HEALTH ---
     struct {
-        uint8_t irq_latchs;     // reg INT_PIN_CFG = 0x20
-        uint8_t irq_enable;     // reg INT_ENABLE = 0x01
-        uint8_t exit_sleep;     // reg PWR_MGMT_1 = 0x00
-        uint8_t who_am_i;       // reg WHO_AM_I = 0x68
-        uint8_t irq_status;     // reg INT_STATUS (0x3A)
-        uint16_t error;         // Bitmask of your gMPU_return[10]
-        bool    is_initialized; // <--- THE FAILSAFE
-        bool    is_calibrated;  // after Gyro calibration
+        uint8_t     irq_latchs;         // reg INT_PIN_CFG = 0x20
+        uint8_t     irq_enable;         // reg INT_ENABLE = 0x01
+        uint8_t     exit_sleep;         // reg PWR_MGMT_1 = 0x00
+        uint8_t     who_am_i;           // reg WHO_AM_I = 0x68
+        uint8_t     irq_status;         // reg INT_STATUS (0x3A)
+        uint16_t    error;              // Bitmask of your gMPU_return[10]
+        bool        is_initialized;     // <--- THE FAILSAFE
+        bool        is_calibrated;      // after Gyro calibration
+        uint32_t    delay_cnt_ms;       // initialization delay
+        bool        read_flg;           // read MPU flag
     } status;
     struct {
-        uint32_t irq_set_cnt;
-        uint32_t irq_not_set_cnt;
-        uint32_t reset_cnt;
+        uint32_t    irq_set_cnt;
+        uint32_t    irq_not_set_cnt;
+        uint32_t    reset_cnt;
     } diag;
     // --- 3. Calibration Offsets ---
     struct {
@@ -661,7 +685,9 @@ volatile mpu_t mpu = {
         .who_am_i = 0U,
         .error = 0U,
         .is_initialized = false,
-        .is_calibrated = false
+        .is_calibrated = false,
+        .delay_cnt_ms = TIME_MPU_DELAY_MS,
+        .read_flg = false
     }
 };
 // *****************************************  *****************************************  *****************************************
@@ -687,15 +713,14 @@ bool        UART0_Update_Cmd( void );
 bool        UART0_Update_Gain( void );
 uint16_t    UART0_Send_Tele(uint8_t argCount );
 
-int32_t     Filter_Median3(int32_t a, int32_t b, int32_t c);
 
 void        CRSF_Update ( void );
+bool        CRSF_RX_Extract_16ch_payload( void );
 uint8_t     CRSF_Get_CRC8( uint8_t argTypeID, volatile uint8_t *argData, uint8_t argLength );
-// uint8_t     CSFR_Get_CRC8( void );
-bool        CRSF_Extract_Data( void );
 void        CRSF_Parse_Data( void );
 uint16_t    CRSF_Reverse11( uint16_t arg_data_for_rev );
-void        CRSF_Send_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct);
+void        CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct);
+// uint8_t     CSFR_Get_CRC8( void );
 
 void        Wheel_GetSpeed_SG(void);
 
@@ -706,6 +731,7 @@ void        Robot_GetWheelPhysics(volatile motor_t *argMotor , volatile wheel_t 
 void        Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LSB );
 void        Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB );
 
+int32_t     Filter_Median3(int32_t a, int32_t b, int32_t c);
 static inline float Filter_Median3_f(float a, float b, float c);
 static inline float Filter_Median5_f(float p0, float p1, float p2, float p3, float p4);
 
@@ -746,8 +772,8 @@ int main( void ) {
         PID_Outer_Loop();
         // ----- 4. (B) INNER LOOP -----
         switch ( gController_Type ) {
-            case CONTROLLER_TYPE_PID: PID_Inner_Loop(); break;
-            case CONTROLLER_TYPE_SMC: SMC_Inner_Loop(); break;
+            case CONTROLLER_TYPE_PID: PID_Inner_Loop(); gLED_Seq_Now = LED_SEQUENCE_1; break;
+            case CONTROLLER_TYPE_SMC: SMC_Inner_Loop(); gLED_Seq_Now = LED_SEQUENCE_2; break;
                              default: PID_Inner_Loop(); break; }
         // ----- 5. UART UPDATE -----
         UART0_Update();
@@ -768,7 +794,7 @@ int main( void ) {
 
             robot.power.batt_gauge_ptc = 100.0f * ( robot.power.batt_volt_V - VOLT_BATTERY_MIN ) / ( VOLT_BATTERY_MAX - VOLT_BATTERY_MIN);
 
-            CRSF_Send_Telemetry( robot.power.batt_volt_V, 0.0f, 0U, robot.power.batt_gauge_ptc);
+            CRSF_TX_Telemetry( robot.power.batt_volt_V, 0.0f, 0U, robot.power.batt_gauge_ptc);
         }
     }
 }
@@ -810,8 +836,10 @@ void TIMER_0_INST_IRQHandler()
     }
 
     // ----- MPU - DELAY -----
-    if ( gCnt_MPU_Delay > 0 )
-        --gCnt_MPU_Delay;
+    if ( mpu.status.delay_cnt_ms > 0 )
+        --mpu.status.delay_cnt_ms;
+    // if ( gCnt_MPU_Delay > 0 )
+    //     --gCnt_MPU_Delay;
     
     // ----- UART - SEND DATA -----
     if ( --gCnt_UART_Send == 0 )
@@ -867,7 +895,9 @@ void TIMER_0_INST_IRQHandler()
 ****************************************/
 void TIMER_8_INST_IRQHandler(void)
 {
-    gFlg_Read_MPU = true;    // READ DATA FROM MPU
+    // READ DATA FROM MPU
+    mpu.status.read_flg = true;
+    // gFlg_Read_MPU = true;    
 }
 
 /****************************************
@@ -880,11 +910,11 @@ void ADC12_0_INST_IRQHandler( void )
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_0_INST ) )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
-            gFlg_ADC[ 4 ] = true;
+            gADC_flg[ 4 ] = true;
             gADC_LSB[ 4 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_TEMP_M1 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
-            gFlg_ADC[ 2 ] = true;
+            gADC_flg[ 2 ] = true;
             gADC_LSB[ 2 ] = DL_ADC12_getMemResult( ADC12_0_INST , ADC12_0_ADCMEM_CURR_M1 );
 GET_DURATION(11);
 duration_us.adc_m1 = dt[11];
@@ -905,18 +935,18 @@ void ADC12_1_INST_IRQHandler( void )
     switch  ( DL_ADC12_getPendingInterrupt( ADC12_1_INST ) )
     {
         case DL_ADC12_IIDX_MEM0_RESULT_LOADED:
-            gFlg_ADC[ 3 ] = true;
+            gADC_flg[ 3 ] = true;
             gADC_LSB[ 3 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_TEMP_M0 );
             break;
         case DL_ADC12_IIDX_MEM1_RESULT_LOADED:
-            gFlg_ADC[ 1 ] = true;
+            gADC_flg[ 1 ] = true;
             gADC_LSB[ 1 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_CURR_M0 );
 GET_DURATION(10);
 duration_us.adc_m0 = dt[10];
 STORE_TIMER6(10);
             break;    
         case DL_ADC12_IIDX_MEM2_RESULT_LOADED:
-            gFlg_ADC[ 0 ] = true;
+            gADC_flg[ 0 ] = true;
             gADC_LSB[ 0 ] = DL_ADC12_getMemResult( ADC12_1_INST , ADC12_1_ADCMEM_VS1 );
             break; 
         default:
@@ -931,22 +961,22 @@ void UART_0_INST_IRQHandler( void )
     switch ( DL_UART_Main_getPendingInterrupt( UART_0_INST ) )
     {
         case DL_UART_MAIN_IIDX_RX:
-            gUART0_RXbytes &= UART0_RX_BUFFER_SIZE - 1U;  // mask to prevent overflow
-            gUART0_RXbuffer[ gUART0_RXbytes ] = DL_UART_Main_receiveData( UART_0_INST );
+            gRX0_idx &= RX0_BUFF_SIZE - 1U;  // mask to prevent overflow
+            gRX0_buffer[ gRX0_idx ] = DL_UART_Main_receiveData( UART_0_INST );
             // Check terminator
-            if( gUART0_RXbuffer[ gUART0_RXbytes ] == '\n' )
-                gFlg_UART0_terminator_detected = true;
-            gUART0_RXbytes++;
+            if( gRX0_buffer[ gRX0_idx ] == '\n' )
+                gRX0_flg_eol = true;
+            gRX0_idx++;
         break;
 
         case DL_UART_MAIN_IIDX_TX:
             //transmit byte
-            DL_UART_Main_transmitData ( UART_0_INST , gUART0_message[ gUART0_TXbytes++ ] );
+            DL_UART_Main_transmitData ( UART_0_INST , gTX0_buffer[ gTX0_idx++ ] );
             // Disable transmit interrupt if no more bytes
-            if ( gUART0_TXbytes == gUART0_MessageLength )
+            if ( gTX0_idx == gTX0_size )
             {
                 DL_UART_Main_disableInterrupt( UART_0_INST , DL_UART_MAIN_INTERRUPT_TX );
-                gUART0_TXbytes = 0;
+                gTX0_idx = 0;
             }
         break;
 
@@ -968,65 +998,65 @@ void UART_1_INST_IRQHandler( void )
             rx_byte = (uint8_t)DL_UART_Main_receiveData( UART_1_INST );
 
             // --- BYTE 0: Must be SYNC (0xC8) ---
-            if ( gUART1_RXbuffer_index == 0 )
+            if ( gRX1_idx == 0 )
             {
                 if ( rx_byte == 0xC8 )
                 {
-                    gUART1_RXbuffer[0] = rx_byte;
-                    gUART1_RXbuffer_index = 1;
+                    gRX1_buffer[0] = rx_byte;
+                    gRX1_idx = 1;
                 }
                 break;
             }
 
             // --- BYTE 1: Must be LENGTH (0x18) ---
-            if ( gUART1_RXbuffer_index == 1 )
+            if ( gRX1_idx == 1 )
             {
                 if ( rx_byte == 0x18 )
                 {
-                    gUART1_RXbuffer[1] = rx_byte;
-                    gUART1_RXbuffer_index = 2;
+                    gRX1_buffer[1] = rx_byte;
+                    gRX1_idx = 2;
                 }
                 else
                 {
-                    gUART1_RXbuffer_index = 0; // Alignment lost, reset
+                    gRX1_idx = 0; // Alignment lost, reset
                 }
                 break;
             }
 
             // --- BYTE 2: Must be TYPE (0x16) ---
-            if ( gUART1_RXbuffer_index == 2 )
+            if ( gRX1_idx == 2 )
             {
                 if ( rx_byte == 0x16 )
                 {
-                    gUART1_RXbuffer[2] = rx_byte;
-                    gUART1_RXbuffer_index = 3;
+                    gRX1_buffer[2] = rx_byte;
+                    gRX1_idx = 3;
                 }
                 else
                 {
-                    gUART1_RXbuffer_index = 0; // Alignment lost, reset
+                    gRX1_idx = 0; // Alignment lost, reset
                 }
                 break;
             }
 
             // --- PAYLOAD & CRC (Bytes 3 to 25) ---
-            gUART1_RXbuffer[gUART1_RXbuffer_index++] = rx_byte;
+            gRX1_buffer[gRX1_idx++] = rx_byte;
 
-            // Full 24-byte packet collected
-            if ( gUART1_RXbuffer_index >= 26 )
+            // Full 26-byte packet collected
+            if ( gRX1_idx >= 26 )
             {
-                gUART1_frame_ready = true; // Signal main loop to run CRC & decode channels
-                gUART1_RXbuffer_index = 0; // Reset index for next incoming frame
+                gCRSF_RX_flg_eol = true;    // Signal main loop to run CRC & decode channels
+                gRX1_idx = 0;               // Reset index for next incoming frame
             }
             break;
 
         case DL_UART_MAIN_IIDX_TX:
             //transmit byte
-            DL_UART_Main_transmitData ( UART_1_INST , gUART1_message[ gUART1_TXbytes++ ] );
+            DL_UART_Main_transmitData ( UART_1_INST , gTX1_buffer[ gTX1_idx++ ] );
             // Disable transmit interrupt if no more bytes
-            if ( gUART1_TXbytes == gUART1_MessageLength )
+            if ( gTX1_idx == gTX1_size )
             {
                 DL_UART_Main_disableInterrupt( UART_1_INST , DL_UART_MAIN_INTERRUPT_TX );
-                gUART1_TXbytes = 0;
+                gTX1_idx = 0;
                 gCnt_Tele_sended++;
             }
             break;
@@ -1041,7 +1071,7 @@ void UART_1_INST_IRQHandler( void )
 //     {
 //         case DL_UART_MAIN_IIDX_RX:
 //             gUART1_RXbuffer[ gUART1_RXbuffer_index ] = DL_UART_Main_receiveData( UART_1_INST );
-//             gUART1_RXbuffer_index = ( gUART1_RXbuffer_index + 1 ) % UART1_RX_BUFFER_SIZE;
+//             gUART1_RXbuffer_index = ( gUART1_RXbuffer_index + 1 ) % RX1_BUFF_SIZE;
 //         break;
 
 //         case DL_UART_MAIN_IIDX_TX:
@@ -1180,15 +1210,6 @@ void GROUP1_IRQHandler(void)
     }
     GET_DURATION( 0 );
     duration_us.quad_isr = dt[0];
-    
-    // uint32_t dt = dt_us[0];
-    // if (dt==0U) dt_over_us[0]++;
-    // if (dt==1U) dt_over_us[1]++;
-    // if (dt==2U) dt_over_us[2]++;
-    // if (dt==3U) dt_over_us[3]++;
-    // if (dt==4U) dt_over_us[4]++;
-    // if (dt>=5U) dt_over_us[5]++;
-
 }
 
 // *****************************************  *****************************************  *****************************************
@@ -1234,8 +1255,10 @@ void MCU_Initialize( void )
 void IMU_Initialize(void)
 {
     // 1. Initial Delay for MPU Power-up stabilization
-    gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-    while (gCnt_MPU_Delay > 0U);
+    mpu.status.delay_cnt_ms = TIME_MPU_DELAY_MS;
+    while (mpu.status.delay_cnt_ms > 0U);
+    // gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
+    // while (gCnt_MPU_Delay > 0U);
 
     // Reset error mask and initialization status
     mpu.status.error = 0;
@@ -1248,8 +1271,10 @@ void IMU_Initialize(void)
     if (MPU_Write_Reg(0x6B, 0x00) != 0) mpu.status.error |= (1 << 2); // Exit Sleep
 
     // Second Delay to allow MPU internal clock PLL to stabilize after waking up
-    gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-    while (gCnt_MPU_Delay > 0U);
+    mpu.status.delay_cnt_ms = TIME_MPU_DELAY_MS;
+    while (mpu.status.delay_cnt_ms > 0U);
+    // gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
+    // while (gCnt_MPU_Delay > 0U);
 
     // 3. Read-Back and Validation logic
     // We check if the data on the chip actually matches what we just wrote
@@ -1300,8 +1325,10 @@ void IMU_Initialize(void)
 void        IMU_Calibrate( void )
 {
     // Delay to allow Robot to stop shaking from powring up
-    gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-    while (gCnt_MPU_Delay > 0U);
+    mpu.status.delay_cnt_ms = TIME_MPU_DELAY_MS;
+    while (mpu.status.delay_cnt_ms > 0U);
+    // gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
+    // while (gCnt_MPU_Delay > 0U);
 
     // --- calibration ---
     mpu.status.is_calibrated = false;
@@ -1437,9 +1464,9 @@ void ADC12_Update( void )
 {
     for ( int i = 0 ; i < ADC_CNT ; i++ )
     {
-        if ( gFlg_ADC[ i ] )
+        if ( gADC_flg[ i ] )
         {
-            gFlg_ADC[ i ] = false;
+            gADC_flg[ i ] = false;
 
             gADC_Volt[ i ] = (float)gADC_LSB[ i ] * VOLT_ADC_REF / 4096.0f;   // LSB to volt 
 
@@ -1473,18 +1500,18 @@ uint16_t UART0_Send_Tele( uint8_t argCount )
     for ( i = 0 ; i < argCount ; i++ )
     {
         // limiting -99 999 to +99 999
-        if ( UART0_Tele_Sig[ i ] > 99999 )
-            UART0_Tele_Sig[ i ] = 99999;
-        if ( UART0_Tele_Sig[ i ] < -99999 )
-            UART0_Tele_Sig[ i ] = -99999;
+        if ( gTX0_signal[ i ] > 99999 )
+            gTX0_signal[ i ] = 99999;
+        if ( gTX0_signal[ i ] < -99999 )
+            gTX0_signal[ i ] = -99999;
            
         // negative sign assigment
-        if ( UART0_Tele_Sig[ i ] < 0  )
+        if ( gTX0_signal[ i ] < 0  )
         {
             // negative number will be inverted to positive
-            UART0_Tele_Sig[ i ] = -1 * UART0_Tele_Sig[ i ];
+            gTX0_signal[ i ] = -1 * gTX0_signal[ i ];
             // write '-' symbol to signalize negative number
-            gUART0_message[ j++ ] = '-';
+            gTX0_buffer[ j++ ] = '-';
         }
        
         // ten thousands, thousands, hundreds, tens, ones variables are cleared for cycle run
@@ -1496,41 +1523,41 @@ uint16_t UART0_Send_Tele( uint8_t argCount )
        
         // calculate a cipher for each decimal order
         // ten thousands
-        if ( UART0_Tele_Sig[ i ] >= 10000 )
-            A = UART0_Tele_Sig[ i ] / 10000;
+        if ( gTX0_signal[ i ] >= 10000 )
+            A = gTX0_signal[ i ] / 10000;
         // thousands
-        if ( UART0_Tele_Sig[ i ] >= 1000 )    
-            B = ( UART0_Tele_Sig[ i ] - A * 10000 ) / 1000;
+        if ( gTX0_signal[ i ] >= 1000 )    
+            B = ( gTX0_signal[ i ] - A * 10000 ) / 1000;
         // hundreds
-        if ( UART0_Tele_Sig[ i ] >= 100 )    
-            C = ( UART0_Tele_Sig[ i ] - A * 10000 - B * 1000 ) / 100;
+        if ( gTX0_signal[ i ] >= 100 )    
+            C = ( gTX0_signal[ i ] - A * 10000 - B * 1000 ) / 100;
         // tens
-        if ( UART0_Tele_Sig[ i ] >= 10 )        
-            D = ( UART0_Tele_Sig[ i ] - A * 10000 - B * 1000 - C * 100 ) / 10;
+        if ( gTX0_signal[ i ] >= 10 )        
+            D = ( gTX0_signal[ i ] - A * 10000 - B * 1000 - C * 100 ) / 10;
         // ones
-        E = ( UART0_Tele_Sig[ i ] - A * 10000 - B * 1000 - C * 100 - D * 10 ) % 10;
+        E = ( gTX0_signal[ i ] - A * 10000 - B * 1000 - C * 100 - D * 10 ) % 10;
        
         // string creation, leading zeros are inhibited, base is '0'
         if ( A > 0 )
-            gUART0_message[ j++ ] = '0' + A;
+            gTX0_buffer[ j++ ] = '0' + A;
         if ( ( A > 0 ) || ( B > 0 ) )
-            gUART0_message[ j++ ] = '0' + B;
+            gTX0_buffer[ j++ ] = '0' + B;
         if ( ( A > 0 ) || ( B > 0 ) || ( C > 0 ) )
-            gUART0_message[ j++ ] = '0' + C;
+            gTX0_buffer[ j++ ] = '0' + C;
         if ( ( A > 0 ) || ( B > 0 ) || ( C > 0 ) || ( D > 0 ) )
-            gUART0_message[ j++ ] = '0' + D;
+            gTX0_buffer[ j++ ] = '0' + D;
         // ones will be always writte becase of 0
-        gUART0_message[ j++ ] = '0' + E;
+        gTX0_buffer[ j++ ] = '0' + E;
         // comma separated data
         if ( i < argCount - 1 )
-            gUART0_message[ j++ ] = ',';
+            gTX0_buffer[ j++ ] = ',';
         else
             // last character as requested by Processing Grapher
             // https://wired.chillibasket.com/processing-grapher/
-            gUART0_message[ j++ ] = '\n';
+            gTX0_buffer[ j++ ] = '\n';
     }
    
-    gUART0_MessageLength = j;
+    gTX0_size = j;
     DL_UART_Main_enableInterrupt( UART_0_INST, DL_UART_MAIN_INTERRUPT_TX );
    
     return j;
@@ -1540,9 +1567,9 @@ uint16_t UART0_Send_Tele( uint8_t argCount )
 void UART0_Update( void )
 {
     // ----- COMMAND RECEIVED CHECK -----
-    if ( gFlg_UART0_terminator_detected ) {
+    if ( gRX0_flg_eol ) {
             
-        gFlg_UART0_terminator_detected = false;
+        gRX0_flg_eol = false;
 
         // checkForGainCommand();   
         UART0_Update_Cmd();
@@ -1565,10 +1592,10 @@ STORE_TIMER6( 6 );
             case ROBO_STATE_BALA:      
                 // UART0_Tele_Sig[ 0 ] =duration_us.adc_m0;    // motor 0 (right) current duration
                 // UART0_Tele_Sig[ 1 ] =duration_us.adc_m1;    // motor 1 (left) current duration
-                UART0_Tele_Sig[ 0 ] = 1000.0f * robot.motor.left.curr_med5_A;
-                UART0_Tele_Sig[ 1 ] = 1000.0f * robot.motor.left.curr_ema_A;
-                UART0_Tele_Sig[ 2 ] = 1000.0f * robot.motor.right.curr_med5_A;
-                UART0_Tele_Sig[ 3 ] = 1000.0f * robot.motor.right.curr_ema_A;
+                gTX0_signal[ 0 ] = 1000.0f * robot.motor.left.curr_med5_A;
+                gTX0_signal[ 1 ] = 1000.0f * robot.motor.left.curr_ema_A;
+                gTX0_signal[ 2 ] = 1000.0f * robot.motor.right.curr_med5_A;
+                gTX0_signal[ 3 ] = 1000.0f * robot.motor.right.curr_ema_A;
                 UART0_Send_Tele( 4U );              
                 // UART0_Tele_Sig[ 4 ] = duration_us.csfr;    // CSFR duration
                 
@@ -1611,7 +1638,7 @@ STORE_TIMER6( 6 );
                 // UART0_signals[ 26 ] = 0.0f;                             // empty - for further use
                 // UART0_signals[ 27 ] = 0.0f;                             // empty - for further use
 
-                // Send_integers_over_UART ( SIGNAL_CNT );
+                // Send_integers_over_UART ( TX0_SIG_CNT );
 
                 // UART0_signals[  9 ] = 1.0f * gM1_LH_Curr_mA;
                 break;
@@ -1621,12 +1648,12 @@ STORE_TIMER6( 6 );
 
             // ----- IDENTIFICATION ------
             case ROBO_STATE_IDENT:
-                UART0_Tele_Sig[ 0 ] = gCnt_Sample++;
-                UART0_Tele_Sig[ 1 ] = robot.control.CMterm_V;
-                UART0_Tele_Sig[ 2 ] = robot.motor.left.imp;
-                UART0_Tele_Sig[ 3 ] = robot.motor.right.imp;
-                UART0_Tele_Sig[ 4 ] = 1000.0f * robot.motor.left.curr_ema_A;
-                UART0_Tele_Sig[ 5 ] = 1000.0f * robot.motor.right.curr_ema_A;
+                gTX0_signal[ 0 ] = gCnt_Sample++;
+                gTX0_signal[ 1 ] = robot.control.CMterm_V;
+                gTX0_signal[ 2 ] = robot.motor.left.imp;
+                gTX0_signal[ 3 ] = robot.motor.right.imp;
+                gTX0_signal[ 4 ] = 1000.0f * robot.motor.left.curr_ema_A;
+                gTX0_signal[ 5 ] = 1000.0f * robot.motor.right.curr_ema_A;
                 UART0_Send_Tele ( 6U );
                 break;
             // ----- ERROR ------
@@ -1640,260 +1667,261 @@ duration_us.uart_comms = dt[6];
 
 bool UART0_Update_Gain( void )
 {
-    char gainType = gUART0_RXbuffer[0];
+    // char gainType = gRX0_buffer[0];
 
-    // Check if it matches [P|I|D|C|N|G]GAIN=
-    if ( (gainType == 'P' || gainType == 'I' || gainType == 'D' || gainType == 'C' || gainType == 'N' || gainType == 'G' || gainType == 'A' || gainType == 'Z') &&
-        gUART0_RXbuffer[1] == 'G' &&
-        gUART0_RXbuffer[2] == 'A' &&
-        gUART0_RXbuffer[3] == 'I' &&
-        gUART0_RXbuffer[4] == 'N' &&
-        gUART0_RXbuffer[5] == '=' )
-    {
-        // Look for '\n' terminator
-        for ( uint8_t i = 6; i < UART0_RX_BUFFER_SIZE; ++i )
-        {
-            if ( gUART0_RXbuffer[i] == '\n' )
-            {
-                // Extract value substring
-                char valueStr[8] = {0};
-                uint8_t len = i - 6;
-                if ( len > 0 && len < sizeof( valueStr ) )
-                {
-                    for ( uint8_t j = 0; j < len; ++j )
-                    {
-                        valueStr[j] = gUART0_RXbuffer[6 + j];
-                    }
+    // // Check if it matches [P|I|D|C|N|G]GAIN=
+    // if ( (gainType == 'P' || gainType == 'I' || gainType == 'D' || gainType == 'C' || gainType == 'N' || gainType == 'G' || gainType == 'A' || gainType == 'Z') &&
+    //     gRX0_buffer[1] == 'G' &&
+    //     gRX0_buffer[2] == 'A' &&
+    //     gRX0_buffer[3] == 'I' &&
+    //     gRX0_buffer[4] == 'N' &&
+    //     gRX0_buffer[5] == '=' )
+    // {
+    //     // Look for '\n' terminator
+    //     for ( uint8_t i = 6; i < RX0_BUFF_SIZE; ++i )
+    //     {
+    //         if ( gRX0_buffer[i] == '\n' )
+    //         {
+    //             // Extract value substring
+    //             char valueStr[8] = {0};
+    //             uint8_t len = i - 6;
+    //             if ( len > 0 && len < sizeof( valueStr ) )
+    //             {
+    //                 for ( uint8_t j = 0; j < len; ++j )
+    //                 {
+    //                     valueStr[j] = gRX0_buffer[6 + j];
+    //                 }
 
-                    int16_t value = atoi( valueStr );
+    //                 int16_t value = atoi( valueStr );
 
-                    // Assign to correct variable
-                    switch ( gainType )
-                    {
-                        case 'P': 
-                            P_Gain_received = value;
-                            if ( 100 >= P_Gain_received && P_Gain_received >= 0 ) { // P shall be small and positive
-                                // P_0_gain = (float)P_Gain_received / 100.0f;
-                            }
-                            break;
-                        case 'I': 
-                            I_Gain_received = value;
-                            if ( 100 >= I_Gain_received && I_Gain_received >= 0 ) { // I shall be small and positive
-                                // I_0_gain = (float)I_Gain_received / 10000.0f;
-                            }
-                            break;
-                        case 'D':
-                            D_Gain_received = value;
-                            if ( 100 >= D_Gain_received && D_Gain_received >= -100  ) { // D shall be small
-                                // D_0_gain = (float)D_Gain_received / 100.0f;
-                            }
-                            break;
-                        case 'C':
-                            C_Gain_received = value;
-                            if ( 10000 >= C_Gain_received && C_Gain_received >= 0 ) {   // C could be large and positive
-                                // C_gain_LH_RH = (float)C_Gain_received / 100.0f;
-                            }
-                            break;
-                        case 'N':
-                            N_Gain_received = value;
-                            if ( 2000 >= N_Gain_received && N_Gain_received >= 0 ) {    // N could be large and positive
-                                // N_0_coef = (float)N_Gain_received / 100.0f;
-                            }
-                            break;
-                        case 'G':
-                            G_Gain_received = value;
-                            if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-                                // gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
-                            }
-                            break;    
-                        case 'A':
-                            A_Filt_received = value;
-                            if ( 100 >= A_Filt_received && A_Filt_received >= 0 ) {    // A shall be 0-100 (0-1.0)
-                                // gALPHA_CF_Coef = (float)A_Filt_received / 100.0f;
-                            }
-                            break;
-                        case 'Z':
-                            Z_Filt_received = value;
-                            if ( 100 >= Z_Filt_received && Z_Filt_received >= 0 ) {    // Z shall be 0-100 (0-1.0)
-                                // gCURR_EMA_Coef = (float)Z_Filt_received / 100.0f;
-                            }
-                            break; 
-                        default: return false;
-                    }
-                    return true;
-                }
-            }
-        }
-    } 
+    //                 // Assign to correct variable
+    //                 switch ( gainType )
+    //                 {
+    //                     case 'P': 
+    //                         // P_Gain_received = value;
+    //                         // if ( 100 >= P_Gain_received && P_Gain_received >= 0 ) { // P shall be small and positive
+    //                             // P_0_gain = (float)P_Gain_received / 100.0f;
+    //                         // }
+    //                         break;
+    //                     case 'I': 
+    //                         // I_Gain_received = value;
+    //                         // if ( 100 >= I_Gain_received && I_Gain_received >= 0 ) { // I shall be small and positive
+    //                             // I_0_gain = (float)I_Gain_received / 10000.0f;
+    //                         // }
+    //                         break;
+    //                     case 'D':
+    //                         // D_Gain_received = value;
+    //                         // if ( 100 >= D_Gain_received && D_Gain_received >= -100  ) { // D shall be small
+    //                             // D_0_gain = (float)D_Gain_received / 100.0f;
+    //                         // }
+    //                         break;
+    //                     case 'C':
+    //                         // C_Gain_received = value;
+    //                         // if ( 10000 >= C_Gain_received && C_Gain_received >= 0 ) {   // C could be large and positive
+    //                             // C_gain_LH_RH = (float)C_Gain_received / 100.0f;
+    //                         // }
+    //                         break;
+    //                     case 'N':
+    //                         // N_Gain_received = value;
+    //                         // if ( 2000 >= N_Gain_received && N_Gain_received >= 0 ) {    // N could be large and positive
+    //                             // N_0_coef = (float)N_Gain_received / 100.0f;
+    //                         // }
+    //                         break;
+    //                     case 'G':
+    //                         // G_Gain_received = value;
+    //                         // if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
+    //                             // gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
+    //                         // }
+    //                         break;    
+    //                     case 'A':
+    //                         // A_Filt_received = value;
+    //                         // if ( 100 >= A_Filt_received && A_Filt_received >= 0 ) {    // A shall be 0-100 (0-1.0)
+    //                             // gALPHA_CF_Coef = (float)A_Filt_received / 100.0f;
+    //                         // }
+    //                         break;
+    //                     case 'Z':
+    //                         // Z_Filt_received = value;
+    //                         // if ( 100 >= Z_Filt_received && Z_Filt_received >= 0 ) {    // Z shall be 0-100 (0-1.0)
+    //                             // gCURR_EMA_Coef = (float)Z_Filt_received / 100.0f;
+    //                         // }
+    //                         break; 
+    //                     default: return false;
+    //                 }
+    //                 return true;
+    //             }
+    //         }
+    //     }
+    // } 
     return false;
 }
 
 bool UART0_Update_Cmd( void )
 {
-    char typeChar = gUART0_RXbuffer[0];
+    // char typeChar = gRX0_buffer[0];
 
-    // -------- Branch 0: IDENT --------
-    if (gUART0_RXbuffer[0]=='i' && gUART0_RXbuffer[1]=='d' &&
-        gUART0_RXbuffer[2]=='e' && gUART0_RXbuffer[3]=='n' &&
-        gUART0_RXbuffer[4]=='t')
-    {
-        gRobot_State = ROBO_STATE_IDENT;
-    }
+    // // -------- Branch 0: IDENT --------
+    // if (gRX0_buffer[0]=='i' && gRX0_buffer[1]=='d' &&
+    //     gRX0_buffer[2]=='e' && gRX0_buffer[3]=='n' &&
+    //     gRX0_buffer[4]=='t')
+    // {
+    //     gRobot_State = ROBO_STATE_IDENT;
+    // }
 
-    // -------- Branch 1: xGAIN= --------
-    if (gUART0_RXbuffer[1]=='G' && gUART0_RXbuffer[2]=='A' &&
-        gUART0_RXbuffer[3]=='I' && gUART0_RXbuffer[4]=='N' &&
-        gUART0_RXbuffer[5]=='=')
-    {
-        // find terminator
-        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
-        {
-            if (gUART0_RXbuffer[i]=='\n')
-            {
-                char valueStr[8] = {0};
-                uint8_t len = i-6;
-                if (len>0 && len<sizeof(valueStr))
-                {
-                    for (uint8_t j=0; j<len; j++)
-                        valueStr[j] = gUART0_RXbuffer[6+j];
+    // // -------- Branch 1: xGAIN= --------
+    // if (gRX0_buffer[1]=='G' && gRX0_buffer[2]=='A' &&
+    //     gRX0_buffer[3]=='I' && gRX0_buffer[4]=='N' &&
+    //     gRX0_buffer[5]=='=')
+    // {
+    //     // find terminator
+    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
+    //     {
+    //         if (gRX0_buffer[i]=='\n')
+    //         {
+    //             char valueStr[8] = {0};
+    //             uint8_t len = i-6;
+    //             if (len>0 && len<sizeof(valueStr))
+    //             {
+    //                 for (uint8_t j=0; j<len; j++)
+    //                     valueStr[j] = gRX0_buffer[6+j];
 
-                    int16_t value = atoi(valueStr);
+    //                 int16_t value = atoi(valueStr);
 
-                    switch(typeChar)
-                    {
-                        case 'P': P_Gain_received=value;
-                                  if(value>=0 && value<=100)
-                                    //   P_0_gain=(float)value/100.0f;
-                                  break;
-                        case 'I': I_Gain_received=value;
-                                  if(value>=0 && value<=100)
-                                    //   I_0_gain=(float)value/10000.0f;
-                                  break;
-                        case 'D': D_Gain_received=value;
-                                  if(value>=-100 && value<=100)
-                                    //   D_0_gain=(float)value/100.0f;
-                                  break;
-                        case 'C': C_Gain_received=value;
-                                  if(value>=0 && value<=10000)
-                                    //   C_gain_LH_RH=(float)value/100.0f;
-                                  break;
-                        case 'N': N_Gain_received=value;
-                                  if(value>=0 && value<=2000)
-                                    //   N_0_coef=(float)value/100.0f;
-                                  break;
-                        case 'G': G_Gain_received=value;
-                                  if(value>=0 && value<=2000)
-                                    //   gK1_DynamicDamp=(float)value/100.0f;
-                                  break;
-                        case 'A': A_Filt_received=value;
-                                  if(value>=0 && value<=100)
-                                    //   gALPHA_CF_Coef=(float)value/100.0f;
-                                  break;
-                        case 'Z': Z_Filt_received=value;
-                                  if(value>=0 && value<=100)
-                                      gCURR_EMA_Coef=(float)value/100.0f;
-                                  break;
-                        default: return false;
-                    }
-                    return true;
-                }
-            }
-        }
-    }
+    //                 switch(typeChar)
+    //                 {
+    //                     case 'P': P_Gain_received=value;
+    //                             //   if(value>=0 && value<=100)
+    //                                 //   P_0_gain=(float)value/100.0f;
+    //                               break;
+    //                     case 'I': I_Gain_received=value;
+    //                               if(value>=0 && value<=100)
+    //                                 //   I_0_gain=(float)value/10000.0f;
+    //                               break;
+    //                     case 'D': D_Gain_received=value;
+    //                               if(value>=-100 && value<=100)
+    //                                 //   D_0_gain=(float)value/100.0f;
+    //                               break;
+    //                     case 'C': C_Gain_received=value;
+    //                               if(value>=0 && value<=10000)
+    //                                 //   C_gain_LH_RH=(float)value/100.0f;
+    //                               break;
+    //                     case 'N': N_Gain_received=value;
+    //                               if(value>=0 && value<=2000)
+    //                                 //   N_0_coef=(float)value/100.0f;
+    //                               break;
+    //                     case 'G': G_Gain_received=value;
+    //                               if(value>=0 && value<=2000)
+    //                                 //   gK1_DynamicDamp=(float)value/100.0f;
+    //                               break;
+    //                     case 'A': A_Filt_received=value;
+    //                               if(value>=0 && value<=100)
+    //                                 //   gALPHA_CF_Coef=(float)value/100.0f;
+    //                               break;
+    //                     case 'Z': 
+    //                             // Z_Filt_received=value;
+    //                             //   if(value>=0 && value<=100)
+    //                             //   gCURR_EMA_Coef=(float)value/100.0f;
+    //                               break;
+    //                     default: return false;
+    //                 }
+    //                 return true;
+    //             }
+    //         }
+    //     }
+    // }
 
-    // -------- Branch 2: yPARA= --------
-    if (gUART0_RXbuffer[1]=='P' && gUART0_RXbuffer[2]=='A' &&
-        gUART0_RXbuffer[3]=='R' && gUART0_RXbuffer[4]=='A' &&
-        gUART0_RXbuffer[5]=='=')
-    {
-        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
-        {
-            if (gUART0_RXbuffer[i]=='\n')
-            {
-                char valueStr[8]={0};
-                uint8_t len=i-6;
-                if(len>0 && len<sizeof(valueStr))
-                {
-                    for(uint8_t j=0;j<len;j++)
-                        valueStr[j]=gUART0_RXbuffer[6+j];
-                    int16_t value=atoi(valueStr);
+    // // -------- Branch 2: yPARA= --------
+    // if (gRX0_buffer[1]=='P' && gRX0_buffer[2]=='A' &&
+    //     gRX0_buffer[3]=='R' && gRX0_buffer[4]=='A' &&
+    //     gRX0_buffer[5]=='=')
+    // {
+    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
+    //     {
+    //         if (gRX0_buffer[i]=='\n')
+    //         {
+    //             char valueStr[8]={0};
+    //             uint8_t len=i-6;
+    //             if(len>0 && len<sizeof(valueStr))
+    //             {
+    //                 for(uint8_t j=0;j<len;j++)
+    //                     valueStr[j]=gRX0_buffer[6+j];
+    //                 int16_t value=atoi(valueStr);
 
-                    // Example: assign to parameter variable
-                    switch(typeChar)
-                    {
-                        // case 'K': Kpara_received=value;
-                        //           Kpara_flag=(value!=0);
-                        //           break;
-                        // add other PARA parameters here
-                        default: return false;
-                    }
-                    return true;
-                }
-            }
-        }
-    }
+    //                 // Example: assign to parameter variable
+    //                 switch(typeChar)
+    //                 {
+    //                     // case 'K': Kpara_received=value;
+    //                     //           Kpara_flag=(value!=0);
+    //                     //           break;
+    //                     // add other PARA parameters here
+    //                     default: return false;
+    //                 }
+    //                 return true;
+    //             }
+    //         }
+    //     }
+    // }
 
-    // -------- Branch 3: zOFFS= --------
-    if (gUART0_RXbuffer[1]=='O' && gUART0_RXbuffer[2]=='F' &&
-        gUART0_RXbuffer[3]=='F' && gUART0_RXbuffer[4]=='S' &&
-        gUART0_RXbuffer[5]=='=')
-    {
-        for (uint8_t i=6; i<UART0_RX_BUFFER_SIZE; i++)
-        {
-            if (gUART0_RXbuffer[i]=='\n')
-            {
-                char valueStr[8]={0};
-                uint8_t len=i-6;
-                if(len>0 && len<sizeof(valueStr))
-                {
-                    for(uint8_t j=0;j<len;j++)
-                        valueStr[j]=gUART0_RXbuffer[6+j];
-                    int16_t value=atoi(valueStr);
+    // // -------- Branch 3: zOFFS= --------
+    // if (gRX0_buffer[1]=='O' && gRX0_buffer[2]=='F' &&
+    //     gRX0_buffer[3]=='F' && gRX0_buffer[4]=='S' &&
+    //     gRX0_buffer[5]=='=')
+    // {
+    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
+    //     {
+    //         if (gRX0_buffer[i]=='\n')
+    //         {
+    //             char valueStr[8]={0};
+    //             uint8_t len=i-6;
+    //             if(len>0 && len<sizeof(valueStr))
+    //             {
+    //                 for(uint8_t j=0;j<len;j++)
+    //                     valueStr[j]=gRX0_buffer[6+j];
+    //                 int16_t value=atoi(valueStr);
 
-                    // Example: assign to offset variable
-                    switch( typeChar )
-                    {
-                        // case 'X': X_offset=value; break;
-                        case 'Y':
-                            Y_Offs_received = value;
-                            if( 1 == value || value == -1 )
-                                // PID_0_angle_ref += value;
-                            // else if ( value == 0 )
-                                // PID_0_angle_ref = ANGLE_UPRIGHT_DEG;
-                        break;
-                        // case 'Z': Z_offset=value; break;
-                        // add other OFFS parameters here
-                        default: return false;
-                    }
-                    return true;
-                }
-            }
-        }
-    }
+    //                 // Example: assign to offset variable
+    //                 switch( typeChar )
+    //                 {
+    //                     // case 'X': X_offset=value; break;
+    //                     case 'Y':
+    //                         Y_Offs_received = value;
+    //                         if( 1 == value || value == -1 )
+    //                             // PID_0_angle_ref += value;
+    //                         // else if ( value == 0 )
+    //                             // PID_0_angle_ref = ANGLE_UPRIGHT_DEG;
+    //                     break;
+    //                     // case 'Z': Z_offset=value; break;
+    //                     // add other OFFS parameters here
+    //                     default: return false;
+    //                 }
+    //                 return true;
+    //             }
+    //         }
+    //     }
+    // }
 
     return false;
 }
 
 void UART0_ClearBuff( void )
 {
-    for ( int i = 0; i < UART0_RX_BUFFER_SIZE; ++i )
+    for ( int i = 0; i < RX0_BUFF_SIZE; ++i )
     {
-        gUART0_RXbuffer[i] = 0x00;
+        gRX0_buffer[i] = 0x00;
     }
-    gUART0_RXbytes = 0;
+    gRX0_idx = 0;
 }
 
 void CRSF_Update( void )
 {
-    if (!gUART1_frame_ready) return;
-    gUART1_frame_ready = false;
+    if (!gCRSF_RX_flg_eol) return;
+    gCRSF_RX_flg_eol = false;
 
 GET_DURATION( 9 );
-duration_us.csfr = dt[9];  
+duration_us.crsf = dt[9];  
 STORE_TIMER6( 9 );
 
     // 1. SNAPSHOT: Extract and Parse into local/intermediate buffers
-    if (CRSF_Extract_Data() && robot.rc_cmd.is_connected)
+    if (CRSF_RX_Extract_16ch_payload() && robot.rc_cmd.is_connected)
     {
         CRSF_Parse_Data();
 
@@ -1957,11 +1985,11 @@ STORE_TIMER6( 9 );
 
         // Apply boosted gains - PID
         if ( gController_Type == CONTROLLER_TYPE_PID ) {
-            // robot.gain.KP = KP_GAIN_DEF * loc_latch_L * loc_state3_L;
-            // robot.gain.KD = KD_GAIN_DEF * loc_latch_R * loc_state3_R;
-            robot.gain.KP = KP_GAIN_DEF     * loc_state3_L;
-            robot.gain.KD = KD_GAIN_DEF     * loc_state3_R;
-            robot.gain.FF = FF_GAIN_DEF     * loc_throttle;
+            // robot.gain.KP = PID_KP_GAIN_DEF * loc_latch_L * loc_state3_L;
+            // robot.gain.KD = PID_KD_GAIN_DEF * loc_latch_R * loc_state3_R;
+            robot.gain.KP = PID_KP_GAIN_DEF     * loc_state3_L;
+            robot.gain.KD = PID_KD_GAIN_DEF     * loc_state3_R;
+            robot.gain.FF = PID_FF_GAIN_DEF     * loc_throttle;
         }
         // Apply boosted gains - SMC
         else if ( gController_Type == CONTROLLER_TYPE_SMC ) {
@@ -1989,41 +2017,42 @@ uint8_t CRSF_Get_CRC8( uint8_t argTypeID, volatile uint8_t *argData, uint8_t arg
     return crc;
 }    
 
-// Function to extract data following the header
-bool CRSF_Extract_Data( void ) 
+// Function to extract payload and CRC from PACKET -> following the header
+bool CRSF_RX_Extract_16ch_payload( void ) 
 {
-    // Define header sequence - Sync Byte (Flight Controller), Bytes count, 16 RC channels
-    // 0xC8 - Flight Controller
-    // 0x18 - Payload Length = Frame ID (1B) + Data (22B) + CRC byte (1B) = 24B -> 0x18
-    // 0x16 - Frame ID - RC channels
+    // Define header sequence:
+    // 0xC8 - SYNC BYTE
+    // 0x18 - LENGTH (FRAME_TYPE+PAYLOAD+CRC8 => 1B+22B+1B=24B -> 0x18)
+    // 0x16 - FRAME TYPE (RC channels)
+    
     uint8_t header[ CRSF_MSG_HEAD_SIZE ] = { 0xC8 , 0x18 , 0x16 };
-    // uint8_t header[ CRSF_MSG_HEAD_SIZE ] = { CRSF_SYNC_BYTE , 0x18 , CRSF_FRAME_ID_16_CHAN };
+    uint8_t crc_calculated = 0;
 
     // Search for header in the buffer
-    for ( int i = 0 ; i < UART1_RX_BUFFER_SIZE ; i++ )
+    for ( int i = 0 ; i < RX1_BUFF_SIZE ; i++ )
     {
         // Check for header match
-        if (    gUART1_RXbuffer[ i ]                                == header[ 0 ] &&
-                gUART1_RXbuffer[ ( i + 1 ) % UART1_RX_BUFFER_SIZE ] == header[ 1 ] &&
-                gUART1_RXbuffer[ ( i + 2 ) % UART1_RX_BUFFER_SIZE ] == header[ 2 ] )
+        if (    gRX1_buffer[ i ]                         == header[ 0 ] &&
+                gRX1_buffer[ ( i + 1 ) % RX1_BUFF_SIZE ] == header[ 1 ] &&
+                gRX1_buffer[ ( i + 2 ) % RX1_BUFF_SIZE ] == header[ 2 ] )
         {
             gCSFR_Header_match_cnt++;
             // run Fail Safe Timer
             gCnt_Fail_Safe = TIME_FAIL_SAFE_MS;
             robot.rc_cmd.is_connected = true;
-            // Extract the 22 bytes following the header
-            for ( int j = 0 ; j < CRSF_MSG_DATA_SIZE + CRSF_MSG_CRC_SIZE ; j++ )
+            // Extract the 22 bytes of 16ch payload + CRC following the header
+            for ( int j = 0 ; j < CRSF_MSG_16CH_SIZE + CRSF_MSG_CRC_SIZE ; j++ )
             {
-                gCSFR_Data_RX[ j ] = gUART1_RXbuffer[ ( i + CRSF_MSG_HEAD_SIZE + j ) % UART1_RX_BUFFER_SIZE ];
+                gCSFR_RX_DataCRC[ j ] = gRX1_buffer[ ( i + CRSF_MSG_HEAD_SIZE + j ) % RX1_BUFF_SIZE ];
             }
             // clear UART buffer
-            for ( int k = 0 ; k < UART1_RX_BUFFER_SIZE ; k++ )
-                gUART1_RXbuffer[ k ] = 0x00;
+            for ( int k = 0 ; k < RX1_BUFF_SIZE ; k++ )
+                gRX1_buffer[ k ] = 0x00;
 
-            gCSFR_CRC_Calculated = CRSF_Get_CRC8( CRSF_FRAME_ID_16_CHAN, &gCSFR_Data_RX[0], CRSF_MSG_DATA_SIZE );
+            crc_calculated = CRSF_Get_CRC8( CRSF_FRAME_ID_16_CHAN, &gCSFR_RX_DataCRC[0], CRSF_MSG_16CH_SIZE );
             // gCSFR_CRC_Calculated = CSFR_Get_CRC8();
 
-            if ( gCSFR_CRC_Calculated == gCSFR_Data_RX[ 22 ] )   // CRC match?
+            if ( crc_calculated == gCSFR_RX_DataCRC[ 22 ] )   // CRC match?
             {
                 gCSFR_CRC_match_cnt++;
                 return true; // Data extraction successful and CRC is OK
@@ -2052,72 +2081,80 @@ uint16_t CRSF_Reverse11( uint16_t arg_data_for_rev )
 
 void CRSF_Parse_Data( void )
 {
-    uint8_t reversed = 0;
+    uint8_t reversed_byte = 0;
+    uint8_t reversed_array[ CRSF_MSG_16CH_SIZE ];
     
     // reverse bits in each byte
-    for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
+    for ( uint8_t i = 0 ; i < CRSF_MSG_16CH_SIZE ; i++ )
     {
-        reversed = 0;
+        reversed_byte = 0;
         
         for ( uint8_t j = 0 ; j < 8 ; j++ )
         {
-            if ( ( gCSFR_Data_RX[ i ] >> j ) & 0x01 )
-                reversed |= 1 << ( 7 - j );
+            if ( ( gCSFR_RX_DataCRC[ i ] >> j ) & 0x01 )
+                reversed_byte |= 1 << ( 7 - j );
         }
-        gCSFR_Data_Reversed[ i ] = reversed;
+        reversed_array[ i ] = reversed_byte;
         
     }
     
-    RC_channels[ 0 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  0 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[  1 ] >> 5 ) );
-    RC_channels[ 1 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  1 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[  2 ] >> 2 ) );
-    RC_channels[ 2 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  2 ] & 0x3F ) << 9 ) | ( gCSFR_Data_Reversed[  3 ] << 1 ) | ( gCSFR_Data_Reversed[ 4 ] >> 7 ) );
-    RC_channels[ 3 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  4 ] & 0x7F ) << 4 ) | ( gCSFR_Data_Reversed[  5 ] >> 4 ) );
+    robot.rc_cmd.ch[ 0 ] = CRSF_Reverse11( ( ( reversed_array[  0 ] & 0xFF ) << 3 ) | ( reversed_array[  1 ] >> 5 ) );
+    robot.rc_cmd.ch[ 1 ] = CRSF_Reverse11( ( ( reversed_array[  1 ] & 0x1F ) << 6 ) | ( reversed_array[  2 ] >> 2 ) );
+    robot.rc_cmd.ch[ 2 ] = CRSF_Reverse11( ( ( reversed_array[  2 ] & 0x3F ) << 9 ) | ( reversed_array[  3 ] << 1 ) | ( reversed_array[ 4 ] >> 7 ) );
+    robot.rc_cmd.ch[ 3 ] = CRSF_Reverse11( ( ( reversed_array[  4 ] & 0x7F ) << 4 ) | ( reversed_array[  5 ] >> 4 ) );
     
-    RC_channels[ 4 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  5 ] & 0x0F ) << 7 ) | ( gCSFR_Data_Reversed[  6 ] >> 1 ) );
-    RC_channels[ 5 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  6 ] & 0x01 ) << 10 )| ( gCSFR_Data_Reversed[  7 ] << 2 ) | ( gCSFR_Data_Reversed[ 8 ] >> 6 ) );
-    RC_channels[ 6 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  8 ] & 0x3F ) << 5 ) | ( gCSFR_Data_Reversed[  9 ] >> 3 ) );
-    RC_channels[ 7 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[  9 ] & 0x07 ) << 8 ) | ( gCSFR_Data_Reversed[ 10 ] >> 0 ) );
+    robot.rc_cmd.ch[ 4 ] = CRSF_Reverse11( ( ( reversed_array[  5 ] & 0x0F ) << 7 ) | ( reversed_array[  6 ] >> 1 ) );
+    robot.rc_cmd.ch[ 5 ] = CRSF_Reverse11( ( ( reversed_array[  6 ] & 0x01 ) << 10 )| ( reversed_array[  7 ] << 2 ) | ( reversed_array[ 8 ] >> 6 ) );
+    robot.rc_cmd.ch[ 6 ] = CRSF_Reverse11( ( ( reversed_array[  8 ] & 0x3F ) << 5 ) | ( reversed_array[  9 ] >> 3 ) );
+    robot.rc_cmd.ch[ 7 ] = CRSF_Reverse11( ( ( reversed_array[  9 ] & 0x07 ) << 8 ) | ( reversed_array[ 10 ] >> 0 ) );
 
-    RC_channels[ 8 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[ 11 ] & 0xFF ) << 3 ) | ( gCSFR_Data_Reversed[ 12 ] >> 5 ) );
-    RC_channels[ 9 ] = CRSF_Reverse11( ( ( gCSFR_Data_Reversed[ 12 ] & 0x1F ) << 6 ) | ( gCSFR_Data_Reversed[ 13 ] >> 2 ) );
+    robot.rc_cmd.ch[ 8 ] = CRSF_Reverse11( ( ( reversed_array[ 11 ] & 0xFF ) << 3 ) | ( reversed_array[ 12 ] >> 5 ) );
+    robot.rc_cmd.ch[ 9 ] = CRSF_Reverse11( ( ( reversed_array[ 12 ] & 0x1F ) << 6 ) | ( reversed_array[ 13 ] >> 2 ) );
 
-    for ( uint8_t j = 0 ; j < 10 ; j++ )
-        robot.rc_cmd.ch[ j ] = RC_channels[ j ];
+    // gCRSF_RC_chann[ 0 ] = CRSF_Reverse11( ( ( reversed_array[  0 ] & 0xFF ) << 3 ) | ( reversed_array[  1 ] >> 5 ) );
+    // gCRSF_RC_chann[ 1 ] = CRSF_Reverse11( ( ( reversed_array[  1 ] & 0x1F ) << 6 ) | ( reversed_array[  2 ] >> 2 ) );
+    // gCRSF_RC_chann[ 2 ] = CRSF_Reverse11( ( ( reversed_array[  2 ] & 0x3F ) << 9 ) | ( reversed_array[  3 ] << 1 ) | ( reversed_array[ 4 ] >> 7 ) );
+    // gCRSF_RC_chann[ 3 ] = CRSF_Reverse11( ( ( reversed_array[  4 ] & 0x7F ) << 4 ) | ( reversed_array[  5 ] >> 4 ) );
+    
+    // gCRSF_RC_chann[ 4 ] = CRSF_Reverse11( ( ( reversed_array[  5 ] & 0x0F ) << 7 ) | ( reversed_array[  6 ] >> 1 ) );
+    // gCRSF_RC_chann[ 5 ] = CRSF_Reverse11( ( ( reversed_array[  6 ] & 0x01 ) << 10 )| ( reversed_array[  7 ] << 2 ) | ( reversed_array[ 8 ] >> 6 ) );
+    // gCRSF_RC_chann[ 6 ] = CRSF_Reverse11( ( ( reversed_array[  8 ] & 0x3F ) << 5 ) | ( reversed_array[  9 ] >> 3 ) );
+    // gCRSF_RC_chann[ 7 ] = CRSF_Reverse11( ( ( reversed_array[  9 ] & 0x07 ) << 8 ) | ( reversed_array[ 10 ] >> 0 ) );
+
+    // gCRSF_RC_chann[ 8 ] = CRSF_Reverse11( ( ( reversed_array[ 11 ] & 0xFF ) << 3 ) | ( reversed_array[ 12 ] >> 5 ) );
+    // gCRSF_RC_chann[ 9 ] = CRSF_Reverse11( ( ( reversed_array[ 12 ] & 0x1F ) << 6 ) | ( reversed_array[ 13 ] >> 2 ) );
+
+    // for ( uint8_t j = 0 ; j < 10 ; j++ )
+    //     robot.rc_cmd.ch[ j ] = gCRSF_RC_chann[ j ];
 }
 
-void CRSF_Send_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct)
+void CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct)
 {
-    // uint8_t packet[12];
-
-    // Přepočty na CRSF formát
+    // Recalculate battery voltage and current into CRSF format
     uint16_t v_dec = (uint16_t)(argBatt_V * 10.0f);   // 12.6V -> 126
     uint16_t i_dec = (uint16_t)(argBatt_A * 10.0f);   // 1.5A  -> 15
-    
-    gUART1_message[0] = CRSF_SYNC_BYTE;         // 0xC8
-    gUART1_message[1] = 0x0A;                   // Délka od TYPE po CRC (1 + 8 + 1)
-    gUART1_message[2] = CRSF_FRAME_ID_BATTERY;  // 0x08
+    // CRSF header assembly
+    gTX1_buffer[0] = CRSF_SYNC_BYTE;         // 0xC8
+    gTX1_buffer[1] = 0x0A;                   // Délka od TYPE po CRC (1 + 8 + 1)
+    gTX1_buffer[2] = CRSF_FRAME_ID_BATTERY;  // 0x08
 
-    // Big-Endian zápis hodnot:
+    // Big-Endian for values:
     // Voltage (uint16_t)
-    gUART1_message[3] = (v_dec >> 8) & 0xFF;
-    gUART1_message[4] = v_dec & 0xFF;
-
+    gTX1_buffer[3] = (v_dec >> 8) & 0xFF;
+    gTX1_buffer[4] = v_dec & 0xFF;
     // Current (uint16_t)
-    gUART1_message[5] = (i_dec >> 8) & 0xFF;
-    gUART1_message[6] = i_dec & 0xFF;
-
-    // Capacity mAh (uint24_t - 3 bajty)
-    gUART1_message[7] = (argCapacity_mAh >> 16) & 0xFF;
-    gUART1_message[8] = (argCapacity_mAh >> 8) & 0xFF;
-    gUART1_message[9] = argCapacity_mAh & 0xFF;
-
+    gTX1_buffer[5] = (i_dec >> 8) & 0xFF;
+    gTX1_buffer[6] = i_dec & 0xFF;
+    // Capacity used mAh (uint24_t - 3bytes)
+    gTX1_buffer[7] = (argCapacity_mAh >> 16) & 0xFF;
+    gTX1_buffer[8] = (argCapacity_mAh >> 8) & 0xFF;
+    gTX1_buffer[9] = argCapacity_mAh & 0xFF;
     // Remaining % (uint8_t)
-    gUART1_message[10] = argFuelGauge_pct;
+    gTX1_buffer[10] = argFuelGauge_pct;
+    // CRC8 calculated from FRAME TYPE and PAYLOAD
+    gTX1_buffer[11] = CRSF_Get_CRC8( CRSF_FRAME_ID_BATTERY, &gTX1_buffer[3], 8);
 
-    // CRC8 se počítá pouze z TYPE (bajt 2) až PAYLOAD (bajt 10) -> celkem 9 bajtů
-    gUART1_message[11] = CRSF_Get_CRC8( CRSF_FRAME_ID_BATTERY, &gUART1_message[3], 8);
-
-    gUART1_MessageLength = 12;
+    gTX1_size = 12;
     DL_UART_Main_enableInterrupt( UART_1_INST, DL_UART_MAIN_INTERRUPT_TX );
 }
 
@@ -2330,7 +2367,7 @@ uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA )
     // ANTIBLOCK - observation: stays at 1004U - CONTROLLER IDLE
     for ( I2C_Anti_Block = 1004U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_wr_ct[ 0 ] = I2C_Anti_Block;
+    i2c_wr_ct[ 0 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
     
@@ -2341,7 +2378,7 @@ uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA )
     // ANTIBLOCK - observation: stays at 1003U - STATUS TX COMPLETED
     for ( I2C_Anti_Block = 1003U ; ( gI2cControllerStatus==I2C_STATUS_TX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_wr_ct[ 1 ] = I2C_Anti_Block;
+    i2c_wr_ct[ 1 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2349,14 +2386,14 @@ uint16_t    MPU_Write_Reg( uint8_t argREG , uint8_t argDATA )
     // ANTIBLOCK - observation: stays 1002U - BUS NOT BUSY
     for ( I2C_Anti_Block = 1002U ; ( ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_wr_ct[ 2 ] = I2C_Anti_Block;
+    i2c_wr_ct[ 2 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     // ANTIBLOCK - observation: drop to ~666-674U - CONTROLLER IS BUSSY
     for ( I2C_Anti_Block = 1001U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_wr_ct[ 3 ] = I2C_Anti_Block;
+    i2c_wr_ct[ 3 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2387,7 +2424,7 @@ uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
     // ANTIBLOCK - observation: time-to-time drops to ~804U-810U - CONTROLLER IS BUSSY? - 2026-01-24 12:30
     for ( I2C_Anti_Block = 1009U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 0 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 0 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
   
@@ -2398,7 +2435,7 @@ uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
     // ANTIBLOCK - observation: stays at 1008U - STATUS TX COMPLETED
     for ( I2C_Anti_Block = 1008U ; ( gI2cControllerStatus==I2C_STATUS_TX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 1 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 1 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2406,28 +2443,28 @@ uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
     // ANTIBLOCK - observation: stays 1007U - BUS NOT BUSY
     for ( I2C_Anti_Block = 1007U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 2 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 2 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
     
     // ANTIBLOCK - observation: drops to ~768-784U - CONTROLLER IS BUSSY
     for ( I2C_Anti_Block = 1006U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 3 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 3 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     // ANTIBLOCK - count down to 1005U - I2C BUS NOT OCCUPIED - !!! 2024-01-24 09:40 ERRORS OCCOURS HERE - SOLVED - Condition wrongly Negated
     for ( I2C_Anti_Block = 1005U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 4 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 4 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
     
     // ANTIBLOCK - countdown to 1004U - CONTROLLER IDLE
     for ( I2C_Anti_Block = 1004U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 5 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 5 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2444,14 +2481,14 @@ uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
     // ANTIBLOCK - observation: stays at 1003U - I2C BUS NOT OCCUPIED
     for ( I2C_Anti_Block = 1003U ; ( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 6 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 6 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
     // ANTIBLOCK - observation: stays at 1002U - STATUS RX COMPLETED
     for ( I2C_Anti_Block = 1002U ; ( gI2cControllerStatus==I2C_STATUS_RX_COMPLETE ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 7 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 7 ] = I2C_Anti_Block;
 
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2460,7 +2497,7 @@ uint16_t    MPU_Read_Len( uint8_t argREG , uint8_t argDataLen )
     // ANTIBLOCK - countdown from 2001U to ~602U-606U for 14 bytes - CONTROLLER IDLE
     for ( I2C_Anti_Block = 2001U ; ( !( DL_I2C_getControllerStatus( I2C1_INST ) & DL_I2C_CONTROLLER_STATUS_IDLE ) ) && I2C_Anti_Block > 0 ; I2C_Anti_Block--)
 	    ;
-    ab_rl_ct[ 8 ] = I2C_Anti_Block;
+    i2c_rl_ct[ 8 ] = I2C_Anti_Block;
     
     if ( I2C_Anti_Block == 0 ) { I2C_Flag_Block++; }
 
@@ -2572,10 +2609,12 @@ void IMU_ProcessData(void)
 {
     if (!mpu.status.is_initialized) return;
 
-    if (gFlg_Read_MPU && (gCnt_MPU_Delay == 0))
+    // if (gFlg_Read_MPU && (gCnt_MPU_Delay == 0))
+    if ( (mpu.status.read_flg) && (mpu.status.delay_cnt_ms == 0U) )
     {
-        gFlg_Read_MPU = false; 
-        
+        // gFlg_Read_MPU = false; 
+        mpu.status.read_flg = false;
+
 STORE_TIMER6(1);
 
         // Read 15 bytes starting at 0x3A (INT_STATUS)
@@ -2839,8 +2878,10 @@ void    Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LS
 
     // 5. Exponential Moving Average (EMA)
     // We apply EMA on top of the Median to smooth out the remaining ripple
-    temp.curr_ema_A = (gCURR_EMA_Coef * medCurrent) + 
-                  ((1.0f - gCURR_EMA_Coef) * temp.curr_ema_A);
+    temp.curr_ema_A =   ( 0.01f * medCurrent ) + 
+                        ( 0.99f * temp.curr_ema_A );
+    // temp.curr_ema_A = (gCURR_EMA_Coef * medCurrent) + 
+    //               ((1.0f - gCURR_EMA_Coef) * temp.curr_ema_A);
 
     // 6. Commit
     *argMotor = temp;
@@ -2859,8 +2900,10 @@ void    Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB
 
     // 3. Process: Exponential Moving Average (EMA)
     // Smooths out voltage ripple during motor transients
-    temp.batt_volt_V = (gBATT_EMA_Coef * instBattVolt) + 
-                     ((1.0f - gBATT_EMA_Coef) * temp.batt_volt_V);
+    temp.batt_volt_V =  ( 0.01f * instBattVolt ) + 
+                        ( 0.99f* temp.batt_volt_V);
+    // temp.batt_volt_V = (gBATT_EMA_Coef * instBattVolt) + 
+    //                  ((1.0f - gBATT_EMA_Coef) * temp.batt_volt_V);
 
     // 4. Protection: Low Power Detection with Hysteresis
     // Prevents "flickering" near the threshold
@@ -3133,47 +3176,3 @@ float SMC_Saturate(float arg_s, float arg_boundary_layer)
     if (arg_s < -arg_boundary_layer) return -1.0;
     return arg_s / arg_boundary_layer;
 }
-
-// uint8_t CSFR_Get_CRC8( void )
-// {
-//     uint8_t crc = 0;
-
-//     crc = crc8tab[ crc ^ 0x16 ];
-
-//     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
-//         crc = crc8tab[ crc ^ gCSFR_Data_RX[ i ] ];
-//     return crc;
-// }    
-
-// uint8_t compute_crc8( void )
-// {
-//     uint8_t crc = 0;
-
-//     crc ^= 0x16; // XOR with fitst byte
-
-//     for ( uint8_t j = 0 ; j < 8 ; j++ )
-//     {
-//         if ( crc & 0x80 )
-//         {
-//             crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
-//         } else {
-//             crc <<= 1;
-//         }
-//     }
-
-//     for ( uint8_t i = 0 ; i < CRSF_MSG_DATA_SIZE ; i++ )
-//     {
-//         crc ^= CSFR_Data_RX[ i ]; // XOR with current byte
-
-//         for ( uint8_t j = 0 ; j < 8 ; j++ )
-//         {
-//             if ( crc & 0x80 )
-//             {
-//                 crc = ( crc << 1 ) ^ CRSF_CRC_POLY; // Apply polynomial if MSB is set
-//             } else {
-//                 crc <<= 1;
-//             }
-//         }
-//     }
-//     return crc;
-// }
