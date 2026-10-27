@@ -8,7 +8,7 @@
  *              0.42 Mbps (8bit, 1stp, no parity) - UART1 - CrossFire communication
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-10-26 13:58:17
+ * LAST MODIFIED: 2026-10-27 22:15:17
  **********************************************************************/
 
 /*******************************************************************************
@@ -63,7 +63,8 @@
  * -------------------------------------------------------------------------------- */
 
 // ** LAST UPDATE **
-// - Minor updates as Variable correct names or obsolete variables removed
+// - IMU/MPU Callibration routine added
+// - Progressive bar for IMU/MPU callibration added
 
 #include    <stdbool.h>
 #include    <string.h>
@@ -84,14 +85,14 @@
 // https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/middleware/iqmath/doc_guide/doc_guide-srcs/Users_Guide.html
 
 // ----- LED Sequence ----
-#define     LED_SEQUENCE_0          (0b111111)      // long  blink
-#define     LED_SEQUENCE_1          (0b111)         // one   blink
-#define     LED_SEQUENCE_2          (0b111000111)   // two   blink
-#define     LED_SEQUENCE_3          (0b1100110011)  // three blink
-#define     LED_SEQUENCE_4          (0b11011011011) // four blink
-#define     LED_SEQUENCE_5          (0b101010101)   // five blink
-#define     LED_SEQUENCE_6          (0b10101010101) // six blink
-#define     LED_TICK_COUNT          (15U)           // LED heartbeat period
+#define     LED_SEQUENCE_0          (0b000111111111)    // long  blink
+#define     LED_SEQUENCE_1          (0b000000000011)    // one   blink
+#define     LED_SEQUENCE_2          (0b000000011011)    // two   blink
+#define     LED_SEQUENCE_3          (0b000011011011)    // three blink
+#define     LED_SEQUENCE_4          (0b000001010101)    // four blink
+#define     LED_SEQUENCE_5          (0b000101010101)    // five blink
+#define     LED_SEQUENCE_6          (0b010101010101)    // six blink
+#define     LED_TICK_COUNT          (12U)               // LED heartbeat period
 // ----- Timebase ----
 #define     TIME_MPU_READ_SEC       (0.0008f)       // reading rate of MPU in seconds - Main Sample Period - Inner Loop
 #define     iqTIME_MPU_READ_S    _IQ(0.0008f)       // 800us in seconds - actual compiler value = 52/65536 = 0.00079346s
@@ -175,23 +176,23 @@
 volatile    uint8_t     gLEDColors_8b_GRB[ (WS2812B_LED_COUNT+WS2812B_DUMY_BYTE) ][ WS2812B_COLOR_CNT*WS2812B_PWM_PATTR ] =
 {   
     // GREEN color (MSB first),                RED color (MSB first),                  BLUE color (MSB first)
-    { 0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED0 - FRONT RH
-    { 0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED1
-    { 0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED2
-    { 0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED3 - FRONT MID
-    { 0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED4 - FRONT MID
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED5
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED6
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED7 - FRONT LH
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED0 - FRONT RH
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED1
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED2
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED3 - FRONT MID
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED4 - FRONT MID
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED5
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED6
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED7 - FRONT LH
 
-    { 0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED8 - REAR LH
-    { 0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED9
-    { 0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED10
-    { 0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED11 - REAR MID
-    { 0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED12 - REAR MID
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED13
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED14
-    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x38, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED15 - REAR RH
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED8 - REAR LH
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED9
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED10
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED11 - REAR MID
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED12 - REAR MID
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED13
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED14
+    { 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C, 0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C,0x1C } , // LED15 - REAR RH
 
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } , // DUMMY
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } , // DUMMY
@@ -217,7 +218,7 @@ volatile uint8_t crc8tab[256] = {
     0xD6, 0x03, 0xA9, 0x7C, 0x28, 0xFD, 0x57, 0x82, 0xFF, 0x2A, 0x80, 0x55, 0x01, 0xD4, 0x7E, 0xAB,
     0x84, 0x51, 0xFB, 0x2E, 0x7A, 0xAF, 0x05, 0xD0, 0xAD, 0x78, 0xD2, 0x07, 0x53, 0x86, 0x2C, 0xF9};
 
-volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_0;
+volatile    uint16_t    gLED_Seq_Now        = LED_SEQUENCE_6;
 volatile    uint8_t     gRobot_State        = ROBO_STATE_BALA;
 volatile    uint8_t     gRobot_State_1      = ROBO_STATE_BALA;
 volatile    uint8_t     gController_Type    = CONTROLLER_TYPE_PID;  // Default state use PID
@@ -272,7 +273,7 @@ volatile    uint32_t    gCnt_Sample         = 0U;
 volatile    uint32_t    gCnt_Batt_gauge     = TIME_BATT_GAU_MS;
 volatile    uint32_t    gCnt_Tilt_gauge     = TIME_TILT_GAU_MS;
 volatile    uint32_t    gCnt_Send_tele      = TIME_SEND_TELE_MS;
-volatile    uint32_t    gCnt_Tele_sended    = 0U;
+// volatile    uint32_t    gCnt_Tele_sended    = 0U;
 
 // ----- ERROR COUNTERS -----
 // volatile    uint32_t    er_ct[ 24 ];
@@ -380,7 +381,7 @@ typedef struct motor_t {
 typedef struct power_t {
     float       batt_volt_V;        // Battery filtered voltage (V)
     float       batt_curr_A;        // Battery current (A)
-    uint16_t    batt_cap_mAh;       // Battery fuel used (mAh)
+    uint32_t    batt_cap_mAh;       // Battery fuel used (mAh)
     float       batt_gauge_ptc;     // Battery gauge in percentage (%)
     bool        is_low_power;       // Critical low voltage flag
 } power_t;
@@ -708,19 +709,15 @@ void        Motor1_LH_SetVolt( float argVoltM1 );
 void        HW_Lay_Set_PWM(uint8_t argPhase,uint16_t argDuty);
 
 void        UART0_Update( void );
-void        UART0_ClearBuff(void);
-bool        UART0_Update_Cmd( void );
-bool        UART0_Update_Gain( void );
 uint16_t    UART0_Send_Tele(uint8_t argCount );
-
+void        UART0_ClearBuff(void);
 
 void        CRSF_Update ( void );
 bool        CRSF_RX_Extract_16ch_payload( void );
 uint8_t     CRSF_Get_CRC8( uint8_t argTypeID, volatile uint8_t *argData, uint8_t argLength );
 void        CRSF_Parse_Data( void );
 uint16_t    CRSF_Reverse11( uint16_t arg_data_for_rev );
-void        CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct);
-// uint8_t     CSFR_Get_CRC8( void );
+void        CRSF_TX_Telemetry( void );
 
 void        Wheel_GetSpeed_SG(void);
 
@@ -731,7 +728,6 @@ void        Robot_GetWheelPhysics(volatile motor_t *argMotor , volatile wheel_t 
 void        Robot_GetMotorCurrent( volatile motor_t *argMotor, uint32_t argRawADC_LSB );
 void        Robot_GetBatteryVoltage( volatile power_t *argPower , uint32_t rawAdcLSB );
 
-int32_t     Filter_Median3(int32_t a, int32_t b, int32_t c);
 static inline float Filter_Median3_f(float a, float b, float c);
 static inline float Filter_Median5_f(float p0, float p1, float p2, float p3, float p4);
 
@@ -757,15 +753,17 @@ int main( void ) {
     MCU_Initialize();
     IMU_Initialize();
 
+    // ----- 1. IMU CALIBRATION -----
+    // Calibration only in first 500ms if Tilt is stable
+    IMU_Calibrate();
+
 // *****************************************  *****************************************  *****************************************
 // *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****  *****   INFINITE LOOP INFINITE LOOP *****
 // *****************************************  *****************************************  *****************************************
     while ( 1 ) {
 
-        // ----- 0. IDENT (STEP RESPONSE) -----
+        // ----- 0. IDENTIFICATION (STEP RESPONSE) -----
         Robot_Ident();
-        // ----- 1. QUAD -----
-        // now in ISR
         // ----- 2. READ MPU -----        
         IMU_ProcessData();
         // ----- 3. (A) OUTER LOOP -----
@@ -789,13 +787,7 @@ int main( void ) {
         // ----- 10. CROSS FIRE DETECTOR -----
         CRSF_Update();
         // ----- 11. SEND BATT TELEMETRY -----
-        if ( gFlg_Send_tele ){
-            gFlg_Send_tele = false;
-
-            robot.power.batt_gauge_ptc = 100.0f * ( robot.power.batt_volt_V - VOLT_BATTERY_MIN ) / ( VOLT_BATTERY_MAX - VOLT_BATTERY_MIN);
-
-            CRSF_TX_Telemetry( robot.power.batt_volt_V, 0.0f, 0U, robot.power.batt_gauge_ptc);
-        }
+        CRSF_TX_Telemetry();
     }
 }
 
@@ -838,8 +830,6 @@ void TIMER_0_INST_IRQHandler()
     // ----- MPU - DELAY -----
     if ( mpu.status.delay_cnt_ms > 0 )
         --mpu.status.delay_cnt_ms;
-    // if ( gCnt_MPU_Delay > 0 )
-    //     --gCnt_MPU_Delay;
     
     // ----- UART - SEND DATA -----
     if ( --gCnt_UART_Send == 0 )
@@ -847,14 +837,7 @@ void TIMER_0_INST_IRQHandler()
         gCnt_UART_Send = TIME_SEND_DATA_MS;
         gFlg_Send_UART = true;
     }
-    
-    // ----- RC - READ DATA -----
-    // if ( --gCnt_CRSF_Read == 0 )
-    // {
-    //     gCnt_CRSF_Read = TIME_CRSF_MS;
-    //     gFlg_Read_CRSF = true;
-    // }
-    
+        
     // ----- COMMUNICATION TIME OUT - motors STOP
     if ( gCnt_Fail_Safe > 0 )
     {
@@ -880,14 +863,6 @@ void TIMER_0_INST_IRQHandler()
         gCnt_Send_tele = TIME_SEND_TELE_MS;
         gFlg_Send_tele = true;
     }
-
-    // ----- MPU - READ DATA -----
-    // now in ISR
-    // if ( --gCnt_MPU_Read == 0 )
-    // {
-    //     gCnt_MPU_Read = TIME_MPU_READ_MS;
-    //     gFlg_Read_MPU = true;
-    // }
 }
 
 /****************************************
@@ -896,8 +871,7 @@ void TIMER_0_INST_IRQHandler()
 void TIMER_8_INST_IRQHandler(void)
 {
     // READ DATA FROM MPU
-    mpu.status.read_flg = true;
-    // gFlg_Read_MPU = true;    
+    mpu.status.read_flg = true; 
 }
 
 /****************************************
@@ -1057,7 +1031,7 @@ void UART_1_INST_IRQHandler( void )
             {
                 DL_UART_Main_disableInterrupt( UART_1_INST , DL_UART_MAIN_INTERRUPT_TX );
                 gTX1_idx = 0;
-                gCnt_Tele_sended++;
+                // gCnt_Tele_sended++;
             }
             break;
 
@@ -1065,23 +1039,7 @@ void UART_1_INST_IRQHandler( void )
             break;
     }
 }
-// void UART_1_INST_IRQHandler( void )
-// {
-//     switch ( DL_UART_Main_getPendingInterrupt( UART_1_INST ) )
-//     {
-//         case DL_UART_MAIN_IIDX_RX:
-//             gUART1_RXbuffer[ gUART1_RXbuffer_index ] = DL_UART_Main_receiveData( UART_1_INST );
-//             gUART1_RXbuffer_index = ( gUART1_RXbuffer_index + 1 ) % RX1_BUFF_SIZE;
-//         break;
 
-//         case DL_UART_MAIN_IIDX_TX:
-
-//         break;
-
-//         default:
-//             break;
-//     }
-// }
 /****************************************
 *****   I2C 1 TRANSMITTER          *****
 ****************************************/
@@ -1322,16 +1280,88 @@ void IMU_Initialize(void)
     }
 }
 
-void        IMU_Calibrate( void )
+// -------------------------------
+// ----- IMU/MPU CALIBRATION -----
+// -------------------------------
+void IMU_Calibrate(void)
 {
-    // Delay to allow Robot to stop shaking from powring up
+    int32_t accX_sum = 0;
+    int32_t accY_sum = 0;
+    int32_t gyroX_sum = 0;
+    int32_t gyroY_sum = 0;
+    uint16_t sample_count = 0U;
+    const   uint16_t    target_samples = 1250U;  // shall take about 1 sec (800us * 1250)
+
+    const   uint8_t     LED_COUNT   = 8U;
+    const   uint8_t     LED_OFFSET  = 8U; // Offset for Other side of
+            uint8_t     LED_active  = 0U;
+            float       LED_norm    = 0.0f;
+
+    // --- FEATURE: Progressbar ---
+    // for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++) {
+    //     WS2812B_LED_Col(i, 0, 0, 0);   // OFF
+    // }
+    
+    // Delay to allow Robot to stop shaking from powering up
     mpu.status.delay_cnt_ms = TIME_MPU_DELAY_MS;
     while (mpu.status.delay_cnt_ms > 0U);
-    // gCnt_MPU_Delay = TIME_MPU_DELAY_MS;
-    // while (gCnt_MPU_Delay > 0U);
 
-    // --- calibration ---
     mpu.status.is_calibrated = false;
+
+    // Collect Series of samples synchronized with the 800us inner loop tick
+    while (sample_count < target_samples)
+    {
+        // ----- READ MPU -----        
+        IMU_ProcessData();
+
+        if (gFlg_RUN_InnerLoop)
+        {
+            gFlg_RUN_InnerLoop = false; // Clear flag for the next cycle
+
+            // --- FEATURE: Progressbar ---
+            // Calculate the level based on current sample count
+            LED_norm = (float)(sample_count) / (float)target_samples;
+            if (LED_norm < 0.0f) LED_norm = 0.0f;
+            if (LED_norm > 1.0f) LED_norm = 1.0f;
+            LED_active = (uint8_t)(LED_norm * (float)LED_COUNT);
+
+            // --- Draw the Progressbar - One side ---
+            for (uint8_t i = 0; i < (LED_COUNT); i++)
+            {
+                if ( i <= (LED_active) ) {
+                    WS2812B_LED_Col(i, 0, 0, 0x10); // Blue
+                } else {
+                    WS2812B_LED_Col(i, 0, 0, 0);    // Off
+                }
+            }
+
+            // --- Draw the Progressbar - Other side ---
+            for (uint8_t i = LED_OFFSET; i < (LED_COUNT+LED_OFFSET); i++)
+            {
+                if ( i <= (LED_active+LED_OFFSET) ) {
+                    WS2812B_LED_Col(i, 0, 0, 0x10); // Blue
+                } else {
+                    WS2812B_LED_Col(i, 0, 0, 0);    // Off
+                }
+            }
+
+            // Accumulate raw values for X and Y axes
+            accX_sum  += mpu.raw.accX_lsb;
+            accY_sum  += mpu.raw.accY_lsb;
+            gyroX_sum += mpu.raw.gyroX_lsb;
+            gyroY_sum += mpu.raw.gyroY_lsb;
+
+            sample_count++;
+        }
+    }
+
+    // Calculate average offsets and store them directly in the offset structure
+    mpu.offset.accX_lsb  = (int16_t)(accX_sum / target_samples);
+    mpu.offset.accY_lsb  = (int16_t)(accY_sum / target_samples);
+    mpu.offset.gyroX_lsb = (int16_t)(gyroX_sum / target_samples);
+    mpu.offset.gyroY_lsb = (int16_t)(gyroY_sum / target_samples);
+
+    mpu.status.is_calibrated = true;
 }
 
 // --------------------------
@@ -1383,7 +1413,6 @@ STORE_TIMER6(7);
 
         // --- 43. Proportional Term "Spring" (KP * ERR) ---
         robot.control.KPterm_V  = robot.gain.KP * robot.control.Booster_P_gain * robot.control.Err_Pitch_rad;
-
 
         // --- 44. Derivative Term DUMPING "Counter-Force" (KD * RATE) ---
         // If Rate is (+), Result is (-). If Rate is (-), Result is (+).
@@ -1453,8 +1482,6 @@ STORE_TIMER6(8);
             robot.control.Err_Speed_ms = 0.0f;
             robot.control.Correction_Pos_rad = 0.0f;
         }
-        
-        
     }
 }
 
@@ -1572,10 +1599,9 @@ void UART0_Update( void )
         gRX0_flg_eol = false;
 
         // checkForGainCommand();   
-        UART0_Update_Cmd();
+        // UART0_Update_Cmd();
 
         UART0_ClearBuff();   
-
     }
     // ----- SEND DATA OVER UART -----
     if ( gFlg_Send_UART && gFlg_Log_Enable )
@@ -1665,242 +1691,15 @@ duration_us.uart_comms = dt[6];
     }
 }
 
-bool UART0_Update_Gain( void )
-{
-    // char gainType = gRX0_buffer[0];
+// bool UART0_Update_Gain( void )
+// {
+//     return false;
+// }
 
-    // // Check if it matches [P|I|D|C|N|G]GAIN=
-    // if ( (gainType == 'P' || gainType == 'I' || gainType == 'D' || gainType == 'C' || gainType == 'N' || gainType == 'G' || gainType == 'A' || gainType == 'Z') &&
-    //     gRX0_buffer[1] == 'G' &&
-    //     gRX0_buffer[2] == 'A' &&
-    //     gRX0_buffer[3] == 'I' &&
-    //     gRX0_buffer[4] == 'N' &&
-    //     gRX0_buffer[5] == '=' )
-    // {
-    //     // Look for '\n' terminator
-    //     for ( uint8_t i = 6; i < RX0_BUFF_SIZE; ++i )
-    //     {
-    //         if ( gRX0_buffer[i] == '\n' )
-    //         {
-    //             // Extract value substring
-    //             char valueStr[8] = {0};
-    //             uint8_t len = i - 6;
-    //             if ( len > 0 && len < sizeof( valueStr ) )
-    //             {
-    //                 for ( uint8_t j = 0; j < len; ++j )
-    //                 {
-    //                     valueStr[j] = gRX0_buffer[6 + j];
-    //                 }
-
-    //                 int16_t value = atoi( valueStr );
-
-    //                 // Assign to correct variable
-    //                 switch ( gainType )
-    //                 {
-    //                     case 'P': 
-    //                         // P_Gain_received = value;
-    //                         // if ( 100 >= P_Gain_received && P_Gain_received >= 0 ) { // P shall be small and positive
-    //                             // P_0_gain = (float)P_Gain_received / 100.0f;
-    //                         // }
-    //                         break;
-    //                     case 'I': 
-    //                         // I_Gain_received = value;
-    //                         // if ( 100 >= I_Gain_received && I_Gain_received >= 0 ) { // I shall be small and positive
-    //                             // I_0_gain = (float)I_Gain_received / 10000.0f;
-    //                         // }
-    //                         break;
-    //                     case 'D':
-    //                         // D_Gain_received = value;
-    //                         // if ( 100 >= D_Gain_received && D_Gain_received >= -100  ) { // D shall be small
-    //                             // D_0_gain = (float)D_Gain_received / 100.0f;
-    //                         // }
-    //                         break;
-    //                     case 'C':
-    //                         // C_Gain_received = value;
-    //                         // if ( 10000 >= C_Gain_received && C_Gain_received >= 0 ) {   // C could be large and positive
-    //                             // C_gain_LH_RH = (float)C_Gain_received / 100.0f;
-    //                         // }
-    //                         break;
-    //                     case 'N':
-    //                         // N_Gain_received = value;
-    //                         // if ( 2000 >= N_Gain_received && N_Gain_received >= 0 ) {    // N could be large and positive
-    //                             // N_0_coef = (float)N_Gain_received / 100.0f;
-    //                         // }
-    //                         break;
-    //                     case 'G':
-    //                         // G_Gain_received = value;
-    //                         // if ( 2000 >= G_Gain_received && G_Gain_received >= 0 ) {    // G could be large and positive
-    //                             // gK1_DynamicDamp = (float)G_Gain_received / 100.0f;
-    //                         // }
-    //                         break;    
-    //                     case 'A':
-    //                         // A_Filt_received = value;
-    //                         // if ( 100 >= A_Filt_received && A_Filt_received >= 0 ) {    // A shall be 0-100 (0-1.0)
-    //                             // gALPHA_CF_Coef = (float)A_Filt_received / 100.0f;
-    //                         // }
-    //                         break;
-    //                     case 'Z':
-    //                         // Z_Filt_received = value;
-    //                         // if ( 100 >= Z_Filt_received && Z_Filt_received >= 0 ) {    // Z shall be 0-100 (0-1.0)
-    //                             // gCURR_EMA_Coef = (float)Z_Filt_received / 100.0f;
-    //                         // }
-    //                         break; 
-    //                     default: return false;
-    //                 }
-    //                 return true;
-    //             }
-    //         }
-    //     }
-    // } 
-    return false;
-}
-
-bool UART0_Update_Cmd( void )
-{
-    // char typeChar = gRX0_buffer[0];
-
-    // // -------- Branch 0: IDENT --------
-    // if (gRX0_buffer[0]=='i' && gRX0_buffer[1]=='d' &&
-    //     gRX0_buffer[2]=='e' && gRX0_buffer[3]=='n' &&
-    //     gRX0_buffer[4]=='t')
-    // {
-    //     gRobot_State = ROBO_STATE_IDENT;
-    // }
-
-    // // -------- Branch 1: xGAIN= --------
-    // if (gRX0_buffer[1]=='G' && gRX0_buffer[2]=='A' &&
-    //     gRX0_buffer[3]=='I' && gRX0_buffer[4]=='N' &&
-    //     gRX0_buffer[5]=='=')
-    // {
-    //     // find terminator
-    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
-    //     {
-    //         if (gRX0_buffer[i]=='\n')
-    //         {
-    //             char valueStr[8] = {0};
-    //             uint8_t len = i-6;
-    //             if (len>0 && len<sizeof(valueStr))
-    //             {
-    //                 for (uint8_t j=0; j<len; j++)
-    //                     valueStr[j] = gRX0_buffer[6+j];
-
-    //                 int16_t value = atoi(valueStr);
-
-    //                 switch(typeChar)
-    //                 {
-    //                     case 'P': P_Gain_received=value;
-    //                             //   if(value>=0 && value<=100)
-    //                                 //   P_0_gain=(float)value/100.0f;
-    //                               break;
-    //                     case 'I': I_Gain_received=value;
-    //                               if(value>=0 && value<=100)
-    //                                 //   I_0_gain=(float)value/10000.0f;
-    //                               break;
-    //                     case 'D': D_Gain_received=value;
-    //                               if(value>=-100 && value<=100)
-    //                                 //   D_0_gain=(float)value/100.0f;
-    //                               break;
-    //                     case 'C': C_Gain_received=value;
-    //                               if(value>=0 && value<=10000)
-    //                                 //   C_gain_LH_RH=(float)value/100.0f;
-    //                               break;
-    //                     case 'N': N_Gain_received=value;
-    //                               if(value>=0 && value<=2000)
-    //                                 //   N_0_coef=(float)value/100.0f;
-    //                               break;
-    //                     case 'G': G_Gain_received=value;
-    //                               if(value>=0 && value<=2000)
-    //                                 //   gK1_DynamicDamp=(float)value/100.0f;
-    //                               break;
-    //                     case 'A': A_Filt_received=value;
-    //                               if(value>=0 && value<=100)
-    //                                 //   gALPHA_CF_Coef=(float)value/100.0f;
-    //                               break;
-    //                     case 'Z': 
-    //                             // Z_Filt_received=value;
-    //                             //   if(value>=0 && value<=100)
-    //                             //   gCURR_EMA_Coef=(float)value/100.0f;
-    //                               break;
-    //                     default: return false;
-    //                 }
-    //                 return true;
-    //             }
-    //         }
-    //     }
-    // }
-
-    // // -------- Branch 2: yPARA= --------
-    // if (gRX0_buffer[1]=='P' && gRX0_buffer[2]=='A' &&
-    //     gRX0_buffer[3]=='R' && gRX0_buffer[4]=='A' &&
-    //     gRX0_buffer[5]=='=')
-    // {
-    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
-    //     {
-    //         if (gRX0_buffer[i]=='\n')
-    //         {
-    //             char valueStr[8]={0};
-    //             uint8_t len=i-6;
-    //             if(len>0 && len<sizeof(valueStr))
-    //             {
-    //                 for(uint8_t j=0;j<len;j++)
-    //                     valueStr[j]=gRX0_buffer[6+j];
-    //                 int16_t value=atoi(valueStr);
-
-    //                 // Example: assign to parameter variable
-    //                 switch(typeChar)
-    //                 {
-    //                     // case 'K': Kpara_received=value;
-    //                     //           Kpara_flag=(value!=0);
-    //                     //           break;
-    //                     // add other PARA parameters here
-    //                     default: return false;
-    //                 }
-    //                 return true;
-    //             }
-    //         }
-    //     }
-    // }
-
-    // // -------- Branch 3: zOFFS= --------
-    // if (gRX0_buffer[1]=='O' && gRX0_buffer[2]=='F' &&
-    //     gRX0_buffer[3]=='F' && gRX0_buffer[4]=='S' &&
-    //     gRX0_buffer[5]=='=')
-    // {
-    //     for (uint8_t i=6; i<RX0_BUFF_SIZE; i++)
-    //     {
-    //         if (gRX0_buffer[i]=='\n')
-    //         {
-    //             char valueStr[8]={0};
-    //             uint8_t len=i-6;
-    //             if(len>0 && len<sizeof(valueStr))
-    //             {
-    //                 for(uint8_t j=0;j<len;j++)
-    //                     valueStr[j]=gRX0_buffer[6+j];
-    //                 int16_t value=atoi(valueStr);
-
-    //                 // Example: assign to offset variable
-    //                 switch( typeChar )
-    //                 {
-    //                     // case 'X': X_offset=value; break;
-    //                     case 'Y':
-    //                         Y_Offs_received = value;
-    //                         if( 1 == value || value == -1 )
-    //                             // PID_0_angle_ref += value;
-    //                         // else if ( value == 0 )
-    //                             // PID_0_angle_ref = ANGLE_UPRIGHT_DEG;
-    //                     break;
-    //                     // case 'Z': Z_offset=value; break;
-    //                     // add other OFFS parameters here
-    //                     default: return false;
-    //                 }
-    //                 return true;
-    //             }
-    //         }
-    //     }
-    // }
-
-    return false;
-}
+// bool UART0_Update_Cmd( void )
+// {
+//     return false;
+// }
 
 void UART0_ClearBuff( void )
 {
@@ -2110,29 +1909,20 @@ void CRSF_Parse_Data( void )
 
     robot.rc_cmd.ch[ 8 ] = CRSF_Reverse11( ( ( reversed_array[ 11 ] & 0xFF ) << 3 ) | ( reversed_array[ 12 ] >> 5 ) );
     robot.rc_cmd.ch[ 9 ] = CRSF_Reverse11( ( ( reversed_array[ 12 ] & 0x1F ) << 6 ) | ( reversed_array[ 13 ] >> 2 ) );
-
-    // gCRSF_RC_chann[ 0 ] = CRSF_Reverse11( ( ( reversed_array[  0 ] & 0xFF ) << 3 ) | ( reversed_array[  1 ] >> 5 ) );
-    // gCRSF_RC_chann[ 1 ] = CRSF_Reverse11( ( ( reversed_array[  1 ] & 0x1F ) << 6 ) | ( reversed_array[  2 ] >> 2 ) );
-    // gCRSF_RC_chann[ 2 ] = CRSF_Reverse11( ( ( reversed_array[  2 ] & 0x3F ) << 9 ) | ( reversed_array[  3 ] << 1 ) | ( reversed_array[ 4 ] >> 7 ) );
-    // gCRSF_RC_chann[ 3 ] = CRSF_Reverse11( ( ( reversed_array[  4 ] & 0x7F ) << 4 ) | ( reversed_array[  5 ] >> 4 ) );
-    
-    // gCRSF_RC_chann[ 4 ] = CRSF_Reverse11( ( ( reversed_array[  5 ] & 0x0F ) << 7 ) | ( reversed_array[  6 ] >> 1 ) );
-    // gCRSF_RC_chann[ 5 ] = CRSF_Reverse11( ( ( reversed_array[  6 ] & 0x01 ) << 10 )| ( reversed_array[  7 ] << 2 ) | ( reversed_array[ 8 ] >> 6 ) );
-    // gCRSF_RC_chann[ 6 ] = CRSF_Reverse11( ( ( reversed_array[  8 ] & 0x3F ) << 5 ) | ( reversed_array[  9 ] >> 3 ) );
-    // gCRSF_RC_chann[ 7 ] = CRSF_Reverse11( ( ( reversed_array[  9 ] & 0x07 ) << 8 ) | ( reversed_array[ 10 ] >> 0 ) );
-
-    // gCRSF_RC_chann[ 8 ] = CRSF_Reverse11( ( ( reversed_array[ 11 ] & 0xFF ) << 3 ) | ( reversed_array[ 12 ] >> 5 ) );
-    // gCRSF_RC_chann[ 9 ] = CRSF_Reverse11( ( ( reversed_array[ 12 ] & 0x1F ) << 6 ) | ( reversed_array[ 13 ] >> 2 ) );
-
-    // for ( uint8_t j = 0 ; j < 10 ; j++ )
-    //     robot.rc_cmd.ch[ j ] = gCRSF_RC_chann[ j ];
 }
 
-void CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct)
+void CRSF_TX_Telemetry( void )
 {
+    if ( !gFlg_Send_tele ) return;
+    
+    gFlg_Send_tele = false;
+
     // Recalculate battery voltage and current into CRSF format
-    uint16_t v_dec = (uint16_t)(argBatt_V * 10.0f);   // 12.6V -> 126
-    uint16_t i_dec = (uint16_t)(argBatt_A * 10.0f);   // 1.5A  -> 15
+    uint16_t v_dec = (uint16_t)(robot.power.batt_volt_V * 10.0f);   // 12.6V -> 126
+    uint16_t i_dec = (uint16_t)(robot.power.batt_curr_A * 10.0f);   // 1.5A  -> 15
+    // calculate battery gauge
+    robot.power.batt_gauge_ptc = 100.0f * ( robot.power.batt_volt_V - VOLT_BATTERY_MIN ) / ( VOLT_BATTERY_MAX - VOLT_BATTERY_MIN);
+            
     // CRSF header assembly
     gTX1_buffer[0] = CRSF_SYNC_BYTE;         // 0xC8
     gTX1_buffer[1] = 0x0A;                   // Délka od TYPE po CRC (1 + 8 + 1)
@@ -2146,17 +1936,47 @@ void CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_m
     gTX1_buffer[5] = (i_dec >> 8) & 0xFF;
     gTX1_buffer[6] = i_dec & 0xFF;
     // Capacity used mAh (uint24_t - 3bytes)
-    gTX1_buffer[7] = (argCapacity_mAh >> 16) & 0xFF;
-    gTX1_buffer[8] = (argCapacity_mAh >> 8) & 0xFF;
-    gTX1_buffer[9] = argCapacity_mAh & 0xFF;
+    gTX1_buffer[7] = (robot.power.batt_cap_mAh >> 16) & 0xFF;
+    gTX1_buffer[8] = (robot.power.batt_cap_mAh >> 8) & 0xFF;
+    gTX1_buffer[9] = robot.power.batt_cap_mAh & 0xFF;
     // Remaining % (uint8_t)
-    gTX1_buffer[10] = argFuelGauge_pct;
+    gTX1_buffer[10] = robot.power.batt_gauge_ptc;
     // CRC8 calculated from FRAME TYPE and PAYLOAD
     gTX1_buffer[11] = CRSF_Get_CRC8( CRSF_FRAME_ID_BATTERY, &gTX1_buffer[3], 8);
 
     gTX1_size = 12;
     DL_UART_Main_enableInterrupt( UART_1_INST, DL_UART_MAIN_INTERRUPT_TX );
 }
+
+// void CRSF_TX_Telemetry( float argBatt_V, float argBatt_A, uint32_t argCapacity_mAh, uint8_t argFuelGauge_pct)
+// {
+//     // Recalculate battery voltage and current into CRSF format
+//     uint16_t v_dec = (uint16_t)(argBatt_V * 10.0f);   // 12.6V -> 126
+//     uint16_t i_dec = (uint16_t)(argBatt_A * 10.0f);   // 1.5A  -> 15
+//     // CRSF header assembly
+//     gTX1_buffer[0] = CRSF_SYNC_BYTE;         // 0xC8
+//     gTX1_buffer[1] = 0x0A;                   // Délka od TYPE po CRC (1 + 8 + 1)
+//     gTX1_buffer[2] = CRSF_FRAME_ID_BATTERY;  // 0x08
+
+//     // Big-Endian for values:
+//     // Voltage (uint16_t)
+//     gTX1_buffer[3] = (v_dec >> 8) & 0xFF;
+//     gTX1_buffer[4] = v_dec & 0xFF;
+//     // Current (uint16_t)
+//     gTX1_buffer[5] = (i_dec >> 8) & 0xFF;
+//     gTX1_buffer[6] = i_dec & 0xFF;
+//     // Capacity used mAh (uint24_t - 3bytes)
+//     gTX1_buffer[7] = (argCapacity_mAh >> 16) & 0xFF;
+//     gTX1_buffer[8] = (argCapacity_mAh >> 8) & 0xFF;
+//     gTX1_buffer[9] = argCapacity_mAh & 0xFF;
+//     // Remaining % (uint8_t)
+//     gTX1_buffer[10] = argFuelGauge_pct;
+//     // CRC8 calculated from FRAME TYPE and PAYLOAD
+//     gTX1_buffer[11] = CRSF_Get_CRC8( CRSF_FRAME_ID_BATTERY, &gTX1_buffer[3], 8);
+
+//     gTX1_size = 12;
+//     DL_UART_Main_enableInterrupt( UART_1_INST, DL_UART_MAIN_INTERRUPT_TX );
+// }
 
 /*****************************
 *****   MOTOR FUNCTIONS  *****
@@ -3049,9 +2869,9 @@ void WS2812B_BattGauge_8LED(float arg_volt)
             }
             else if (i == active - 1) {
                 if (active == 1)
-                    WS2812B_LED_Col(i, 0x10, 0, 0);   // Red
+                    WS2812B_LED_Col(i, 0xF0, 0, 0);   // Red - strong
                 else
-                    WS2812B_LED_Col(i, 0x0F, 0x05, 0); // Yellow
+                    WS2812B_LED_Col(i, 0x0F, 0, 0); // Red - weak
             }
             else {
                 WS2812B_LED_Col(i, 0, 0, 0); // Off
