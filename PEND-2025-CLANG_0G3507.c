@@ -8,7 +8,7 @@
  *              0.42 Mbps (8bit, 1stp, no parity) - UART1 - CrossFire communication
  * COMPILER/SDK/SysConfig VERSION: Clang v4.0.4 -O2 / 2.10.0.04 / 1.27
  * PROGRAMMER: Ing. Tomas Solarski
- * LAST MODIFIED: 2026-10-27 22:15:17
+ * LAST MODIFIED: 2026-10-28 22:50:17
  **********************************************************************/
 
 /*******************************************************************************
@@ -108,10 +108,10 @@
 #define     TIME_SEND_TELE_MS       (253U)          // 4Hz Battery Telemetry send back to Radio (upstream)
 #define     TIME_FAIL_SAFE_MS       (1501U)         // No command received
 // ----- Angles Limits ----
-#define     ANGLE_LIM_BODY_RAD      (0.60f)         // Angle limit - beyond Controller is OFF   - 0.60rad = 36deg
-#define     ANGLE_LIM_HYST_RAD      (0.20f)         // Angle hysteresis - preventing oscilations- 0.20rad = 12deg
+#define     ANGLE_LIM_BODY_RAD      (0.50f)         // Angle limit - beyond Controller is OFF   - 0.50rad ~ 30deg
+#define     ANGLE_LIM_HYST_RAD      (0.10f)         // Angle hysteresis - preventing oscilations- 0.10rad ~  6deg
 #define     ANGLE_P_ZONE_RAD        (0.20f)         // Region to boost P terms                  - 0.20rad = 12deg
-#define     ANGLE_SP_PITCH_RAD      (0.05f)         // Set Point limit for position controller  - 0.05rad = 3deg
+#define     ANGLE_SP_PITCH_RAD      (0.15f)         // Set Point limit for position controller  - 0.15rad =  9deg
 // ----- Voltages ----
 #define     VOLT_MOTOR_LIM_HI       (8.00f)         // Action value limit for Inner Loop
 #define     VOLT_MOTOR_LIM_LO       (4.00f)         // Action value limit for Side Loop
@@ -144,10 +144,6 @@
 #define     CONTROLLER_TYPE_PID     (0U)            // Generic (Original) Controller
 #define     CONTROLLER_TYPE_SMC     (1U)            // Current (under test) Controller
 #define     CONTROLLER_TYPE_LQR     (2U)            // Future Expansion Controller
-
-// #define     UAV_CF_ALPHA            (0.03f)             // Complementary filter coefficient - Acc Gyro
-// #define     iqUAV_CF_ALPHA       _IQ(UAV_CF_ALPHA)      // Alpha
-// #define     iqONE_NEG_ALPHA      _IQ(1.0f-UAV_CF_ALPHA) // 1-Alpha
 
 #define     PWM_MAX_DUTY            (90U)       // [ % ] -> 0.90*12V => 10.8V
 #define     PWM_MIN_DUTY            (2U)        // [ % ] -> 0.02*12V => 0.24V
@@ -697,8 +693,8 @@ volatile mpu_t mpu = {
 void        MCU_Initialize( void );
 void        IMU_Initialize( void );
 void        IMU_Calibrate( void );
-void        PID_Outer_Loop( void );
-void        PID_Inner_Loop( void );
+void        PD_Outer_Loop( void );
+void        PD_Inner_Loop( void );
 void        SMC_Inner_Loop( void );
 void        ADC12_Update( void );
 void        IMU_ProcessData ( void );
@@ -767,12 +763,12 @@ int main( void ) {
         // ----- 2. READ MPU -----        
         IMU_ProcessData();
         // ----- 3. (A) OUTER LOOP -----
-        PID_Outer_Loop();
+        PD_Outer_Loop();
         // ----- 4. (B) INNER LOOP -----
         switch ( gController_Type ) {
-            case CONTROLLER_TYPE_PID: PID_Inner_Loop(); gLED_Seq_Now = LED_SEQUENCE_1; break;
+            case CONTROLLER_TYPE_PID: PD_Inner_Loop(); gLED_Seq_Now = LED_SEQUENCE_1; break;
             case CONTROLLER_TYPE_SMC: SMC_Inner_Loop(); gLED_Seq_Now = LED_SEQUENCE_2; break;
-                             default: PID_Inner_Loop(); break; }
+                             default: PD_Inner_Loop(); break; }
         // ----- 5. UART UPDATE -----
         UART0_Update();
         // ----- 6. BATTERY GAUGE -----
@@ -1364,10 +1360,10 @@ void IMU_Calibrate(void)
     mpu.status.is_calibrated = true;
 }
 
-// --------------------------
-// ----- (A) INNER LOOP -----
-// --------------------------
-void PID_Inner_Loop( void )
+// -------------------------
+// ----- PD INNER LOOP -----
+// -------------------------
+void PD_Inner_Loop( void )
 {
     if (!mpu.status.is_initialized) return; // DON'T DRIVE MOTORS IF SENSOR IS DEAD
     
@@ -1378,29 +1374,17 @@ duration_us.inner_loop = dt[7];
 STORE_TIMER6(7);
         gFlg_RUN_InnerLoop = false;
 
-        // --- 40. Feed Forward Term "Direct Drive" (FFgain * CMD) ---
-        robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
+        // --- 1. FEED FORWARD / "The Direct Drive" ---
+        robot.control.FFterm_V  = -(robot.gain.FF * robot.rc_cmd.pitch);   // Stick is leaning to fornt - forward
 
-        // --- 41. Determine the Setpoint ---
+        // --- 2. SETPOINT / "The Balancing vortex" ---
         if (!robot.rc_cmd.is_connected) // if not connected use the Position control
             robot.control.SP_Pitch_rad = robot.control.Correction_Pos_rad;
-            
         
-        // --- 41. Smooth the Setpoint Transition - Leaky Integrator Filter ---
-        // Higher alpha (0.99) = Slower, smoother convergence - can never reach the setpoint
-        // Lower alpha (0.90) = Sharper, faster response - zero steady state error
-        // float alpha_sp = 0.975f; 
-
-        // robot.control.SP_Pitch_rad = (alpha_sp * robot.control.SP_Pitch_rad) + 
-        //                             ((1.0f - alpha_sp) * robot.control.Correction_Pos_rad);
-        // --- 41. Now calculate error from the smoothed setpoint ---
-        // robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
-        
-        
-        // Error is the difference between setpoint and actual
+        // --- 3. ERROR / "The Mission" ---
         robot.control.Err_Pitch_rad = robot.control.SP_Pitch_rad - robot.body.pitch_rad;
         
-        // --- 42. P gain Updated with booster - EXPERIMENTAL ---
+        // --- 4. BOOSTER / "The Hammer" ---
         float alpha_boost = 0.975f;
 
         if ( fabsf(robot.control.Err_Pitch_rad) < ANGLE_P_ZONE_RAD ) {
@@ -1411,38 +1395,38 @@ STORE_TIMER6(7);
             robot.control.Booster_P_gain  = (alpha_boost * robot.control.Booster_P_gain) + ((1.0f-alpha_boost) * (1.50f));
         }
 
-        // --- 43. Proportional Term "Spring" (KP * ERR) ---
+        // --- 5. PROPORTIONAL / "The Spring" ---
         robot.control.KPterm_V  = robot.gain.KP * robot.control.Booster_P_gain * robot.control.Err_Pitch_rad;
 
-        // --- 44. Derivative Term DUMPING "Counter-Force" (KD * RATE) ---
+        // --- 6. DERIVATIVE / "The Damping " or "The Counter-Force" ---
         // If Rate is (+), Result is (-). If Rate is (-), Result is (+).
         robot.control.KDterm_V  = -(robot.gain.KD * robot.body.rateY_rads);
         
-        // --- 46. Combine ALL Motor terms "Summing Junction" ---
+        // --- 7. Combine ALL Motor terms "The Summing Junction" ---
         robot.control.CMterm_V = robot.control.FFterm_V + 
                                  robot.control.KPterm_V + 
                                  robot.control.KDterm_V;
         
-        // --- 47. Motor Voltage Limit ---
+        // --- 8. Motor Voltage Limit ---
         if ( robot.control.CMterm_V > VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = VOLT_MOTOR_LIM_HI;
         if ( robot.control.CMterm_V < -VOLT_MOTOR_LIM_HI ) robot.control.CMterm_V = -VOLT_MOTOR_LIM_HI;
         
-        // --- 48. Calculate TURN term ---
+        // --- 9. Calculate TURN term ---
         robot.control.TIterm_V  = robot.gain.TI * robot.rc_cmd.roll;
         
-        // --- 49. Motor mixing ---
+        // --- 10. Motor mixing ---
         robot.motor.left.volt_V  = robot.control.CMterm_V + robot.control.TIterm_V;
         robot.motor.right.volt_V = robot.control.CMterm_V - robot.control.TIterm_V;
         
+        // --- 11. APPLY / "The Make It Happen" ---
         Motor_Control( robot.motor.left.volt_V , robot.motor.right.volt_V );
-
     }
 }
 
-// -------------------------
-// ----- (B) OUTER LOOP ----
-// -------------------------
-void PID_Outer_Loop( void )
+// ------------------------
+// ----- PD OUTER LOOP ----
+// ------------------------
+void PD_Outer_Loop( void )
 {
     if ( gFlg_RUN_OuterLoop )
     {
@@ -1451,32 +1435,32 @@ duration_us.outer_loop = dt[8];
 STORE_TIMER6(8);
         gFlg_RUN_OuterLoop = false;
 
-        // --- 30. Calculate Motor: Angle [rad], Rate [rad/s] and Wheel: Position [m] and Speed [m/s] ---
+        // --- 1. Calculate Motor: Angle [rad], Rate [rad/s] and Wheel: Position [m] and Speed [m/s] ---
         Robot_GetWheelPhysics(&robot.motor.left  , &robot.wheel.left);
         Robot_GetWheelPhysics(&robot.motor.right , &robot.wheel.right);
-        // --- 31. Calculate ROBOT BODY Position ---
+        // --- 2. Calculate ROBOT BODY Position ---
         robot.body.pos_m = (robot.wheel.left.pos_m + robot.wheel.right.pos_m) * 0.5f;
-        // --- 32. Calculate ROBOT BODY Speed --- 
+        // --- 3. Calculate ROBOT BODY Speed --- 
         robot.body.speed_ms = Robot_GetSpeed_SG();      // Savitzky-Golay Derivative Filter
-        // --- 33. Calculate ROBOT TURN Angle ---
+        // --- 4. Calculate ROBOT TURN Angle ---
         robot.body.turn_rad = (robot.wheel.right.pos_m - robot.wheel.left.pos_m) / ROBOT_WHEEL_SOD_M;
-        // --- 34. Calculate ROBOT TURN Angle rate ---
+        // --- 5. Calculate ROBOT TURN Angle rate ---
         robot.body.turn_rate_rads = Robot_GetTurnRate_SG();    // Savitzky-Golay Derivative Filter
-        // --- 35. Position Controller ---
         
-        // run only when no RC communication is active
-        if (!robot.rc_cmd.is_connected)
+        // --- 6. Position Controller ---
+        if (!robot.rc_cmd.is_connected) // run only when no RC communication is active
         {
             robot.control.Err_Pos_m    = robot.control.SP_Pos_m    - robot.body.pos_m;
             robot.control.Err_Speed_ms = robot.control.SP_Speed_ms - robot.body.speed_ms;
-            // Angle as Action Value shall be Negative (-) if Robot Position is positive (+) or Speed is positive (+)
-            robot.control.Correction_Pos_rad = -(robot.control.Err_Pos_m    * robot.gain.KP_Pos +
-                                                 robot.control.Err_Speed_ms * robot.gain.KD_Pos);
+            // Angle as Action Value shall be POSITIVE (Nose Up) if Robot Position is positive (+) or Speed is positive (+)
+            robot.control.Correction_Pos_rad =  ( robot.control.Err_Pos_m    * robot.gain.KP_Pos ) +
+                                                ( robot.control.Err_Speed_ms * robot.gain.KD_Pos ) ;
+            // Angle as Action Value shall be Negative (-) if Robot Position is positive (+) or Speed is positive (+) - !!!
+            // robot.control.Correction_Pos_rad = -(robot.control.Err_Pos_m    * robot.gain.KP_Pos +
+            //                                      robot.control.Err_Speed_ms * robot.gain.KD_Pos);
 
-            if ( robot.control.Correction_Pos_rad >  ANGLE_SP_PITCH_RAD )
-                robot.control.Correction_Pos_rad =  ANGLE_SP_PITCH_RAD;
-            if ( robot.control.Correction_Pos_rad < -ANGLE_SP_PITCH_RAD )
-                robot.control.Correction_Pos_rad = -ANGLE_SP_PITCH_RAD;
+            if ( robot.control.Correction_Pos_rad >  ANGLE_SP_PITCH_RAD ) robot.control.Correction_Pos_rad =  ANGLE_SP_PITCH_RAD;
+            if ( robot.control.Correction_Pos_rad < -ANGLE_SP_PITCH_RAD ) robot.control.Correction_Pos_rad = -ANGLE_SP_PITCH_RAD;
         } else {
             robot.control.Err_Pos_m    = 0.0f;
             robot.control.Err_Speed_ms = 0.0f;
@@ -1726,20 +1710,22 @@ STORE_TIMER6( 9 );
 
         // 2. PROCESS: Use local variables for math to keep the pipeline clean
         
-        // Pre-calculated coefficients (using 174-1811 range) to map into -1.00f to +1.00f
+        // Calculation using 174-1811 range to map into -1.00f to +1.00f
         // a = (+1.00-(-1.00)) / (1811-174) = 0.00122175f
         // b = -1.00 - (a * 174) ≈ -1.21258f
-        const float a1 = 0.00122175f;
-        const float b1 = -1.21258f;
+        const float a1 = (+1.00f-(-1.00f))/(1811.0f-174.0f);
+        const float b1 = -1.00f - (a1 * 174.0f);
+        // const float a1 = 0.00122175f;
+        // const float b1 = -1.21258f;
 
         float loc_roll     = a1 * (float)robot.rc_cmd.ch[0] + b1;
         float loc_pitch    = a1 * (float)robot.rc_cmd.ch[1] + b1;
         // float loc_throttle = a1 * (float)robot.rc_cmd.ch[2] + b1;
         float loc_yaw      = a1 * (float)robot.rc_cmd.ch[3] + b1;
 
-        // Pre-calculated coefficients (using 191.0f-1792.0f range) to map into +1.00f to +1.50f
-        const float a2 = (+1.50f-(+1.00f)) / (1792.0f-191.0f);    // results in 0.000278141f
-        const float b2 = (+1.00f) - (a2 * 191.0f);
+        // Calculation using 191.0f-1792.0f range to map into +0.50f to +1.50f
+        const float a2 = (+1.50f-(+0.50f)) / (1792.0f-191.0f); 
+        const float b2 = (+0.50f) - (a2 * 191.0f);
         
         float loc_latch_L  = a2 * (float)robot.rc_cmd.ch[4] + b2;
         float loc_state3_L = a2 * (float)robot.rc_cmd.ch[5] + b2;
@@ -1766,13 +1752,15 @@ STORE_TIMER6( 9 );
 
         robot.rc_cmd.button_L = loc_button_L;
 
-        // Setpoint and Feed Forward term update
-        float sp_pitch          = 0.25f * (float)loc_pitch;    // Pitch Set point range -1.0 to 1.0 rad
+        // *** NEW Setpoint/Reference ***
+        // As Forward movment need to lean forward, we need to have the PITCH angle negative
+        float sp_pitch          = -0.25f * (float)loc_pitch;    // Pitch Set point range -0.25 to 0.25 rad
+        // float sp_pitch          = 0.25f * (float)loc_pitch;    // Pitch Set point range -1.0 to 1.0 rad
         
         // Apply Limits
-        #define PITCH_ANGLE_LIMIT_RAD (1.05f)
-        if (sp_pitch >  PITCH_ANGLE_LIMIT_RAD) sp_pitch =  PITCH_ANGLE_LIMIT_RAD;
-        if (sp_pitch < -PITCH_ANGLE_LIMIT_RAD) sp_pitch = -PITCH_ANGLE_LIMIT_RAD;
+        // #define PITCH_ANGLE_LIMIT_RAD (1.05f)
+        // if (sp_pitch >  PITCH_ANGLE_LIMIT_RAD) sp_pitch =  PITCH_ANGLE_LIMIT_RAD;
+        // if (sp_pitch < -PITCH_ANGLE_LIMIT_RAD) sp_pitch = -PITCH_ANGLE_LIMIT_RAD;
         
         robot.control.SP_Pitch_rad = sp_pitch;
 
@@ -2826,6 +2814,7 @@ void WS2812B_Half_LED(uint8_t argRGB1, uint8_t argRGB2,
         WS2812B_LED_Col(i, R2, G2, B2);
 }
 
+// --- TIBATTERY GAUGE FEATURE ---
 void WS2812B_BattGauge_8LED(float arg_volt)
 {
     if ( gFlg_Batt_gauge) {
@@ -2836,6 +2825,19 @@ void WS2812B_BattGauge_8LED(float arg_volt)
         const float Vmin = VOLT_BATTERY_MIN + 0.1f; // 11.3V
         const float Hysteresis_V = 0.05f;           // 50mV gap
         const uint8_t LEDcount = 8;
+
+        // --- FEATURE: Flash-To-Pass Override ---
+        // Checks if left button/trigger is pressed beyond threshold (> 1.2f)
+        if (robot.rc_cmd.button_L > 1.2f)
+        {
+            // Flash all 8 LEDs high-intensity White/Blue headlight pulse
+            for (uint8_t i = 0; i < LEDcount; i++)
+            {
+                WS2812B_LED_Col(i, 0xFF, 0xFF, 0xFF); // High-beam White
+                // WS2812B_LED_Col(i, 0x00, 0x10, 0xFF); // POLICE
+            }
+            return; // Skip normal calculation while flashing
+        }
 
         // 1. Calculate the 'Ideal' active level based on current voltage
         float norm = (arg_volt - Vmin) / (Vmax - Vmin);
@@ -2880,6 +2882,7 @@ void WS2812B_BattGauge_8LED(float arg_volt)
     }
 }
 
+// --- TILT GAUGE FEATURE ---
 void WS2812B_TiltGauge_8LED(float arg_tilt_rad)
 {
     if (gFlg_Tilt_gauge) {
@@ -2888,21 +2891,6 @@ void WS2812B_TiltGauge_8LED(float arg_tilt_rad)
         const float TILT_LIMIT_RAD = 0.4f; // 0.4 rad is 22deg
         const uint8_t LED_COUNT    = 8;
         const uint8_t LED_OFFSET   = 8; 
-
-        // --- FEATURE: Flash-To-Pass Override ---
-        // Checks if left button/trigger is pressed beyond threshold (> 1.2f)
-        if (robot.rc_cmd.button_L > 1.2f)
-        {
-            // Flash all 8 LEDs high-intensity White/Blue headlight pulse
-            for (uint8_t i = LED_OFFSET; i < (LED_OFFSET + LED_COUNT); i++)
-            {
-                WS2812B_LED_Col(i, 0xFF, 0xFF, 0xFF); // High-beam White
-                // WS2812B_LED_Col(i, 0x00, 0x10, 0xFF); // POLICE
-            }
-            return; // Skip normal tilt calculation while flashing
-        }
-
-        // --- STANDARD TILT GAUGE MODE ---
 
         // 1. Clamp tilt using the symmetric limit
         if (arg_tilt_rad < -TILT_LIMIT_RAD) arg_tilt_rad = -TILT_LIMIT_RAD;
@@ -2964,7 +2952,7 @@ STORE_TIMER6(7);
         float u_total = smc_controller.K * SMC_Saturate(s, smc_controller.phi);
 
         // --- 4. Feed Forward Term "Direct Drive" (FFgain * CMD) ---
-        robot.control.FFterm_V  = robot.gain.FF * (float)robot.rc_cmd.pitch;
+        robot.control.FFterm_V  = -(robot.gain.FF * robot.rc_cmd.pitch);
 
         u_total = u_total + robot.control.FFterm_V;
 
